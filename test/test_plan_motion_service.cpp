@@ -31,6 +31,7 @@
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "crane_planning/planner_node.hpp"
+#include "description_fixture.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -171,10 +172,8 @@ protected:
       q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
         q_a[static_cast<Eigen::Index>(row)];
     }
-    crane_model::Payload payload;
-    payload.valid = true;
-    payload.inertia_k8_kg_m2.setZero();
-    auto settled = model_->passive_equilibrium(q_a, payload);
+    auto settled =
+      model_->passive_equilibrium(q_a, crane_planning_test::empty_gripper());
     EXPECT_TRUE(settled.ok()) << settled.status().message;
     q[4] = settled.value()[0];
     q[5] = settled.value()[1];
@@ -356,10 +355,8 @@ TEST_F(PlanMotionService, AReachableGoalComesBackAsATimedJointTrajectory)
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
     q_a_goal[static_cast<Eigen::Index>(row)] = trajectory.points.back().positions[row];
   }
-  crane_model::Payload payload;
-  payload.valid = true;
-  payload.inertia_k8_kg_m2.setZero();
-  auto settled = model_->passive_equilibrium(q_a_goal, payload);
+  auto settled =
+    model_->passive_equilibrium(q_a_goal, crane_planning_test::empty_gripper());
   ASSERT_TRUE(settled.ok());
   crane_model::Q q = crane_model::Q::Zero();
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {

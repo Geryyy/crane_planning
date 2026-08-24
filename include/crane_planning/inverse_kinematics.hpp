@@ -17,10 +17,31 @@
 // is right for an instant. Making the equilibrium a *constraint* rather than a
 // pinning is the NLP of 2.2's second half and is issue 039.
 //
-// > "Analytic IK" is closed-form only in step 2. Steps 3 and 4 are a scalar
-// > search and a fixed-point iteration. The solve is fast and deterministic, but
-// > it is **not** a closed-form inverse and it can fail to converge. Every call
-// > must be validated against forward kinematics before the result is used.
+// # The pin is a function of the configuration, and is evaluated as one
+//
+// `q_u = q_eq(q_a)` is where the tool hangs at the configuration the solve is
+// *currently testing*, so every residual this file measures re-solves it. That
+// is the expensive choice -- `Model::passive_equilibrium` costs some 45 ms
+// against 0.35 ms for one `forward_kinematics` call, measured on both machine
+// descriptions in this workspace -- and it is not optional.
+//
+// The cheap alternative, holding q_u across a solve and re-solving it in an
+// outer loop, does not converge on this machine, and it fails structurally
+// rather than by bad luck. Measured on the PZS100, `dq_eq/dq_a` is
+// `[0, -1, -1, 0, 0]` exactly: the passive tilt cancels q2 + q3, which is the
+// statement that the tool hangs vertically whatever the arm does. Hold the pin
+// at a tilt and the closure has to swing the arm until the *tilted* tool lands
+// on the goal; re-solve the pin there and the tool swings back upright by
+// exactly what the arm was moved by. The outer iteration therefore has a
+// multiplier of magnitude one and lands in a period-two orbit -- observed, over
+// eighty passes, alternating between two configurations a quarter of a radian
+// apart and leaving 0.14 m of position residual that no budget closes.
+//
+// Evaluated as a function instead, the same structure is what makes the solve
+// easy: the tool's offset from K5 at equilibrium is very nearly a constant
+// `(0, 0, -L)` -- exactly constant on the PZS100 -- so the wrist target of step
+// 4 is the goal raised by the tool's hanging length and the fixed point is a
+// contraction that converges in two or three iterations.
 //
 // That sentence is why `solve_inverse_kinematics` returns the residual it
 // achieved and refuses outright when the residual is over `eps_pos`/`eps_yaw`.
@@ -52,12 +73,11 @@ namespace crane_planning
 /// The tolerances and the iteration budgets 2.2's search and fixed point run to.
 struct IkSettings
 {
-  double eps_pos{1.0e-4};              ///< m, the position half of 2.2's oracle
-  double eps_yaw{1.0e-4};              ///< rad, the yaw half
-  std::size_t d45_samples{41};         ///< resolution of the step-3 scalar search
-  std::size_t redundancy_passes{2};    ///< how often step 3 is re-run on a corrected target
-  std::size_t fixed_point_iterations{40};  ///< step 4's budget
-  std::size_t refinement_iterations{20};   ///< the Jacobian polish's budget
+  double eps_pos{1.0e-4};             ///< m, the position half of 2.2's oracle
+  double eps_yaw{1.0e-4};             ///< rad, the yaw half
+  std::size_t d45_samples{41};        ///< resolution of the step-3 scalar search
+  std::size_t fixed_point_iterations{4};  ///< step 4's budget
+  std::size_t refinement_iterations{6};   ///< the Jacobian polish's budget
   GeometryTolerance geometry{};
 };
 
@@ -79,6 +99,7 @@ struct IkSolution
   double d45{};                               ///< the extension step 3 resolved on
   std::size_t fixed_point_iterations{};
   std::size_t refinement_iterations{};
+  std::size_t equilibrium_calls{};            ///< what the solve actually cost
 };
 
 /// Solve 2.2 for one goal, and refuse anything the FK oracle does not accept.

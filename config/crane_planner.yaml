@@ -26,11 +26,14 @@ crane_planner:
     eps_pos: 0.001
     eps_yaw: 0.001
 
-    # The scalar search of 2.2 step 3 and the fixed point of step 4.
+    # The scalar search of 2.2 step 3, the fixed point of step 4, and the
+    # Jacobian polish that closes whatever they leave.  The last two are what a
+    # solve costs: each of their iterations re-solves the passive pair at the
+    # configuration it is testing, and one `Model::passive_equilibrium` is worth
+    # some hundred forward-kinematics evaluations.
     d45_samples: 41
-    redundancy_passes: 2
-    fixed_point_iterations: 40
-    refinement_iterations: 20
+    fixed_point_iterations: 4
+    refinement_iterations: 6
 
     # The startup check that this description really is the planar two-link arm
     # 2.2 poses the closure on.  Both machine descriptions in this workspace

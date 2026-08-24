@@ -21,6 +21,15 @@ absent, and the point of this package as it stands is that every absence is
 | geometric path | a straight line in joint space between the start and the endpoint |
 | timing | one scaled ramp obeying the velocity limits |
 
+A solve costs what `Model::passive_equilibrium` costs. The pin is a *function*
+of the configuration being tested, so every residual re-solves it — some 45 ms
+against 0.35 ms for a forward-kinematics call — and a typical endpoint takes a
+dozen or so of them, a few hundred milliseconds. Holding the pin across a solve
+and re-solving it in an outer loop is the obvious saving and it does **not**
+converge: `dq_eq/dq_a` is `[0, -1, -1, 0, 0]`, the tool hangs vertically whatever
+the arm does, and that outer loop has a multiplier of magnitude one. Issue 045
+owns the latency bound and inherits this number, not a faster wrong one.
+
 The four numbers the closure needs — `a2`, `a3`, `d45(q4)` and the bearing they
 are measured from — are **probed out of the model** at startup rather than
 written down, and the probe is also a check: a description whose arm is not

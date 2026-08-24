@@ -64,6 +64,25 @@ inline crane_model::Model build_model(const Machine & machine)
   return std::move(model).value();
 }
 
+/// An empty gripper, declared rather than defaulted.
+/**
+ * `crane_model::Payload` is a plain value type and Eigen does not zero a
+ * default-constructed matrix, so `Payload{}.inertia_k8_kg_m2` holds whatever was
+ * on the stack -- and the model rejects a payload whose inertia is not
+ * symmetric. Every fixture that carries a payload therefore builds it here, and
+ * an empty gripper is `mass_kg == 0` with `valid == true`, which is not the same
+ * thing as the explicit unknown `valid == false` of the model API contract 4.
+ */
+inline crane_model::Payload empty_gripper()
+{
+  crane_model::Payload payload;
+  payload.valid = true;
+  payload.mass_kg = 0.0;
+  payload.center_of_mass_k8_m.setZero();
+  payload.inertia_k8_kg_m2.setZero();
+  return payload;
+}
+
 inline crane_planning::PlannerContext build_context(
   const crane_model::Model & model, const Machine & machine,
   const crane_planning::PlannerSettings & settings = crane_planning::PlannerSettings{})

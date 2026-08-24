@@ -52,33 +52,27 @@ crane_planner:
     validation:
       gt_eq<>: [2]
 
-  redundancy_passes:
-    type: int
-    default_value: 2
-    read_only: true
-    description: "How often step 3 is re-run on a corrected wrist target. The
-      first pass resolves the redundancy against a target that still carries the
-      nominal tool offset; the second runs it against the offset the solution
-      actually has. Passes are cheap and each one is validated, so this trades a
-      little time for a better centred arm."
-    validation:
-      gt_eq<>: [1]
-
   fixed_point_iterations:
     type: int
-    default_value: 40
+    default_value: 4
     read_only: true
     description: "Budget for the wrist-offset fixed point of
       wiki/robot_model.md 2.2 step 4, which is also where step 5 rides -- the
-      rotator takes the residual yaw once per iteration. 2.2 calls it `a handful
-      of steps`; the budget is generous because exceeding it is reported as a
-      residual rather than papered over."
+      rotator takes the residual yaw once per iteration, at the sensitivity the
+      description actually has rather than at an assumed one. Every iteration
+      re-solves the passive pair at the configuration it is testing, so this and
+      refinement_iterations together are what a solve costs:
+      Model::passive_equilibrium runs some 45 ms against 0.35 ms for a
+      forward-kinematics call. The offset it corrects is the tool's hanging
+      length, which barely moves, so the fixed point contracts hard and stops on
+      its own after two or three iterations; exceeding the budget is reported as
+      a residual rather than papered over."
     validation:
       gt_eq<>: [1]
 
   refinement_iterations:
     type: int
-    default_value: 20
+    default_value: 6
     read_only: true
     description: "Budget for the Jacobian polish that closes whatever residual
       the search and the fixed point leave. It is not a second solver and not a

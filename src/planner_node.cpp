@@ -70,7 +70,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.ik.eps_pos = parameters.eps_pos;
   settings_.ik.eps_yaw = parameters.eps_yaw;
   settings_.ik.d45_samples = static_cast<std::size_t>(parameters.d45_samples);
-  settings_.ik.redundancy_passes = static_cast<std::size_t>(parameters.redundancy_passes);
   settings_.ik.fixed_point_iterations =
     static_cast<std::size_t>(parameters.fixed_point_iterations);
   settings_.ik.refinement_iterations =

@@ -145,7 +145,7 @@ TEST(PlanMotion, CollisionAvoidanceIsRefusedAndNamesItsIssue)
   request.p_tcp_0 = Eigen::Vector3d(6.0, 0.0, 2.0);
   request.q_a_start = crane_model::QA::Zero();
   request.q_a_start[static_cast<Eigen::Index>(crane_planning::kToolRow)] = machine.q8;
-  request.payload.valid = true;
+  request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = true;  // which is what the .srv defaults to
 
   auto refused = crane_planning::plan_motion(model, context, request);
@@ -172,7 +172,7 @@ TEST(PlanMotion, TheScaleIsRefusedBeforeTheSolveRatherThanAfterIt)
   // come from before the inverse kinematics ran.
   request.p_tcp_0 = Eigen::Vector3d(500.0, 0.0, 0.0);
   request.q_a_start = crane_model::QA::Zero();
-  request.payload.valid = true;
+  request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = false;
   request.margin_factor = 1.5;
 
@@ -192,7 +192,7 @@ TEST(PlanMotion, AGoalOutsideTheWorkspaceIsRefusedRatherThanApproximated)
   crane_planning::MotionRequest request;
   request.p_tcp_0 = Eigen::Vector3d(500.0, 0.0, 0.0);
   request.q_a_start = crane_model::QA::Zero();
-  request.payload.valid = true;
+  request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = false;
 
   auto refused = crane_planning::plan_motion(model, context, request);
