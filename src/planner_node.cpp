@@ -77,6 +77,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.ik.geometry.planarity_m = parameters.geometry_tolerance.length;
   settings_.ik.geometry.structure_m = parameters.geometry_tolerance.length;
   settings_.ik.geometry.bearing_rad = parameters.geometry_tolerance.bearing;
+  settings_.equilibrium.eps_equilibrium = parameters.eps_equilibrium;
+  settings_.equilibrium.max_iterations =
+    static_cast<std::size_t>(parameters.nlp_max_iterations);
+  settings_.equilibrium.max_wall_clock_s = parameters.nlp_max_wall_clock;
   settings_.ramp.Ts = parameters.Ts;
   settings_.ramp.min_duration = parameters.min_duration;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
@@ -103,9 +107,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   RCLCPP_INFO(
     get_logger(),
     "crane_planner: %s answered with a timed joint trajectory, republished on %s reliable and "
-    "transient-local. This is the slice-5 tracer: the endpoint is the semi-analytic IK of "
-    "wiki/robot_model.md 2.2 with the passive pair pinned at its equilibrium, and the timing is "
-    "one velocity-limited ramp. There is no collision check of any kind (issue 041), no "
+    "transient-local. This is the slice-5 tracer: a goal here is a placement goal, so the "
+    "endpoint is the equilibrium-constrained IK of wiki/robot_model.md 2.2 -- the passive pair "
+    "is a decision variable under g_u(q) = 0 rather than a pinning, so the tool arrives at rest "
+    "-- and the timing is one velocity-limited ramp. There is no collision check of any kind "
+    "(issue 041), no "
     "structured lift/traverse/descend primitive (issue 040) and no path-constrained OCP, so no "
     "force, flow or kappa margin (issue 043). Each of those is refused or named rather than "
     "approximated.",
@@ -340,11 +346,12 @@ void PlannerNode::plan(
     " points; the endpoint IK closed to " + std::to_string(motion_plan.endpoint.residual_p) +
     " m and " + std::to_string(motion_plan.endpoint.residual_phi_z) +
     " rad against forward kinematics, resolving the telescope at d45 = " +
-    std::to_string(motion_plan.endpoint.d45) + " m after " +
-    std::to_string(motion_plan.endpoint.fixed_point_iterations) +
-    " wrist-offset iterations and " +
-    std::to_string(motion_plan.endpoint.refinement_iterations) +
-    " Jacobian refinements. The peak velocity is " +
+    std::to_string(motion_plan.endpoint.d45) + " m in " +
+    std::to_string(motion_plan.endpoint.nlp_iterations) +
+    " equilibrium-constrained iterations and " + std::to_string(motion_plan.endpoint.elapsed_s) +
+    " s, leaving the passive pair " +
+    std::to_string(motion_plan.endpoint.residual_equilibrium) +
+    " rad off Model::passive_equilibrium, so the tool arrives at rest. The peak velocity is " +
     std::to_string(motion_plan.trajectory.limiting_fraction) +
     " of the scaled limit. No collision was checked (issue 041) and the timing is the ramp of "
     "this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";

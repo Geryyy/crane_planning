@@ -35,6 +35,19 @@ crane_planner:
     fixed_point_iterations: 4
     refinement_iterations: 6
 
+    # The equilibrium-constrained solve of 2.2, which is what a *placement*
+    # endpoint is found with -- the passive pair is a decision variable under
+    # `g_u(q) = 0` rather than a pinning, so the tool arrives at rest.
+    # `eps_equilibrium` is the assertion that it really did: the answer's passive
+    # pair is put back through `Model::passive_equilibrium` and compared, because
+    # `g_u(q) = 0` also has the tool *standing up* as a root and the solver's own
+    # constraint residual cannot tell the two apart.  The two caps are the bound;
+    # hitting either is a refusal naming it, never a best-effort endpoint.  One
+    # solve costs 0.25 s on the PZS100 and 0.73 s at its worst on the 7040.
+    eps_equilibrium: 1.0e-4
+    nlp_max_iterations: 60
+    nlp_max_wall_clock: 5.0
+
     # The startup check that this description really is the planar two-link arm
     # 2.2 poses the closure on.  Both machine descriptions in this workspace
     # close to floating-point noise.

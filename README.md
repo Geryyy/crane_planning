@@ -14,21 +14,49 @@ absent, and the point of this package as it stands is that every absence is
 
 | Step | Where |
 |---|---|
-| endpoint from a goal pose | the semi-analytic IK of `wiki/robot_model.md` §2.2, over `q_a = (q1, q2, q3, q4, q7)` |
-| passive pair | **pinned** at `Model::passive_equilibrium`, §2.2's default for a placement goal |
+| endpoint from a goal pose | the equilibrium-**constrained** NLP of `wiki/robot_model.md` §2.2, over all eight coordinates |
+| passive pair | a decision variable under `g_u(q) = 0`, so the endpoint is a genuine steady state |
+| initial guess | the semi-analytic IK of §2.2 steps 1–5, with the passive pair pinned |
 | redundancy | the scalar search over `d45` of §2.2 step 3, scored by joint-range centring |
 | acceptance | the forward-kinematics residual of §2.2, on **every** call, before the result is used |
+| assertion | the answer's passive pair against `Model::passive_equilibrium`, through the frozen API |
 | geometric path | a straight line in joint space between the start and the endpoint |
 | timing | one scaled ramp obeying the velocity limits |
 
-A solve costs what `Model::passive_equilibrium` costs. The pin is a *function*
-of the configuration being tested, so every residual re-solves it — some 45 ms
-against 0.35 ms for a forward-kinematics call — and a typical endpoint takes a
-dozen or so of them, a few hundred milliseconds. Holding the pin across a solve
-and re-solving it in an outer loop is the obvious saving and it does **not**
-converge: `dq_eq/dq_a` is `[0, -1, -1, 0, 0]`, the tool hangs vertically whatever
-the arm does, and that outer loop has a multiplier of magnitude one. Issue 045
-owns the latency bound and inherits this number, not a faster wrong one.
+**Which of §2.2's two formulations runs is this planner's decision, not a
+parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
+speed matters, the equilibrium-constrained one where the endpoint must be
+sway-free — and every `/crane/plan_motion` goal is a *placement* goal, so every
+endpoint takes the constrained route and the fast route runs inside it as the
+initial guess. There is no switch for it, because a caller who picked the fast
+one would be choosing to have the tool arrive swinging without being told that is
+what the choice meant.
+
+The constraint is `g_u(q) = inverse_dynamics(q, 0, 0, payload)` on the passive
+rows, which the model API contract §7 states is zero exactly at a valid passive
+equilibrium — so no second model and no new dependency. It is *not*
+`Model::passive_equilibrium`, and that is what gives the final assertion its
+teeth: `g_u(q) = 0` also has the tool **standing up** as a root, which is an
+equilibrium and is not a steady state anything settles into, and the solver's own
+constraint residual cannot tell the two apart. `passive_equilibrium` returns the
+settled root, so checking against it is a stability check rather than a
+restatement of what the solver already believes.
+
+A solve costs what `Model::passive_equilibrium` costs — some 33–45 ms against
+0.35 ms for a forward-kinematics call — so the constraint being cheaper than the
+equilibrium is the whole reason an eight-coordinate NLP is affordable here. One
+endpoint takes 0.25 s on the PZS100 and 0.73 s at its worst on the Epsilon 7040.
+Both an iteration cap (`nlp_max_iterations`) and a wall-clock cap
+(`nlp_max_wall_clock`) bound it, and hitting either is a refusal naming the cap,
+never the best iterate dressed as an answer — an unbounded NLP inside a service
+call is a hang, and a caller cannot cancel one. Issue 045 owns the latency bound
+and inherits these numbers.
+
+The seed matters and is measurable: on the PZS100 `dq_eq/dq_a` is
+`[0, -1, -1, 0, 0]` exactly — the tool hangs vertically whatever the arm does —
+so the semi-analytic answer is already feasible and the NLP converges in a single
+iteration. The 7040's tool sits off the tilt axis, its seed is only close, and
+the worst of twenty five sampled goals took 24 iterations.
 
 The four numbers the closure needs — `a2`, `a3`, `d45(q4)` and the bearing they
 are measured from — are **probed out of the model** at startup rather than
@@ -52,8 +80,12 @@ description the controllers were configured against.
   `trajectory_planning` §5.2, carrying the sway explicitly, with the cylinder
   force and pump-flow constraints and the κ margin that leaves the MPC authority
   — arrives with **issue 043**. Nothing here reads `Q_P^max` or a cylinder force.
-- The equilibrium-constrained endpoint NLP of `robot_model` §2.2 is **issue
-  039**; this pins `q_u` instead of constraining it.
+- **Clearance does not enter the redundancy score.** `robot_model` §2.2 step 3
+  scores the telescope's one leftover degree of freedom by joint-range centring
+  *and* collision clearance; there is no scene here to score against, so a
+  non-zero clearance weight is **refused** rather than read and silently ignored.
+  It joins the score at **issue 041**, and
+  `include/crane_planning/redundancy.hpp` is the one place the rule is written.
 - The structured lift/traverse/descend primitive is **issue 040**, the sampling
   fallback and its mandatory smoothing **issue 042**, `/crane/plan_grip` **issue
   044**, replanning from a moving and swinging start **issue 045**, and the
@@ -88,7 +120,9 @@ reading these sources.
 
     include/crane_planning/joint_limits.hpp        the description's own limits
     include/crane_planning/arm_geometry.hpp        the probed two-link closure
-    include/crane_planning/inverse_kinematics.hpp  robot_model §2.2
+    include/crane_planning/inverse_kinematics.hpp  robot_model §2.2, semi-analytic
+    include/crane_planning/equilibrium_ik.hpp      robot_model §2.2, constrained
+    include/crane_planning/redundancy.hpp          §2.2 step 3's leftover freedom
     include/crane_planning/trajectory_timing.hpp   the ramp
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free
     include/crane_planning/planner_node.hpp        the adapter

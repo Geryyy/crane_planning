@@ -84,6 +84,52 @@ crane_planner:
     validation:
       gt_eq<>: [0]
 
+  eps_equilibrium:
+    type: double
+    default_value: 1.0e-4
+    read_only: true
+    description: "How far the endpoint's passive pair may sit from
+      Model::passive_equilibrium of its own actuated part, rad. This is the
+      *assertion* wiki/trajectory_planning.md 6 rests on and not the solver's own
+      constraint residual: g_u(q) = 0 has more than one root -- the tool hanging
+      down and the tool standing up -- and only the first is a steady state
+      anything settles into, so the answer is put back through the frozen model
+      API and compared. Loose enough to absorb the model's equilibrium solve
+      landing on a slightly different point than the NLP did, and tight enough
+      that the standing-up root, which is radians away, can never pass."
+    validation:
+      gt<>: [0.0]
+
+  nlp_max_iterations:
+    type: int
+    default_value: 60
+    read_only: true
+    description: "Iteration cap on the equilibrium-constrained solve of
+      wiki/robot_model.md 2.2, in Gauss-Newton steps. Hitting it is a refusal
+      naming the cap, never the best iterate dressed as an answer: a solve that
+      was still moving when it was stopped holds an iterate, and nothing
+      establishes that the next step would not have moved it back outside the
+      acceptance residual. Warm-started from the semi-analytic route this is one
+      iteration on the PZS100, whose seed is exact; the 7040's tool sits off the
+      tilt axis, so its seed is only close and the worst of twenty five sampled
+      goals took 24. Sixty is that with room. The latency bound this feeds is
+      issue 045's; the cap exists here because an unbounded NLP inside a service
+      call is a hang and a caller cannot cancel one."
+    validation:
+      gt_eq<>: [1]
+
+  nlp_max_wall_clock:
+    type: double
+    default_value: 5.0
+    read_only: true
+    description: "Wall-clock cap on the same solve, s, measured across the whole
+      of it including the semi-analytic seed. The other half of the bound, and the
+      half that holds when a machine is slower than the one the iteration count
+      was measured on: one solve costs 0.25 s on the PZS100 and 0.73 s at its
+      worst on the 7040. Hitting it is the same refusal, naming this cap."
+    validation:
+      gt<>: [0.0]
+
   geometry_samples:
     type: int
     default_value: 9
