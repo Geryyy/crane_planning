@@ -1,0 +1,159 @@
+crane_planner:
+  tool:
+    type: string
+    default_value: "pzs100"
+    read_only: true
+    description: "The mounted tool. It decides which URDF joint the eighth
+      canonical coordinate is -- q9_left_rail_joint on the PZS100,
+      theta10_outer_jaw_joint on the Epsilon 7040 (Nomenclature 4, ROS 2
+      Interfaces 3.1) -- and the model refuses a description whose selected tool
+      does not carry it. The joint strings themselves come off the model, so no
+      per-tool table lives in this package."
+    validation:
+      one_of<>: [["pzs100", "epsilon7040"]]
+
+  eps_pos:
+    type: double
+    default_value: 0.001
+    read_only: true
+    description: "eps_p of wiki/robot_model.md 2.2, m. The position half of the
+      forward-kinematics acceptance test every IK call is put through before its
+      result is used. 2.2 says in as many words that the semi-analytic solve is
+      not a closed-form inverse and can fail to converge, so a residual over this
+      is a success=false with the residual in the message and never a returned
+      trajectory. The default is a millimetre: an order of magnitude under the
+      3 cm placement budget wiki/robot_model.md 5.1 works to, so a solve that
+      passes here has not spent any of it."
+    validation:
+      gt<>: [0.0]
+
+  eps_yaw:
+    type: double
+    default_value: 0.001
+    read_only: true
+    description: "eps_phi of wiki/robot_model.md 2.2, rad. The yaw half of the
+      same acceptance test. A milliradian turns the 0.5 m half-width of a block
+      by half a millimetre, which is the same order as eps_pos and is why the two
+      defaults are the same number."
+    validation:
+      gt<>: [0.0]
+
+  d45_samples:
+    type: int
+    default_value: 41
+    read_only: true
+    description: "How many telescope extensions the scalar search of
+      wiki/robot_model.md 2.2 step 3 evaluates. The redundancy is one degree of
+      freedom and the score -- joint-range centring -- is smooth in it, so this
+      is a resolution and not a convergence criterion: a coarser grid picks a
+      slightly less well centred extension, never a wrong one, because whatever
+      it picks is closed in closed form and then validated against forward
+      kinematics like every other candidate."
+    validation:
+      gt_eq<>: [2]
+
+  redundancy_passes:
+    type: int
+    default_value: 2
+    read_only: true
+    description: "How often step 3 is re-run on a corrected wrist target. The
+      first pass resolves the redundancy against a target that still carries the
+      nominal tool offset; the second runs it against the offset the solution
+      actually has. Passes are cheap and each one is validated, so this trades a
+      little time for a better centred arm."
+    validation:
+      gt_eq<>: [1]
+
+  fixed_point_iterations:
+    type: int
+    default_value: 40
+    read_only: true
+    description: "Budget for the wrist-offset fixed point of
+      wiki/robot_model.md 2.2 step 4, which is also where step 5 rides -- the
+      rotator takes the residual yaw once per iteration. 2.2 calls it `a handful
+      of steps`; the budget is generous because exceeding it is reported as a
+      residual rather than papered over."
+    validation:
+      gt_eq<>: [1]
+
+  refinement_iterations:
+    type: int
+    default_value: 20
+    read_only: true
+    description: "Budget for the Jacobian polish that closes whatever residual
+      the search and the fixed point leave. It is not a second solver and not a
+      silent fallback: it starts from the semi-analytic solution, it is skipped
+      entirely when that solution already meets eps_pos and eps_yaw, it
+      backtracks on the true residual so it cannot make the answer worse, and how
+      many iterations it took is reported in the service response. Set it to zero
+      to run the bare semi-analytic solve of 2.2 and nothing else."
+    validation:
+      gt_eq<>: [0]
+
+  geometry_samples:
+    type: int
+    default_value: 9
+    read_only: true
+    description: "How many telescope extensions the two-link structure check runs
+      over at startup. The four numbers of wiki/robot_model.md 2.2 -- a2, a3,
+      d45(q4) and the bearing they are measured from -- are probed out of the
+      model rather than written down here, and this is the over-determination
+      that turns the probe into a check: a description whose arm is not planar,
+      or whose telescope does not extend affinely in q4, fails to start."
+    validation:
+      gt_eq<>: [3]
+
+  geometry_tolerance:
+    length:
+      type: double
+      default_value: 1.0e-6
+      read_only: true
+      description: "How far a description may depart from the planar two-link arm
+        of wiki/robot_model.md 2.2 and still be planned for, m. Both machine
+        descriptions in this workspace close to floating-point noise, so this is
+        a guard against a *different* crane rather than a fitted tolerance."
+      validation:
+        gt<>: [0.0]
+    bearing:
+      type: double
+      default_value: 1.0e-6
+      read_only: true
+      description: "The same guard on the forearm's bearing offset, rad."
+      validation:
+        gt<>: [0.0]
+
+  Ts:
+    type: double
+    default_value: 0.04
+    read_only: true
+    description: "Sample period of the emitted reference, s. 25 Hz, which is the
+      rate crane_mpc publishes its horizon at (ROS 2 Interfaces 4) and therefore
+      the grid the reference is consumed on. It is a sampling of a continuous
+      ramp, not a control period: nothing in this node runs in a cycle."
+    validation:
+      gt<>: [0.0]
+
+  min_duration:
+    type: double
+    default_value: 0.5
+    read_only: true
+    description: "Floor on the traversal time, s. Without it a goal a few
+      millimetres away would be handed over in microseconds, and a reference
+      shorter than the loop it is tracked by is a step, not a trajectory."
+    validation:
+      gt<>: [0.0]
+
+  max_input_age:
+    type: double
+    default_value: 0.5
+    read_only: true
+    description: "Longest age of /joint_states that still counts as a start
+      state, s, measured against the message's own header stamp. The plan begins
+      at the machine's measured configuration and its header.stamp is that
+      measurement's stamp (ROS 2 Interfaces 1: the absolute time the first point
+      is valid for), so a stale measurement is a first point that was valid
+      seconds ago. Planning from a *moving* start, and the latency bound that
+      goes with it, is issue 045; this issue plans from a machine that is
+      standing still and refuses when it cannot tell."
+    validation:
+      gt<>: [0.0]

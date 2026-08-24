@@ -1,0 +1,52 @@
+# The `crane_planner` node of ROS 2 Interfaces 2, as the `fake` and `hardware`
+# profiles compose it.
+#
+# Everything here is a property of the *solve*, not of the machine.  The machine's
+# own numbers -- how far and how fast each of the six actuated joints may go --
+# are read out of the `robot_description` the profile remaps this node onto, and
+# deliberately do not appear in this file: a limit written down beside a node is a
+# limit that drifts away from the description every controller in the same
+# deployment was configured against.  The same goes for the arm geometry a2, a3
+# and d45(q4) of wiki/robot_model.md 2.2, which are probed out of the model at
+# startup and checked rather than declared.
+#
+# The two numbers worth reading twice are the acceptance residuals.  2.2 says in
+# as many words that the semi-analytic solve is not a closed-form inverse and can
+# fail to converge, so every solution is put through a forward-kinematics
+# residual before it is used and a residual over `eps_pos` or `eps_yaw` is a
+# `success=false` with the number in the message.  Raising them does not make the
+# planner better at reaching a goal; it makes it quieter about missing.
+crane_planner:
+  ros__parameters:
+    # The tool the profiles select.  It decides which URDF joint the eighth
+    # canonical coordinate is, and nothing else in this file changes with it.
+    tool: pzs100
+
+    # The acceptance test of wiki/robot_model.md 2.2, in metres and radians.
+    eps_pos: 0.001
+    eps_yaw: 0.001
+
+    # The scalar search of 2.2 step 3 and the fixed point of step 4.
+    d45_samples: 41
+    redundancy_passes: 2
+    fixed_point_iterations: 40
+    refinement_iterations: 20
+
+    # The startup check that this description really is the planar two-link arm
+    # 2.2 poses the closure on.  Both machine descriptions in this workspace
+    # close to floating-point noise.
+    geometry_samples: 9
+    geometry_tolerance:
+      length: 1.0e-6
+      bearing: 1.0e-6
+
+    # The emitted reference: 25 Hz, which is the rate the horizon is consumed at
+    # (ROS 2 Interfaces 4), and a floor so that a goal a few millimetres away is
+    # still a trajectory rather than a step.
+    Ts: 0.04
+    min_duration: 0.5
+
+    # How old /joint_states may be and still be a start state.  Planning from a
+    # moving start is issue 045; this one plans from a machine that is standing
+    # still, and refuses when it cannot tell that it is.
+    max_input_age: 0.5

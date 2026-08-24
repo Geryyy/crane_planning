@@ -2,11 +2,32 @@
 <package format="3">
   <name>crane_planning</name>
   <version>0.1.0</version>
-  <description>Frozen ROS-free seams for geometric and timing planning.</description>
+  <description>Geometric and timing planning: the `crane_planner` node and the
+    semi-analytic inverse kinematics it answers `/crane/plan_motion` with.</description>
   <maintainer email="maintainers@example.invalid">Architecture maintainers</maintainer>
   <license>Apache-2.0</license>
+
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <build_depend>eigen</build_depend>
+  <exec_depend>eigen</exec_depend>
+  <depend>crane_model</depend>
+  <depend>crane_msgs</depend>
+  <depend>generate_parameter_library</depend>
+  <depend>geometry_msgs</depend>
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <!-- Pinocchio's own URDF front end, and the one `crane_model` parses the
+       description with (`src/model.cpp`).  It is used here for the one thing the
+       frozen model API does not expose and this planner cannot invent: the
+       position and velocity limits the description gives the six actuated
+       joints.  Libraries lists Pinocchio for "URDF and SRDF parsing"; writing a
+       second XML reader here is what its Style Guide 1.1 forbids. -->
+  <depend>urdfdom</depend>
   <test_depend>ament_cmake_gtest</test_depend>
-  <test_depend>crane_model</test_depend>
-  <export><build_type>ament_cmake</build_type></export>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
 </package>

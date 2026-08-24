@@ -1,0 +1,71 @@
+// Stage 2 of `wiki/trajectory_planning.md`, in the one shape the slice-5 tracer
+// is allowed to have: **a single scaled ramp between the endpoints, obeying the
+// velocity limits and nothing else**.
+//
+// This is deliberately not the time parametrization the page specifies. §5.2's
+// stage 2 is a path-constrained optimal control problem carrying the sway
+// explicitly, with the force and pump-flow constraints and the kappa margin, and
+// it arrives with **issue 043**. Nothing here reads a cylinder force, a pump
+// flow or a sway state, and a reference produced here is feasible against the
+// velocity bound alone.
+//
+// What it does keep from the page is the boundary behaviour, because a ramp that
+// did not have it would be worse than useless downstream: the profile is C1 at
+// both ends and starts and ends at rest, so the trajectory controller is handed
+// a reference whose first and last velocity are zero rather than a step.
+
+#ifndef CRANE_PLANNING__TRAJECTORY_TIMING_HPP_
+#define CRANE_PLANNING__TRAJECTORY_TIMING_HPP_
+
+#include <vector>
+
+#include "crane_model/model.hpp"
+#include "crane_planning/joint_limits.hpp"
+
+namespace crane_planning
+{
+
+/// How the ramp is sampled and how short it may get.
+struct RampSettings
+{
+  double Ts{0.04};           ///< sample period of the emitted points, s
+  double min_duration{0.5};  ///< floor on the traversal time, s
+};
+
+/// The time-parametrized reference of `wiki/robot_model.md` 4.4.
+/**
+ * Positions and velocities only, over the six actuated coordinates in
+ * ROS 2 Interfaces 3.1 order. Accelerations are left out on the same terms the
+ * horizon leaves them out (ROS 2 Interfaces 10): the receiver owns derivatives.
+ */
+struct TimedTrajectory
+{
+  std::vector<double> time_from_start;         ///< s, strictly increasing, first is 0
+  std::vector<crane_model::QA> q_a_ref;        ///< rad or m
+  std::vector<crane_model::DQA> dq_a_ref;      ///< rad/s or m/s
+  double duration{};                           ///< s
+  double limiting_fraction{};                  ///< peak |dq| as a fraction of the scaled bound
+};
+
+/// Whether kappa is a scaling at all.
+/**
+ * Separate from `scaled_ramp` so the refusal can happen before the endpoint IK
+ * rather than after it: a request that asks for `speed_scale = 2` is refused for
+ * that reason, not for whatever the solver would have said next.
+ */
+[[nodiscard]] crane_model::Status check_margin_factor(double margin_factor);
+
+/// The scaled ramp between two configurations.
+/**
+ * `margin_factor` is kappa of `wiki/trajectory_planning.md` 5.5, taken straight
+ * off `crane_msgs/PlanMotion.speed_scale`. It scales the velocity bound and
+ * therefore the duration; a value outside (0, 1] is refused rather than clamped,
+ * because a clamp would answer a request nobody made.
+ */
+[[nodiscard]] crane_model::Result<TimedTrajectory> scaled_ramp(
+  const crane_model::QA & q_a_start, const crane_model::QA & q_a_goal, const JointLimits & limits,
+  double margin_factor, const RampSettings & settings);
+
+}  // namespace crane_planning
+
+#endif  // CRANE_PLANNING__TRAJECTORY_TIMING_HPP_
