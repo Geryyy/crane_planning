@@ -4,12 +4,21 @@
 // `wiki/trajectory_planning.md` 2 splits planning into a geometric stage and a
 // timing stage. This carries the thinnest honest version of each: the geometric
 // stage is the endpoint IK of `wiki/robot_model.md` 2.2 and a straight line
-// between the two configurations, the timing stage is one scaled ramp. What is
+// between the two configurations, the timing stage is one scaled ramp.
+//
+// **Which of 2.2's two formulations solves the endpoint is decided here and not
+// by the caller.** 2.2's closing paragraph is the rule -- the semi-analytic
+// route where speed matters, the equilibrium-constrained NLP where the endpoint
+// must be sway-free -- and every goal this service is asked for is a placement
+// goal, so every endpoint is solved with the constrained route of
+// `equilibrium_ik.hpp`. The fast route still runs, as that solve's initial
+// guess. There is no parameter for it, because a caller who picked the fast one
+// would be choosing to have the tool arrive swinging without being told that is
+// what the choice meant. What is
 // **absent** is named rather than approximated, and every absence is refused at
 // the boundary instead of stubbed:
 //
 //   collision of any kind, and the sway envelope       issue 041
-//   the equilibrium-constrained endpoint NLP           issue 039
 //   the lift/traverse/descend primitive                issue 040
 //   the sampling fallback and its smoothing            issue 042
 //   the path-constrained OCP, force, flow, kappa       issue 043
@@ -30,6 +39,7 @@
 
 #include "crane_model/model.hpp"
 #include "crane_planning/arm_geometry.hpp"
+#include "crane_planning/equilibrium_ik.hpp"
 #include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/joint_limits.hpp"
 #include "crane_planning/trajectory_timing.hpp"
@@ -41,6 +51,7 @@ namespace crane_planning
 struct PlannerSettings
 {
   IkSettings ik{};
+  EquilibriumIkSettings equilibrium{};
   RampSettings ramp{};
   std::size_t geometry_samples{9};  ///< telescope extensions the structure check runs over
 };

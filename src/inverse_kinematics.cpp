@@ -2,6 +2,8 @@
 
 #include <Eigen/Dense>
 
+#include "crane_planning/redundancy.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -86,25 +88,22 @@ struct Closure
   double score{std::numeric_limits<double>::infinity()};
 };
 
-/// The joint-range centring of 2.2 step 3, as a sum of squared normalised offsets.
+/// The four axes the closure scores, which is 2.2 step 3's three plus the azimuth.
 /**
- * An axis the description leaves unbounded -- the rotator -- contributes
- * nothing, because there is no range for it to be centred in and a made-up one
- * would silently steer the redundancy.
+ * q1 is in the sum here and is *not* in `kRedundantAxes`, and both are right.
+ * The search this scores holds q1 fixed across every candidate -- step 1 has
+ * already answered it -- so its term is a constant that shifts every score
+ * equally and orders nothing. Dropping it would change the numbers this route
+ * reports without changing any decision it makes, so it stays.
  */
+constexpr std::array<std::size_t, 4> kClosureAxes{{0, 1, 2, 3}};
+
+/// The joint-range centring of 2.2 step 3, from the one place it is written down.
 double centring_score(const JointLimits & limits, const Closure & candidate)
 {
-  const std::array<double, 4> value{{candidate.q1, candidate.q2, candidate.q3, candidate.q4}};
-  double score = 0.0;
-  for (std::size_t row = 0; row < value.size(); ++row) {
-    const AxisLimit & axis = limits.axis[row];
-    if (!axis.bounded) {
-      continue;
-    }
-    const double normalised = (value[row] - axis.centre()) / axis.half_span();
-    score += normalised * normalised;
-  }
-  return score;
+  return crane_planning::centring_score(
+    limits, kClosureAxes,
+    std::array<double, 4>{{candidate.q1, candidate.q2, candidate.q3, candidate.q4}});
 }
 
 bool inside(const AxisLimit & axis, double value)
@@ -636,6 +635,7 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
   }
 
   best.q = q;
+  best.route = EndpointRoute::SemiAnalytic;
   best.residual_p = (placement.p_tcp - request.p_tcp_0).norm();
   best.residual_phi_z = std::abs(wrap(placement.phi_z - request.phi_z_d));
   best.d45 = geometry.d45(q[3]);

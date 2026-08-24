@@ -80,8 +80,15 @@ crane_model::Result<MotionPlan> plan_motion(
   goal.q8 = request.q_a_start[static_cast<Eigen::Index>(kToolRow)];
   goal.payload = request.payload;
 
-  auto endpoint = solve_inverse_kinematics(
-    model, context.geometry, context.limits, context.settings.ik, goal);
+  // The route decision of robot_model 2.2's closing paragraph, made here rather
+  // than asked of the caller: a `/crane/plan_motion` goal is a *placement* goal,
+  // so its endpoint has to be a genuine steady state of the passive subsystem
+  // and it is solved with the equilibrium-constrained NLP. The semi-analytic
+  // route is 2.2's "where speed matters" one and it still runs -- inside this
+  // call, as the initial guess.
+  auto endpoint = solve_equilibrium_constrained_ik(
+    model, context.geometry, context.limits, context.settings.ik,
+    context.settings.equilibrium, goal);
   if (!endpoint.ok()) {
     return Result<MotionPlan>::failure(endpoint.status());
   }

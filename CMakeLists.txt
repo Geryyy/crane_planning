@@ -24,6 +24,7 @@ find_package(urdfdom REQUIRED)
 # object, so no `--exclude-libs` workaround is needed.
 add_library(planner_core STATIC
   src/arm_geometry.cpp
+  src/equilibrium_ik.cpp
   src/inverse_kinematics.cpp
   src/joint_limits.cpp
   src/planner_core.cpp
@@ -135,6 +136,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_inverse_kinematics test/test_inverse_kinematics.cpp TIMEOUT 300)
   target_link_libraries(test_inverse_kinematics planner_core)
   target_compile_definitions(test_inverse_kinematics PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: the equilibrium-constrained NLP of robot_model §2.2, over sampled
+  # goal poses per tool with *two* oracles -- the forward-kinematics residual of
+  # §2.2 and the equilibrium residual against Model::passive_equilibrium. Offline
+  # C++, same descriptions, no ROS.
+  ament_add_gtest(test_equilibrium_ik test/test_equilibrium_ik.cpp TIMEOUT 900)
+  target_link_libraries(test_equilibrium_ik planner_core)
+  target_compile_definitions(test_equilibrium_ik PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S4 as well: the timing ramp and the refusals the core owes. Plain data in,

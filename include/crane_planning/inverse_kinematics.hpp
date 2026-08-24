@@ -15,7 +15,10 @@
 // default for a placement goal, because pinning at a measured q_u solves for
 // where the tool is now and a tool that is still swinging leaves a target that
 // is right for an instant. Making the equilibrium a *constraint* rather than a
-// pinning is the NLP of 2.2's second half and is issue 039.
+// pinning is the NLP of 2.2's second half; it lives in `equilibrium_ik.hpp`,
+// it is what a placement endpoint is solved with, and this route is 2.2's
+// "where speed matters" one -- including as the initial guess that route starts
+// from.
 //
 // # The pin is a function of the configuration, and is evaluated as one
 //
@@ -55,6 +58,7 @@
 #include <Eigen/Geometry>
 
 #include <cstddef>
+#include <cstdint>
 
 #include "crane_model/model.hpp"
 #include "crane_planning/arm_geometry.hpp"
@@ -90,16 +94,42 @@ struct IkRequest
   crane_model::Payload payload{};                    ///< it moves q_eq (robot_model 5.1)
 };
 
+/// Which of 2.2's two formulations produced an endpoint.
+/**
+ * 2.2 poses the same problem twice and its closing paragraph is the rule for
+ * choosing: the semi-analytic route where speed matters, the
+ * equilibrium-constrained NLP where the endpoint must be sway-free. Which one
+ * ran is carried on the answer rather than asked of the caller.
+ */
+enum class EndpointRoute : std::uint8_t
+{
+  SemiAnalytic,            ///< 2.2 steps 1-5: the scalar search plus the fixed point
+  EquilibriumConstrained   ///< 2.2's NLP, with g_u(q) = 0 as a constraint
+};
+
 /// A solved configuration, with the residual it was accepted on.
+/**
+ * One type for both routes, so that whatever produced an endpoint it travels
+ * through `MotionPlan` and out of the service the same way. The diagnostic
+ * counts are per-route and the ones the other route does not run stay zero:
+ * `fixed_point_iterations`, `refinement_iterations` and `equilibrium_calls`
+ * belong to the semi-analytic solve, `nlp_iterations`, `residual_g_u` and
+ * `elapsed_s` to the constrained one. `route` says which to read.
+ */
 struct IkSolution
 {
   crane_model::Q q{crane_model::Q::Zero()};  ///< all eight; q5, q6 at the equilibrium
   double residual_p{};                        ///< ||p_fk - p_d||, m
   double residual_phi_z{};                    ///< |phi_z,fk - phi_z,d|, rad
   double d45{};                               ///< the extension step 3 resolved on
+  EndpointRoute route{EndpointRoute::SemiAnalytic};
+  double residual_equilibrium{};              ///< ||q_u - passive_equilibrium(q_a)||, rad
+  double residual_g_u{};                      ///< ||g_u(q)||, N m -- the constraint itself
+  double elapsed_s{};
   std::size_t fixed_point_iterations{};
   std::size_t refinement_iterations{};
   std::size_t equilibrium_calls{};            ///< what the solve actually cost
+  std::size_t nlp_iterations{};               ///< Gauss-Newton steps of the constrained route
 };
 
 /// Solve 2.2 for one goal, and refuse anything the FK oracle does not accept.
