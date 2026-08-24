@@ -493,6 +493,121 @@ TEST(StructuredPrimitive, AnUnreachableTransferAltitudeIsRefusedAndNamesTheLiftP
     << refused.status().message;
 }
 
+TEST(StructuredPrimitive, AGoalColumnTheArmCannotReachIsRefusedAndNamesTheTraversePhase)
+{
+  const Machine & machine = crane_planning_test::machines().front();
+  const crane_model::Model model = crane_planning_test::build_model(machine);
+  const crane_planning::PlannerContext context =
+    crane_planning_test::build_context(model, machine);
+  const JointLimits limits = machine_limits(model, machine);
+
+  // The lift and the traverse ask the arm for two *different* columns at the one
+  // transfer altitude -- straight up from the start, straight down onto the goal
+  // -- so the only way to refuse at the traverse rather than at the lift is a
+  // goal whose column leaves the workspace while the start's does not. The
+  // further out the tool stands, the lower the ceiling above it, so the goal is
+  // left standing where the centred configuration puts it and the start is drawn
+  // in underneath the machine: dropping the boom to its limit folds the arm in
+  // rather than reaching it out, which is the opposite of what the joint name
+  // suggests and is why this is measured below rather than assumed.
+  const crane_model::QA standing_out = centred(limits, machine);
+  crane_model::QA drawn_in = standing_out;
+  const auto to_limit = [&limits](crane_model::QA & q_a, std::size_t row, bool upper) {
+      if (!limits.axis[row].bounded) {
+        return;
+      }
+      q_a[static_cast<Eigen::Index>(row)] =
+        upper ? limits.axis[row].upper : limits.axis[row].lower;
+    };
+  to_limit(drawn_in, 1, false);  // boom to its limit, which brings the tool in and down
+  to_limit(drawn_in, 3, true);   // telescope out, so this is not simply the shorter arm
+
+  const crane_model::Q q_start = settled(model, drawn_in);
+  const crane_model::Q q_goal = settled(model, standing_out);
+  auto tcp_start =
+    model.forward_kinematics(q_start, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+  auto tcp_goal =
+    model.forward_kinematics(q_goal, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+  ASSERT_TRUE(tcp_start.ok()) << tcp_start.status().message;
+  ASSERT_TRUE(tcp_goal.ok()) << tcp_goal.status().message;
+  const Eigen::Vector3d p_start = tcp_start.value().position_m;
+  const Eigen::Vector3d p_goal = tcp_goal.value().position_m;
+  const double phi_start = crane_planning::phi_z_of(tcp_start.value().orientation);
+  const double phi_goal = crane_planning::phi_z_of(tcp_goal.value().orientation);
+  ASSERT_GT(p_goal.head<2>().norm(), p_start.head<2>().norm())
+    << "the goal has to stand further out than the start for its column to be the "
+    "lower one; this description does not put it there";
+
+  // Whether a column is reachable at an altitude is a property of the description
+  // and not a number this test may invent, so it is measured on the description's
+  // own IK -- the same call `build_structured_primitive` makes for the waypoint,
+  // with the same held tool coordinate and the same yaw.
+  const auto reachable = [&](const Eigen::Vector3d & below, double altitude, double phi_z) {
+      crane_planning::IkRequest probe;
+      probe.p_tcp_0 = Eigen::Vector3d(below.x(), below.y(), altitude);
+      probe.phi_z_d = phi_z;
+      probe.q8 = machine.q8;
+      probe.payload = crane_planning_test::empty_gripper();
+      return crane_planning::solve_inverse_kinematics(
+        model, context.geometry, limits, context.settings.ik, probe).ok();
+    };
+
+  // Bracket the goal column's ceiling. The bisection assumes reachability above a
+  // standing tool is an interval and not a set of holes, which is what a boom
+  // arm gives; nothing rests on the assumption, because the altitude it lands on
+  // is then put through both columns directly below.
+  double clears = p_goal.z();
+  double blocked = p_goal.z() + 20.0;  // no crane on this site is twenty metres taller
+  ASSERT_FALSE(reachable(p_goal, blocked, phi_goal));
+  for (std::size_t step = 0; step < 20U; ++step) {
+    const double middle = 0.5 * (clears + blocked);
+    if (reachable(p_goal, middle, phi_goal)) {
+      clears = middle;
+    } else {
+      blocked = middle;
+    }
+  }
+
+  // The altitude the primitive will be made to run at: above the goal column's
+  // ceiling, and above what the derivation asks for on its own so that the floor
+  // binds rather than being ignored.
+  auto reach_start = crane_planning::measure_tool_reach(model, q_start);
+  auto reach_goal = crane_planning::measure_tool_reach(model, q_goal);
+  ASSERT_TRUE(reach_start.ok()) << reach_start.status().message;
+  ASSERT_TRUE(reach_goal.ok()) << reach_goal.status().message;
+  auto derived = crane_planning::derive_transfer_altitude(
+    p_start.z(), reach_start.value().reach_m, p_goal.z(), reach_goal.value().reach_m,
+    crane_planning::scene_without_obstacles(), crane_planning::TransferAltitudeSettings{});
+  ASSERT_TRUE(derived.ok()) << derived.status().message;
+  const double altitude = std::max(blocked, derived.value().z_m + 0.05);
+
+  // The premise, verified rather than assumed: at this one altitude the lift's
+  // column is reachable and the traverse's is not.
+  ASSERT_TRUE(reachable(p_start, altitude, phi_start))
+    << "the start column is out of reach at " << altitude << " m too, so this would "
+    "refuse at the lift and prove nothing about the traverse";
+  ASSERT_FALSE(reachable(p_goal, altitude, phi_goal));
+
+  crane_planning::PrimitiveRequest request;
+  request.q_start = q_start;
+  request.q_goal = q_goal;
+  request.payload = crane_planning_test::empty_gripper();
+  request.scene = crane_planning::scene_without_obstacles();
+
+  crane_planning::PrimitiveSettings settings = context.settings.primitive;
+  settings.altitude.floor_m = altitude;
+
+  auto refused = crane_planning::build_structured_primitive(
+    model, context.geometry, limits, context.settings.ik, settings, request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_NE(refused.status().message.find("traverse phase"), std::string::npos)
+    << refused.status().message;
+  // And it is a refusal and not a deformation: no lower traverse was substituted
+  // for the one that could not be built.
+  EXPECT_NE(refused.status().message.find("refused rather than deformed"), std::string::npos)
+    << refused.status().message;
+}
+
 TEST(C2Path, AFitRefusalNamesTheSegmentItCameFrom)
 {
   const Machine & machine = crane_planning_test::machines().front();
