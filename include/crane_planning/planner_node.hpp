@@ -39,6 +39,7 @@
 #include <string>
 
 #include "crane_model/model.hpp"
+#include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "crane_planning/planner_core.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -57,6 +58,7 @@ namespace crane_planning
 inline constexpr char kPlanMotionService[] = "/crane/plan_motion";
 inline constexpr char kReferenceTopic[] = "/crane/reference";
 inline constexpr char kJointStatesTopic[] = "/joint_states";
+inline constexpr char kCollisionSceneTopic[] = "/crane/collision_scene";
 
 /// The one name that is not a contract, and that the profile remaps.
 inline constexpr char kRobotDescriptionTopic[] = "/robot_description";
@@ -74,6 +76,14 @@ inline constexpr char kPlanningFrame[] = "K0_mounting_base";
 
 /// Reliable, depth 1, volatile: the measured state this plans from.
 [[nodiscard]] rclcpp::QoS input_qos();
+
+/// Reliable, depth 1, **transient-local** -- the `/crane/collision_scene` row of 4.
+/**
+ * Transient-local because the scene is published *on change*: a planner that
+ * started after the world model last spoke would otherwise have to refuse every
+ * request until something moved.
+ */
+[[nodiscard]] rclcpp::QoS collision_scene_qos();
 
 /// The description, latched by `robot_state_publisher`.
 [[nodiscard]] rclcpp::QoS robot_description_qos();
@@ -98,6 +108,16 @@ public:
 private:
   void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
 
+  /// One `/crane/collision_scene`, converted and expanded, or refused with a reason.
+  /**
+   * Public through the service test rather than through the wire only, for the
+   * same reason `plan` is: a refusal should be readable without a round trip.
+   * The conversion is where the frame is checked, where the reserved ids of
+   * `collision.hpp` are enforced, and where the primitive carrying the measured
+   * truck pose becomes the bed and the six runges of `trajectory_planning` 4.2.
+   */
+  void on_collision_scene(crane_msgs::msg::CollisionScene::ConstSharedPtr message);
+
   /// The six actuated coordinates out of the newest `/joint_states`, by name.
   /**
    * By name and never by position: `sensor_msgs/JointState` fixes no order and
@@ -110,14 +130,20 @@ private:
 
   crane_model::Tool tool_{crane_model::Tool::Pzs100};
   PlannerSettings settings_{};
+  TruckModel truck_{};  ///< the vehicle's own geometry, keyed to the measured pose
   double max_input_age_{0.5};
 
   std::optional<crane_model::Model> model_;
   std::optional<PlannerContext> context_;
   sensor_msgs::msg::JointState::ConstSharedPtr joint_states_;
 
+  /// The newest usable scene, expanded. Absent until one arrives and converts.
+  std::optional<crane_model::CollisionScene> scene_;
+  std::string scene_note_;  ///< where it came from, or why the last one was refused
+
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_states_subscription_;
+  rclcpp::Subscription<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_subscription_;
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
   rclcpp::Service<crane_msgs::srv::PlanMotion>::SharedPtr plan_motion_;
 };

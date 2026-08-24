@@ -20,10 +20,14 @@
 // **absent** is named rather than approximated, and every absence is refused at
 // the boundary instead of stubbed:
 //
-//   collision of any kind, and the sway envelope       issue 041
 //   the sampling fallback and its smoothing            issue 042
 //   the path-constrained OCP, force, flow, kappa       issue 043
 //   replanning from a moving, swinging state           issue 045
+//
+// Collision is no longer among them: the scene of `/crane/collision_scene`, the
+// truck model of `trajectory_planning` 4.2 and the sway envelope of 4.3 arrive
+// through `collision.hpp`, and `avoid_collisions` is honoured rather than
+// refused.
 //
 // `wiki/implementation/style_guide.md` 3 is the reason this is a separate
 // translation unit from the node: the algorithm takes plain types and returns
@@ -80,8 +84,12 @@ struct MotionRequest
   double phi_z_d{};                                   ///< goal yaw, rad
   crane_model::QA q_a_start{crane_model::QA::Zero()};  ///< where the machine is now
   crane_model::Payload payload{};                      ///< what is in the gripper
+  PayloadShape payload_shape{};                        ///< and what shape it is
   double margin_factor{1.0};                           ///< kappa, i.e. `speed_scale`
-  bool avoid_collisions{true};                         ///< refused here; issue 041 answers it
+  bool avoid_collisions{true};                         ///< honoured, per `crane_msgs/PlanMotion`
+
+  /// The newest `/crane/collision_scene`, already expanded and in K0. May be null.
+  const crane_model::CollisionScene * scene{nullptr};
 };
 
 /// One answer.

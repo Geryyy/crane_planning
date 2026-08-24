@@ -253,6 +253,164 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
+  q_sway_max:
+    type: double_array
+    default_value: [0.2, 0.2]
+    read_only: true
+    description: "The admissible sway bound q_u^+ of wiki/nomenclature.md 8, rad,
+      over [tip, tilt] -- the same index order crane_msgs/PendulumState publishes
+      its arrays in. **This is where that bound lives.** wiki/mpc.md 3 constraint
+      3 imposes |q_u - q_eq| <= q_u^+ as a state box and
+      wiki/trajectory_planning.md 4.3 clears the path over the same box, so any
+      sway the MPC permits is sway the path was cleared for by construction and
+      not by coincidence; the virtual working cell of
+      wiki/control_architecture.md 5.1 consumes the same number and, by that
+      section's own rule, derives its envelope independently of this planner's
+      data.
+      **A design value, not a measured one.** 0.2 rad is roughly 11 degrees, half
+      a metre of tool travel on a 2.5 m pendulum, and it is the same swing
+      crane_supervisor's dq_u_max was derived from -- 0.4 rad/s is its peak rate
+      at the pendulum's own 2 rad/s -- so the two are consistent by construction.
+      What would replace it is a recording of a grip approach with the load
+      swinging, machine and human, like merge gate (ii-b). Read-only: a sway
+      bound that can be widened under a running planner is not one anybody can
+      reason about."
+    validation:
+      fixed_size<>: [2]
+      element_bounds<>: [0.0, 1.5]
+
+  check_resolution:
+    type: double
+    default_value: 0.10
+    read_only: true
+    description: "The largest distance any watched frame of the crane may travel
+      between two configurations the collision check looks at, m. A path checked
+      only at its waypoints is not checked, and this is what 'checked' means
+      here. It is also the step the sway envelope of 4.3 is gridded with, in tool
+      travel.
+      Its relation to the geometry is the reason for the number: a step coarser
+      than the thinnest primitive being checked can carry the tool from one side
+      of that primitive to the other with no sample inside it, so the check
+      tightens this to **half** the thinnest extent in the scene when the scene
+      carries something thinner -- half rather than all of it because the sway
+      grid is two-dimensional and can cross a box corner to corner. The legacy
+      runges are 0.28 m across, so a scene carrying them checks at 0.14 m. This
+      is a sampling rule and not a proof: the frozen model API answers for a
+      configuration and not for the sweep between two."
+    validation:
+      gt<>: [0.0]
+
+  min_check_resolution:
+    type: double
+    default_value: 0.01
+    read_only: true
+    description: "Floor on the step a scene may tighten check_resolution to, m. A
+      scene carrying something so thin that resolving it would need a finer step
+      than this is **refused** rather than checked at a step that does not
+      resolve it, because a path checked at a step it does not resolve is not
+      checked. Two centimetres of primitive is already below anything this
+      machine's own geometry is fitted to."
+    validation:
+      gt<>: [0.0]
+
+  max_check_samples:
+    type: int
+    default_value: 2048
+    read_only: true
+    description: "Cap on the configurations one path may be checked at. Each one
+      costs a Model::passive_equilibrium -- some 45 ms, because the pose the tool
+      hangs in is a function of the configuration -- plus the collision queries
+      of its sway envelope, so this is the bound that keeps a long path at a fine
+      resolution from turning a service call into a hang. Hitting it is a refusal
+      naming the travel and the step; collision_queries is not a real-time call
+      (crane_model's README) and nothing here puts it on one."
+    validation:
+      gt_eq<>: [2]
+
+  max_sway_samples:
+    type: int
+    default_value: 15
+    read_only: true
+    description: "Cap on the poses the sway envelope is resolved with, per
+      passive coordinate. The grid is only walked where the nominal clearance is
+      smaller than Delta_sway = l_tool sin(max|q_u^+|) -- everywhere else that
+      inequality already proves no admissible sway can reach anything, which is
+      trajectory_planning 4.3's own envelope used as the sufficient condition it
+      is. Hitting the cap is a refusal naming the numbers rather than a coarser
+      grid, because a coarser grid leaves sway the MPC permits unchecked."
+    validation:
+      gt_eq<>: [1]
+
+  clearance_weight:
+    type: double
+    default_value: 1.0
+    read_only: true
+    description: "How heavily collision clearance counts in the telescope
+      redundancy score of wiki/robot_model.md 2.2 step 3, against joint-range
+      centring. Step 3 names both terms and this is the second one: one
+      Model::collision_query per candidate extension, at the configuration that
+      extension closes on. Zero asks for the centring-only redundancy. It is a
+      *preference* and not the check -- the check is the one along the path, and
+      it refuses."
+    validation:
+      gt_eq<>: [0.0]
+
+  clearance_reference:
+    type: double
+    default_value: 0.5
+    read_only: true
+    description: "The clearance above which one telescope extension is as good as
+      another, m. Above it the clearance term is zero and centring decides; below
+      it the term rises, and a candidate actually in collision loses to any
+      candidate that is not, whatever its centring. Half a metre is the order of
+      the gap between the runges and the tool descending between them."
+    validation:
+      gt<>: [0.0]
+
+  truck:
+    runge_dimensions:
+      type: double_array
+      default_value: [0.28, 0.31, 2.12]
+      read_only: true
+      description: "One runge, as an extent along the bed's own axes: along the
+        bed, across it, and up, m. **The legacy geometry, preserved.** The
+        timber planner carried two rows of three boxes of exactly these
+        dimensions, hard-coded as postsRight/postsLeft in a motion-planning YAML
+        together with the bed. trajectory_planning 4.2 asks for the geometry to
+        be kept and the hard-coding dropped: what is configured here is a
+        property of the *vehicle*, and where it lands in K0_mounting_base comes
+        from the measured pose the scene carries on the primitive with the
+        reserved id 'truck'. Move the truck and the runges move with it."
+      validation:
+        fixed_size<>: [3]
+        element_bounds<>: [0.0, 100.0]
+    runge_stations:
+      type: double_array
+      default_value: [-2.0, 0.0, 2.0]
+      read_only: true
+      description: "Where the runge stations sit along the bed, measured from its
+        centre, m. One runge per station per side, so the default is 4.2's two
+        rows of three. A station that would hang a runge off the end of the
+        measured bed is refused naming both numbers, because a truck model that
+        does not fit the truck it was keyed to is a model of a different vehicle.
+        **A design value:** the legacy YAML's own station positions are not in
+        this workspace, only the box dimensions are, so these three are spaced
+        for a timber bed and a deployment measuring its own truck should replace
+        them."
+      validation:
+        element_bounds<>: [-100.0, 100.0]
+    bed_thickness:
+      type: double
+      default_value: 0.10
+      read_only: true
+      description: "How thick a slab the load area enters the scene as, m, at the
+        top face of the measured truck box. The crane is bolted to the truck, so
+        checking every link against the whole vehicle box would report the crane
+        colliding with the vehicle it is part of; what the arm has to clear is
+        the surface the load sits on. The runges stand on that face."
+      validation:
+        gt<>: [0.0]
+
   max_input_age:
     type: double
     default_value: 0.5

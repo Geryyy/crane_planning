@@ -163,13 +163,31 @@ crane_model::Result<ToolReach> measure_tool_reach(
 
 SceneExtent scene_without_obstacles()
 {
-  // The read that is not happening. Nothing in this package subscribes to
-  // /crane/collision_scene, holds the truck bed or the runges of
-  // trajectory_planning 4.2, or inflates the tool by the sway envelope of 4.3.
+  // The read that did not happen: nothing has arrived on /crane/collision_scene.
   // Returning `obstacles_known = false` with a NaN extent is the difference
-  // between "no obstacle is known" and "no obstacle is there"; issue 041 is the
-  // issue that makes them the same statement.
+  // between "no obstacle is known" and "no obstacle is there", and the second is
+  // a claim only a scene that was actually received can make.
   return SceneExtent{};
+}
+
+SceneExtent scene_extent(const crane_model::CollisionScene & scene)
+{
+  SceneExtent extent;
+  for (const crane_model::CollisionPrimitive & primitive : scene.primitives) {
+    // The top of the primitive's own box, projected onto K0's z axis, so a
+    // rotated primitive is measured at the height it really reaches rather than
+    // at the height its z extent would suggest.
+    const Eigen::Matrix3d rotation = primitive.pose_in_mounting_base.linear();
+    double half = 0.0;
+    for (Eigen::Index axis = 0; axis < 3; ++axis) {
+      half += std::abs(rotation(2, axis)) * 0.5 * primitive.dimensions_m[axis];
+    }
+    const double top = primitive.pose_in_mounting_base.translation().z() + half;
+    extent.highest_obstacle_z_m =
+      extent.obstacles_known ? std::max(extent.highest_obstacle_z_m, top) : top;
+    extent.obstacles_known = true;
+  }
+  return extent;
 }
 
 crane_model::Result<TransferAltitude> derive_transfer_altitude(
@@ -258,8 +276,8 @@ std::string describe(const TransferAltitude & altitude)
     tool_reference_name(altitude.reference_goal);
   text += altitude.obstacle_term_applied ?
     ", and by an obstacle extent asking for " + std::to_string(altitude.z_from_obstacles_m) + " m" :
-    ". The obstacle term of the derivation has no input: /crane/collision_scene arrives with "
-    "issue 041, so this altitude clears the endpoints and nothing else";
+    ". The obstacle term of the derivation had no input -- no scene carried an extent -- so this "
+    "altitude clears the endpoints and nothing else";
   if (altitude.floor_binding) {
     text += ". A configured floor raised it";
   }
@@ -269,17 +287,51 @@ std::string describe(const TransferAltitude & altitude)
   return text;
 }
 
-PrimitiveCheck check_primitive(const GeometricPath & path)
+crane_model::Result<PrimitiveCheck> check_primitive(
+  const crane_model::Model & model, const GeometricPath & path, const PrimitiveRequest & request,
+  const PrimitiveSettings & settings)
 {
   PrimitiveCheck check;
-  check.clear = true;
-  check.note = "The " + std::to_string(path.segment_count()) +
-    " segments of the primitive were not checked against anything. trajectory_planning 4.4 is "
-    "generate, check, accept, and this is the check: it passes unconditionally because there is "
-    "no collision model here yet -- no /crane/collision_scene, no truck bed, no runges, and no "
-    "tool inflated by the sway envelope of 4.3. This body is what issue 041 replaces, and this "
-    "call site is already where it belongs";
-  return check;
+  if (!request.avoid_collisions) {
+    // Said, never assumed. `crane_msgs/PlanMotion` defaults `avoid_collisions`
+    // to true, so a caller who reaches this asked for the collision-blind plan
+    // and the answer has to carry that back.
+    check.clear = true;
+    check.checked = false;
+    check.note = "Nothing was checked for collision. avoid_collisions was false, so the " +
+      std::to_string(path.segment_count()) +
+      " segments of this primitive were not put through crane_model's collision backend, no "
+      "obstacle from /crane/collision_scene was considered, the truck bed and the runges of "
+      "trajectory_planning 4.2 were not placed, the crane was not checked against itself and the "
+      "sway envelope of 4.3 was not resolved";
+    return Result<PrimitiveCheck>::success(std::move(check));
+  }
+  if (request.collision_scene == nullptr) {
+    return Result<PrimitiveCheck>::failure(
+      failure(
+        ErrorCode::NotReady,
+        "avoid_collisions is set and no scene has been received on /crane/collision_scene, so "
+        "there is nothing to check against. A trajectory returned here would read as "
+        "collision-checked without having been checked, which is worse than no trajectory"));
+  }
+
+  auto checked = check_path(
+    model, path, *request.collision_scene, request.payload, request.payload_shape,
+    settings.collision);
+  if (!checked.ok()) {
+    return Result<PrimitiveCheck>::failure(checked.status());
+  }
+
+  check.checked = true;
+  check.path = std::move(checked).value();
+  check.clear = check.path.clear;
+  check.note = describe(check.path);
+  if (!check.clear) {
+    const std::size_t segment =
+      std::min<std::size_t>(check.path.blocked_segment, kPrimitivePhaseCount - 1U);
+    check.phase = static_cast<PrimitivePhase>(segment);
+  }
+  return Result<PrimitiveCheck>::success(std::move(check));
 }
 
 crane_model::Result<StructuredPrimitive> build_structured_primitive(
@@ -316,9 +368,13 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
     return Result<StructuredPrimitive>::failure(goal.status());
   }
 
+  // The scene decides the obstacle term when there is one, so the altitude and
+  // the check below cannot be told about two different worlds.
+  const SceneExtent extent = (request.collision_scene != nullptr) ?
+    scene_extent(*request.collision_scene) : request.scene;
   auto derived = derive_transfer_altitude(
     start.value().p_tcp.z(), start.value().tool.reach_m, goal.value().p_tcp.z(),
-    goal.value().tool.reach_m, request.scene, settings.altitude);
+    goal.value().tool.reach_m, extent, settings.altitude);
   if (!derived.ok()) {
     return Result<StructuredPrimitive>::failure(
       refuse(PrimitivePhase::Lift, derived.status().message));
@@ -354,6 +410,10 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
   lift.phi_z_d = start.value().tool.phi_z;
   lift.q8 = q8_start;
   lift.payload = request.payload;
+  // The clearance half of 2.2 step 3's redundancy score, at the waypoints too:
+  // the telescope extension a transit configuration is closed at is exactly
+  // where an obstacle-aware preference is worth having.
+  lift.scene = request.collision_scene;
   auto lift_solution = solve_inverse_kinematics(model, geometry, limits, ik, lift);
   if (!lift_solution.ok()) {
     return Result<StructuredPrimitive>::failure(
@@ -370,6 +430,7 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
   traverse.phi_z_d = goal.value().tool.phi_z;
   traverse.q8 = q8_goal;
   traverse.payload = request.payload;
+  traverse.scene = request.collision_scene;
   auto traverse_solution = solve_inverse_kinematics(model, geometry, limits, ik, traverse);
   if (!traverse_solution.ok()) {
     return Result<StructuredPrimitive>::failure(
@@ -408,9 +469,14 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
   }
   primitive.path = std::move(fitted).value();
 
-  // Check, then accept. 4.4's order, as one step, so that issue 041 swaps a body
-  // rather than a structure.
-  primitive.check = check_primitive(primitive.path);
+  // Check, then accept. 4.4's order, as one step. A check that could not be run
+  // is a different answer from a path that was checked and blocked, and both are
+  // refusals rather than a primitive returned with a caveat.
+  auto checked = check_primitive(model, primitive.path, request, settings);
+  if (!checked.ok()) {
+    return Result<StructuredPrimitive>::failure(checked.status());
+  }
+  primitive.check = std::move(checked).value();
   if (!primitive.check.clear) {
     return Result<StructuredPrimitive>::failure(
       refuse(primitive.check.phase, primitive.check.note));

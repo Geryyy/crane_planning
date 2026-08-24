@@ -12,20 +12,28 @@
 // copies of a redundancy rule are two machines that drift apart, so there is
 // one copy and it is here.
 //
-// # Clearance is the other half of that sentence, and it is not here
+// # Clearance is the other half of that sentence, and it is here now
 //
-// This package checks no collision at all; the scene, the truck bed and the
-// runges arrive with issue 041. Clearance still has a *weight* rather than no
-// mention at all, because a score whose shape a caller cannot see is a score
-// nobody can add a term to later. A non-zero clearance weight is **refused**, so
-// that the day the scene arrives the refusal points at issue 041 instead of the
-// weight being read and silently ignored -- which is the same rule the rest of
-// this package follows for an absence.
+// The scene, the truck bed and the runges arrived with issue 041, so the second
+// term of step 3's score is a real one: a candidate extension is scored by how
+// close the whole crane comes to anything -- the scene, the truck model and
+// itself -- at the configuration that extension closes on.
+//
+// **Which of the two routes evaluates it is not symmetric, and that is
+// deliberate.** The scalar search of `inverse_kinematics.cpp` is where the
+// redundancy is *resolved*, so that is where clearance votes: one
+// `Model::collision_query` per candidate extension, once per solve. The
+// equilibrium-constrained NLP of `equilibrium_ik.cpp` only *holds* the freedom
+// the seed already resolved -- measured, it moves the centring score by less
+// than a part in a million -- so a clearance row there would buy no decision and
+// would cost a collision query per finite-difference probe, on a residual that
+// is not smooth where a witness pair changes.
 
 #ifndef CRANE_PLANNING__REDUNDANCY_HPP_
 #define CRANE_PLANNING__REDUNDANCY_HPP_
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <string>
 
@@ -51,9 +59,40 @@ inline constexpr std::array<std::size_t, 3> kRedundantAxes{{1, 2, 3}};
 /// How the leftover freedom is scored -- one weight per term of 2.2 step 3.
 struct RedundancyWeights
 {
-  double centring{1.0};   ///< joint-range centring; the only term there is today
-  double clearance{0.0};  ///< collision clearance, issue 041. Non-zero is refused.
+  double centring{1.0};   ///< joint-range centring
+  double clearance{1.0};  ///< collision clearance, against `clearance_reference_m`
+
+  /// The clearance above which an extension is as good as any other, m.
+  /**
+   * Not a safety margin -- the safety answer is `check_path`, which refuses. It
+   * is where the *preference* stops: two extensions that both clear everything
+   * by more than this are equally good on clearance and are then separated by
+   * their centring alone, which is what keeps the score from steering the
+   * telescope around obstacles it is nowhere near.
+   */
+  double clearance_reference_m{0.5};
 };
+
+/// Penalty on a candidate that comes closer than the reference clearance.
+/**
+ * Zero at and above the reference, rising to one at contact and past it inside,
+ * so it is the same order as the centring term over the range where the two
+ * trade against each other. A candidate that is actually **in** collision loses
+ * to any candidate that is not, whatever its centring: that is what the constant
+ * below buys, and it is what stops the search picking a beautifully centred
+ * extension that puts the telescope through a runge.
+ */
+inline constexpr double kCollidingPenalty = 1.0e3;
+
+[[nodiscard]] inline double clearance_penalty(double distance_m, double reference_m) noexcept
+{
+  if (!std::isfinite(distance_m) || !(reference_m > 0.0) || distance_m >= reference_m) {
+    return 0.0;
+  }
+  const double shortfall = (reference_m - distance_m) / reference_m;
+  const double penalty = shortfall * shortfall;
+  return (distance_m < 0.0) ? kCollidingPenalty + penalty : penalty;
+}
 
 /// One axis' distance from the middle of its own range, in half-spans.
 /**
@@ -83,7 +122,7 @@ template<std::size_t N>
   return score;
 }
 
-/// Refuse a score this package cannot actually evaluate.
+/// Refuse a score that cannot be evaluated as written.
 [[nodiscard]] inline crane_model::Status check_redundancy_weights(
   const RedundancyWeights & weights)
 {
@@ -93,14 +132,16 @@ template<std::size_t N>
       "the joint-range centring weight of robot_model 2.2 step 3 must be finite and "
       "non-negative"};
   }
-  if (weights.clearance != 0.0) {
+  if (!(weights.clearance >= 0.0)) {
     return crane_model::Status{
       crane_model::ErrorCode::InvalidArgument,
-      "a non-zero collision-clearance weight is refused: robot_model 2.2 step 3 scores the "
-      "telescope redundancy by joint-range centring *and* clearance, and this planner has no "
-      "clearance to score -- it subscribes to no /crane/collision_scene and knows nothing about "
-      "the truck bed or the runges. Clearance joins this score at issue 041. Leave the weight at "
-      "zero to ask for the centring-only redundancy this can actually resolve"};
+      "the collision-clearance weight of robot_model 2.2 step 3 must be finite and non-negative"};
+  }
+  if (weights.clearance > 0.0 && !(weights.clearance_reference_m > 0.0)) {
+    return crane_model::Status{
+      crane_model::ErrorCode::InvalidArgument,
+      "a clearance weight needs a positive reference clearance to be measured against, or every "
+      "candidate scores the same and the second half of 2.2 step 3's score votes for nothing"};
   }
   return crane_model::Status{};
 }

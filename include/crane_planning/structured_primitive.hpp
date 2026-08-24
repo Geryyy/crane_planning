@@ -10,9 +10,11 @@
 // watching a large machine move.
 //
 // 4.4's order is **generate, check, accept**, and all three happen inside
-// `build_structured_primitive` as one step. The check is a stub that always
-// passes and names issue 041; wiring its call site now is what keeps 041 from
-// being a restructure rather than a body swap.
+// `build_structured_primitive` as one step. The check is `collision.hpp`'s:
+// the path is sampled at a stated resolution, every sample is put through
+// `Model::collision_query` against `/crane/collision_scene` plus the structural
+// truck geometry of 4.2, the tool is cleared over the sway envelope of 4.3, and
+// a blocked sample refuses the primitive naming the phase it fell in.
 //
 // # The transfer altitude comes from the scene
 //
@@ -22,21 +24,22 @@
 // -- the obstacle extent, and a configured value may bound it from below or from
 // above but may not *be* it.
 //
-// Until issue 041 there is no `/crane/collision_scene`, so the obstacle term has
-// no input. That absence is a **named gap** and not a zero: `SceneExtent` starts
-// with `obstacles_known == false` and a NaN extent, so the term cannot be read
-// as "there are no obstacles", and `scene_without_obstacles()` is the one place
-// the planner says so.
+// The obstacle term's input is `/crane/collision_scene`, through
+// `scene_extent`. The absence of a scene is still a **named gap** and not a
+// zero: `SceneExtent` carries `obstacles_known == false` and a NaN extent when
+// nothing has been received or the scene is empty, so the term cannot be read as
+// "there are no obstacles", and `scene_without_obstacles()` is the one place the
+// planner says so.
 //
 // # What is out of scope here, and where it is
 //
-// Collision of any kind is issue 041; the sampling fallback and its smoothing is
-// issue 042, and a blocked primitive is a **refusal** here rather than a
-// fallback; the time parametrization, the sway-carrying OCP, the force and flow
-// constraints and kappa are issue 043, so this file produces geometry and no
-// timing; `/crane/plan_grip`'s own descend/close/open/lift phases are issue 044
-// and are a different set on a different time base -- the descend phase here is
-// the arm's, not the gripper's.
+// The sampling fallback and its smoothing is issue 042, and a blocked primitive
+// is a **refusal** here rather than a fallback; the time parametrization, the
+// sway-carrying OCP, the force and flow constraints and kappa are issue 043, so
+// this file produces geometry and no timing; `/crane/plan_grip`'s own
+// descend/close/open/lift phases are issue 044 and are a different set on a
+// different time base -- the descend phase here is the arm's, not the
+// gripper's.
 
 #ifndef CRANE_PLANNING__STRUCTURED_PRIMITIVE_HPP_
 #define CRANE_PLANNING__STRUCTURED_PRIMITIVE_HPP_
@@ -49,6 +52,7 @@
 
 #include "crane_model/model.hpp"
 #include "crane_planning/arm_geometry.hpp"
+#include "crane_planning/collision.hpp"
 #include "crane_planning/geometric_path.hpp"
 #include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/joint_limits.hpp"
@@ -82,16 +86,26 @@ struct SceneExtent
   double highest_obstacle_z_m{std::numeric_limits<double>::quiet_NaN()};
 };
 
-/// The scene as this package can see it, which until issue 041 is not at all.
+/// The scene when nothing has been received on `/crane/collision_scene`.
 /**
- * **This is the one place the obstacle stream would be read**, and it is the one
- * place the gap is stated. `/crane/collision_scene` is not subscribed anywhere
- * in this package; the truck bed and the runges of 4.2 are not known; nothing
- * inflates the tool by the sway envelope of 4.3. Issue 041 replaces the body of
- * this function with a read of the scene it consumes, and every caller of it
- * keeps working.
+ * The gap, stated rather than defaulted: no extent is known, so the obstacle
+ * term of the derivation does not run and cannot be read as "there are no
+ * obstacles". A plan that asked for collision avoidance is refused before it
+ * gets here; a plan that did not gets this and an altitude that clears its two
+ * endpoints and nothing else.
  */
 [[nodiscard]] SceneExtent scene_without_obstacles();
+
+/// The obstacle extent of a scene that *has* been received.
+/**
+ * The tallest point of any primitive, measured as the top of its own box
+ * projected onto K0's z axis, so a rotated primitive is measured at the height
+ * it really reaches. An **empty** scene is still `obstacles_known == false`:
+ * a world model that has seen nothing and a world model that has published
+ * nothing are the same statement about the transfer altitude, which is that
+ * there is no obstacle for it to clear.
+ */
+[[nodiscard]] SceneExtent scene_extent(const crane_model::CollisionScene & scene);
 
 /// A floor and a ceiling a deployment may put on the derivation. Neither is it.
 /**
@@ -134,7 +148,7 @@ struct TransferAltitude
   double tool_reach_goal_m{};       ///< and at the goal -- a different number per tool
   ToolReference reference_start{ToolReference::ToolCentre};
   ToolReference reference_goal{ToolReference::ToolCentre};
-  bool obstacle_term_applied{false};  ///< false until issue 041 supplies an extent
+  bool obstacle_term_applied{false};  ///< false when no scene carried an extent
   double z_from_obstacles_m{std::numeric_limits<double>::quiet_NaN()};
   bool floor_binding{false};
   bool ceiling_binding{false};
@@ -160,14 +174,14 @@ struct TransferAltitude
  * `p_tool` is the deepest tool frame the description carries -- see
  * `ToolReference`. It is **not** the rail's or the jaw's tip: those live in links
  * the frozen `Frame` enum does not name, so this clearance is a lower bound on
- * the tool's true vertical envelope. The envelope itself arrives with the
- * collision geometry of issue 041, which is also what inflates the tool by the
- * sway envelope of 4.3; until then a deployment that knows its site needs more
- * says so with the floor below.
+ * the tool's true vertical envelope. The envelope itself is the collision
+ * geometry `crane_model` fitted, and what the altitude does not have to cover
+ * the check of `collision.hpp` does: an altitude that clears the endpoints and
+ * leaves the traverse in something is refused, not flown.
  *
  * The obstacle term is the same statement about the tallest thing in the way,
- * and it is applied only when `scene.obstacles_known` -- see
- * `scene_without_obstacles()` for why that is false today.
+ * and it is applied only when `scene.obstacles_known` -- see `scene_extent` and
+ * `scene_without_obstacles()`.
  *
  * The tool reaches are the caller's forward-kinematics results rather than a
  * model handle, so that this function is the derivation and nothing else, and a
@@ -199,23 +213,15 @@ struct ToolReach
 /// The derivation in one sentence, for the service response.
 [[nodiscard]] std::string describe(const TransferAltitude & altitude);
 
-/// The middle step of 4.4's generate, check, accept. **A stub until issue 041.**
+/// The middle step of 4.4's generate, check, accept.
 struct PrimitiveCheck
 {
   bool clear{true};
+  bool checked{false};  ///< false when the caller asked for a collision-blind plan
   PrimitivePhase phase{PrimitivePhase::Lift};  ///< meaningful only when `clear` is false
   std::string note;                            ///< what was and was not checked
+  PathCheck path{};                            ///< the check itself, when one ran
 };
-
-/// Check the generated primitive. Today this always passes and says so.
-/**
- * Issue 041 replaces the body: the path is sampled, each sample is put through
- * `Model::collision_query` against `/crane/collision_scene` plus the structural
- * geometry of 4.2, with the tool and payload inflated by the sway envelope of
- * 4.3, and a sample in collision returns `clear = false` with the phase it fell
- * in. The signature and the call site do not move.
- */
-[[nodiscard]] PrimitiveCheck check_primitive(const GeometricPath & path);
 
 /// One move the primitive is asked to cover.
 struct PrimitiveRequest
@@ -223,7 +229,27 @@ struct PrimitiveRequest
   crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair at its equilibrium
   crane_model::Q q_goal{crane_model::Q::Zero()};   ///< the endpoint issue 039 solved
   crane_model::Payload payload{};
+  PayloadShape payload_shape{};  ///< the other half of `crane_msgs/Payload`
+
+  /// The extent the transfer altitude is derived against.
+  /**
+   * Ignored when `collision_scene` is set: the extent is then derived from that
+   * scene, so the altitude and the check cannot be told about two different
+   * worlds.
+   */
   SceneExtent scene{};
+
+  /// `avoid_collisions` of `crane_msgs/PlanMotion`, carried down to the check.
+  bool avoid_collisions{true};
+
+  /// The scene the check runs against, already in `K0_mounting_base`.
+  /**
+   * Null means none has been received. With `avoid_collisions` that is a
+   * refusal, because a plan that reads as checked and was not is worse than no
+   * plan; without it the primitive is built and the answer says nothing was
+   * checked.
+   */
+  const crane_model::CollisionScene * collision_scene{nullptr};
 };
 
 /// What a deployment configures about the primitive.
@@ -231,7 +257,21 @@ struct PrimitiveSettings
 {
   TransferAltitudeSettings altitude{};
   PathFitSettings fit{};
+  CollisionSettings collision{};
 };
+
+/// Check the generated primitive against the scene, the truck and itself.
+/**
+ * 4.4's middle step, and `collision.hpp` does the work: the path is sampled at a
+ * stated resolution, every sample is checked at the pose the tool hangs in and
+ * over the sway envelope of 4.3, and the first blocked sample refuses the
+ * primitive naming the phase its sigma fell in. A failure here is a check that
+ * could not be run -- an unusable scene, a description with no collision
+ * geometry -- and is not the same answer as a path that was checked and blocked.
+ */
+[[nodiscard]] crane_model::Result<PrimitiveCheck> check_primitive(
+  const crane_model::Model & model, const GeometricPath & path,
+  const PrimitiveRequest & request, const PrimitiveSettings & settings);
 
 /// The primitive, generated, checked and accepted.
 struct StructuredPrimitive

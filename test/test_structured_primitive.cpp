@@ -118,6 +118,7 @@ StructuredPrimitive primitive_for(
   request.q_goal = settled(model, moved(start, limits));
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
 
   auto built = crane_planning::build_structured_primitive(
     model, context.geometry, limits, context.settings.ik, context.settings.primitive, request);
@@ -174,7 +175,8 @@ TEST(TransferAltitude, TheObstacleTermIsANamedGapAndNotAZero)
 {
   const crane_planning::SceneExtent scene = crane_planning::scene_without_obstacles();
   // Not "there are no obstacles" -- "no obstacle extent is known". The two are
-  // different facts and only the second is true until issue 041.
+  // different facts, and only a scene that was actually received can make the
+  // first one.
   EXPECT_FALSE(scene.obstacles_known);
   EXPECT_TRUE(std::isnan(scene.highest_obstacle_z_m));
 
@@ -183,10 +185,10 @@ TEST(TransferAltitude, TheObstacleTermIsANamedGapAndNotAZero)
   ASSERT_TRUE(blind.ok()) << blind.status().message;
   EXPECT_FALSE(blind.value().obstacle_term_applied);
   EXPECT_TRUE(std::isnan(blind.value().z_from_obstacles_m));
-  EXPECT_NE(describe(blind.value()).find("issue 041"), std::string::npos);
+  EXPECT_NE(describe(blind.value()).find("no scene carried an extent"), std::string::npos);
 
-  // The term itself is wired and waiting for the input issue 041 will give it,
-  // so 041 supplies a producer rather than restructuring the derivation.
+  // And with an extent the term applies, which is the read `scene_extent` makes
+  // of a scene that did arrive.
   crane_planning::SceneExtent with_obstacle;
   with_obstacle.obstacles_known = true;
   with_obstacle.highest_obstacle_z_m = 6.0;
@@ -404,6 +406,7 @@ TEST(StructuredPrimitive, AStartOutsideTheJointLimitsIsRefusedAndNamesTheLiftPha
   request.q_goal = request.q_start;
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
   // Past the boom's upper stop, which is where the lift would have started.
   request.q_start[1] = limits.axis[1].upper + 1.0;
 
@@ -429,6 +432,7 @@ TEST(StructuredPrimitive, AGoalOutsideTheJointLimitsIsRefusedAndNamesTheDescendP
   request.q_goal = request.q_start;
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
   request.q_goal[1] = limits.axis[1].lower - 1.0;
 
   auto refused = crane_planning::build_structured_primitive(
@@ -452,6 +456,7 @@ TEST(StructuredPrimitive, ATransferAltitudeBelowBothEndpointsIsRefusedRatherThan
   request.q_goal = settled(model, moved(start, limits));
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
 
   // A ceiling far below the machine's own mounting base: the derivation asks for
   // an altitude above both endpoints and the ceiling takes it away. A lift that
@@ -482,6 +487,7 @@ TEST(StructuredPrimitive, AnUnreachableTransferAltitudeIsRefusedAndNamesTheLiftP
   request.q_goal = settled(model, moved(start, limits));
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
 
   crane_planning::PrimitiveSettings settings = context.settings.primitive;
   settings.altitude.floor_m = 500.0;  // no crane on this site is 500 m tall
@@ -593,6 +599,7 @@ TEST(StructuredPrimitive, AGoalColumnTheArmCannotReachIsRefusedAndNamesTheTraver
   request.q_goal = q_goal;
   request.payload = crane_planning_test::empty_gripper();
   request.scene = crane_planning::scene_without_obstacles();
+  request.avoid_collisions = false;  // collision is test_collision's; this is the geometry
 
   crane_planning::PrimitiveSettings settings = context.settings.primitive;
   settings.altitude.floor_m = altitude;
@@ -672,7 +679,7 @@ TEST(StructuredPrimitive, TheDescendClearanceIsTheMountedToolsOwnAndDiffersBetwe
   EXPECT_EQ(reference[1], crane_planning::ToolReference::ToolContact);
 }
 
-TEST(StructuredPrimitive, TheCheckRunsBeforeAcceptanceAndNamesTheIssueThatWritesIt)
+TEST(StructuredPrimitive, TheCheckRunsBeforeAcceptanceAndSaysWhatItChecked)
 {
   const Machine & machine = crane_planning_test::machines().front();
   const crane_model::Model model = crane_planning_test::build_model(machine);
@@ -683,9 +690,19 @@ TEST(StructuredPrimitive, TheCheckRunsBeforeAcceptanceAndNamesTheIssueThatWrites
 
   // trajectory_planning 4.4 is generate, check, accept, and the accepted
   // primitive carries what the check said rather than the check being implied.
+  // `primitive_for` asks for a collision-blind plan, so what it has to carry is
+  // that nothing was checked -- the collision check itself is test_collision.
   EXPECT_TRUE(primitive.check.clear);
-  EXPECT_NE(primitive.check.note.find("issue 041"), std::string::npos) << primitive.check.note;
-  EXPECT_TRUE(crane_planning::check_primitive(primitive.path).clear);
+  EXPECT_FALSE(primitive.check.checked);
+  EXPECT_NE(primitive.check.note.find("Nothing was checked"), std::string::npos)
+    << primitive.check.note;
+
+  crane_planning::PrimitiveRequest blind;
+  blind.avoid_collisions = false;
+  auto checked =
+    crane_planning::check_primitive(model, primitive.path, blind, context.settings.primitive);
+  ASSERT_TRUE(checked.ok()) << checked.status().message;
+  EXPECT_TRUE(checked.value().clear);
 }
 
 TEST(StructuredPrimitive, TheEndpointsAreTheIkSolutionsAndTheRampRunsAlongThePath)
@@ -719,6 +736,7 @@ TEST(StructuredPrimitive, TheEndpointsAreTheIkSolutionsAndTheRampRunsAlongThePat
     request.q_goal = endpoint.value().q;
     request.payload = crane_planning_test::empty_gripper();
     request.scene = crane_planning::scene_without_obstacles();
+    request.avoid_collisions = false;
     auto built = crane_planning::build_structured_primitive(
       model, context.geometry, limits, context.settings.ik, context.settings.primitive, request);
     ASSERT_TRUE(built.ok()) << machine.name << ": " << built.status().message;

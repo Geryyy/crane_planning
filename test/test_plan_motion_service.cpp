@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "crane_msgs/msg/collision_primitive.hpp"
+#include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -115,6 +117,8 @@ protected:
       crane_planning::kJointStatesTopic, crane_planning::input_qos());
     robot_description_ = client_node_->create_publisher<std_msgs::msg::String>(
       crane_planning::kRobotDescriptionTopic, crane_planning::robot_description_qos());
+    collision_scene_ = client_node_->create_publisher<crane_msgs::msg::CollisionScene>(
+      crane_planning::kCollisionSceneTopic, crane_planning::collision_scene_qos());
 
     executor_.add_node(planner_);
     executor_.add_node(client_node_);
@@ -232,6 +236,7 @@ protected:
   rclcpp::Subscription<JointTrajectory>::SharedPtr reference_;
   rclcpp::Publisher<JointState>::SharedPtr joint_states_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_;
+  rclcpp::Publisher<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_;
   std::vector<JointTrajectory> published_;
   std::optional<crane_model::Model> model_;
   rclcpp::Time start_stamp_;
@@ -260,7 +265,7 @@ TEST_F(PlanMotionService, AGoalInAnyOtherFrameIsRefusedNamingBoth)
   EXPECT_TRUE(response->trajectory.points.empty());
 }
 
-TEST_F(PlanMotionService, CollisionAvoidanceIsRefusedNamingItsIssue)
+TEST_F(PlanMotionService, CollisionAvoidanceWithoutASceneIsRefusedNamingTheTopic)
 {
   publish_start();
   auto request = collision_blind_request();
@@ -268,8 +273,62 @@ TEST_F(PlanMotionService, CollisionAvoidanceIsRefusedNamingItsIssue)
   const auto response = call(request);
   ASSERT_NE(response, nullptr);
   EXPECT_FALSE(response->success);
-  EXPECT_NE(response->message.find("issue 041"), std::string::npos) << response->message;
+  EXPECT_NE(response->message.find(crane_planning::kCollisionSceneTopic), std::string::npos)
+    << response->message;
   EXPECT_TRUE(response->trajectory.points.empty());
+}
+
+TEST_F(PlanMotionService, ASceneInAnyOtherFrameIsRefusedNamingBoth)
+{
+  // ROS 2 Interfaces 4 gives this row `K0_mounting_base` and names the world
+  // model as the element that has already converted `world` into it. A scene in
+  // another frame is a scene about somewhere else.
+  crane_msgs::msg::CollisionScene scene;
+  scene.header.frame_id = "world";
+  scene.header.stamp = client_node_->now();
+  collision_scene_->publish(scene);
+  publish_start();
+
+  auto request = collision_blind_request();
+  request->avoid_collisions = true;
+  const auto response = call(request);
+  ASSERT_NE(response, nullptr);
+  EXPECT_FALSE(response->success);
+  EXPECT_NE(response->message.find("world"), std::string::npos) << response->message;
+  EXPECT_NE(response->message.find(crane_planning::kPlanningFrame), std::string::npos)
+    << response->message;
+}
+
+TEST_F(PlanMotionService, ASubscribedSceneBecomesTheTruckOfTrajectoryPlanningFourTwo)
+{
+  // One primitive with the reserved id `truck`, parked well clear of this goal,
+  // becomes the bed and the six runges -- and the answer says so, which is the
+  // whole of "keyed to the measured truck pose rather than hard-coded".
+  crane_msgs::msg::CollisionScene scene;
+  scene.header.frame_id = crane_planning::kPlanningFrame;
+  scene.header.stamp = client_node_->now();
+  crane_msgs::msg::CollisionPrimitive truck;
+  truck.id = crane_planning::kTruckId;
+  truck.shape = crane_msgs::msg::CollisionScene::SHAPE_BOX;
+  truck.structural = true;
+  truck.pose.position.x = 18.0;
+  truck.pose.orientation.w = 1.0;
+  truck.dimensions.x = 6.5;
+  truck.dimensions.y = 2.4;
+  truck.dimensions.z = 1.2;
+  scene.primitives.push_back(truck);
+  collision_scene_->publish(scene);
+  publish_start();
+
+  auto request = collision_blind_request();
+  request->avoid_collisions = true;
+  const auto response = call(request);
+  ASSERT_NE(response, nullptr);
+  ASSERT_TRUE(response->success) << response->message;
+  EXPECT_FALSE(response->trajectory.points.empty());
+  EXPECT_NE(response->message.find("runges"), std::string::npos) << response->message;
+  EXPECT_NE(response->message.find("structural"), std::string::npos) << response->message;
+  EXPECT_NE(response->message.find("4.3"), std::string::npos) << response->message;
 }
 
 TEST_F(PlanMotionService, ASpeedScaleOutsideTheUnitIntervalIsRefused)

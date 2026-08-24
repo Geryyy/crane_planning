@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 
+#include "crane_planning/collision.hpp"
 #include "crane_planning/redundancy.hpp"
 
 #include <algorithm>
@@ -106,6 +107,58 @@ double centring_score(const JointLimits & limits, const Closure & candidate)
     std::array<double, 4>{{candidate.q1, candidate.q2, candidate.q3, candidate.q4}});
 }
 
+/// What the clearance half of 2.2 step 3's score is evaluated against.
+/**
+ * The passive pair is **pinned** here, at the equilibrium of the configuration
+ * the solve started from, rather than re-solved per candidate: one
+ * `Model::passive_equilibrium` costs some 45 ms against 0.35 ms for a forward
+ * kinematics call, and forty-one of them per solve would cost more than the
+ * whole endpoint NLP. The pin is honest because this score is a *preference*
+ * between extensions and not the safety check -- `check_path` settles the pair
+ * exactly at every configuration it checks, and it is what refuses a path.
+ */
+struct ClearanceContext
+{
+  const crane_model::CollisionScene * scene{nullptr};
+  RedundancyWeights weights{};
+  Eigen::Vector2d q_u{Eigen::Vector2d::Zero()};
+  double q7{};
+  double q8{};
+
+  [[nodiscard]] bool votes() const noexcept
+  {
+    return scene != nullptr && weights.clearance > 0.0;
+  }
+};
+
+/// The clearance term of the score, or zero when there is no scene to score on.
+double clearance_score(
+  const crane_model::Model & model, const ClearanceContext & clearance, const Closure & candidate)
+{
+  if (!clearance.votes()) {
+    return 0.0;
+  }
+  Q q = Q::Zero();
+  q[0] = candidate.q1;
+  q[1] = candidate.q2;
+  q[2] = candidate.q3;
+  q[3] = candidate.q4;
+  q.segment<2>(4) = clearance.q_u;
+  q[6] = clearance.q7;
+  q[7] = clearance.q8;
+
+  auto distance = clearance_at(model, *clearance.scene, q);
+  if (!distance.ok()) {
+    // A description with no collision geometry is a model that answers every
+    // other question perfectly well (crane_model's README), so the redundancy
+    // falls back to centring alone rather than the whole solve failing on a
+    // preference it could not evaluate.
+    return 0.0;
+  }
+  return clearance.weights.clearance *
+         clearance_penalty(distance.value(), clearance.weights.clearance_reference_m);
+}
+
 bool inside(const AxisLimit & axis, double value)
 {
   return !axis.bounded || (value >= axis.lower && value <= axis.upper);
@@ -184,7 +237,7 @@ enum class ClosureFailure
 ClosureFailure solve_closure(
   const crane_model::Model & model, const ArmGeometry & geometry, const JointLimits & limits,
   std::size_t d45_samples, const Eigen::Vector3d & p_wrist_0, const Closure * fixed,
-  Closure & out)
+  const ClearanceContext & clearance, Closure & out)
 {
   const double q1 = representative(limits.axis[0], std::atan2(p_wrist_0.y(), p_wrist_0.x()));
   if (!inside(limits.axis[0], q1)) {
@@ -256,8 +309,11 @@ ClosureFailure solve_closure(
       if (!inside(limits.axis[1], candidate.q2) || !inside(limits.axis[2], candidate.q3)) {
         continue;
       }
+      // 2.2 step 3's score, both halves of it: joint-range centring and
+      // collision clearance, with the reach deficit dominating either.
       candidate.score = centring_score(limits, candidate) +
-        kDeficitWeight * candidate.deficit * candidate.deficit;
+        kDeficitWeight * candidate.deficit * candidate.deficit +
+        clearance_score(model, clearance, candidate);
       if (candidate.score < best.score) {
         best = candidate;
       }
@@ -479,6 +535,13 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
   // solution actually has -- but seeding from the tool's own hanging length
   // rather than from zero is what keeps a goal near the slewing axis from
   // starting on the far side of it.
+  {
+    const Status weights = check_redundancy_weights(settings.redundancy);
+    if (!weights.ok()) {
+      return Result<IkSolution>::failure(weights);
+    }
+  }
+
   Q q = nominal_configuration(limits, request.q8);
   Placement placement;
   Status status = settle(model, request.payload, q, placement, calls);
@@ -486,6 +549,15 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
     return Result<IkSolution>::failure(std::move(status));
   }
   Eigen::Vector3d wrist = request.p_tcp_0 - (placement.p_tcp - placement.p_tip);
+
+  // The pin the clearance half of step 3's score is evaluated at: where the tool
+  // hangs at the seed. See `ClearanceContext` for why it is not re-solved per
+  // candidate.
+  ClearanceContext clearance;
+  clearance.scene = request.scene;
+  clearance.weights = settings.redundancy;
+  clearance.q_u = q.segment<2>(4);
+  clearance.q8 = request.q8;
   double q7 = 0.0;
   double sensitivity = 0.0;
   bool sensitivity_known = false;
@@ -514,9 +586,10 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
   for (std::size_t iteration = 0; iteration < budget; ++iteration) {
     // ---- steps 1 to 3: the azimuth, the planar closure, the telescope.
     Closure candidate;
+    clearance.q7 = q7;
     const ClosureFailure closure = solve_closure(
       model, geometry, limits, settings.d45_samples, wrist,
-      resolved_valid ? &resolved : nullptr, candidate);
+      resolved_valid ? &resolved : nullptr, clearance, candidate);
     if (closure != ClosureFailure::None) {
       if (!closed) {
         refusal = closure;

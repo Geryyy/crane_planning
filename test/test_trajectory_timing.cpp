@@ -134,7 +134,7 @@ TEST(ScaledRamp, AScaleOutsideTheUnitIntervalIsRefused)
   EXPECT_TRUE(crane_planning::check_margin_factor(1.0).ok());
 }
 
-TEST(PlanMotion, CollisionAvoidanceIsRefusedAndNamesItsIssue)
+TEST(PlanMotion, CollisionAvoidanceIsHonouredAndItsAbsenceIsSaidOutLoud)
 {
   const Machine & machine = crane_planning_test::machines().front();
   const crane_model::Model model = crane_planning_test::build_model(machine);
@@ -148,16 +148,32 @@ TEST(PlanMotion, CollisionAvoidanceIsRefusedAndNamesItsIssue)
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = true;  // which is what the .srv defaults to
 
+  // No scene has been received, so there is nothing to check against and the
+  // request is refused rather than answered with a trajectory that would read as
+  // collision-checked.
   auto refused = crane_planning::plan_motion(model, context, request);
   ASSERT_FALSE(refused.ok());
-  EXPECT_NE(refused.status().message.find("issue 041"), std::string::npos)
+  EXPECT_NE(refused.status().message.find("/crane/collision_scene"), std::string::npos)
     << refused.status().message;
 
-  // And the same request without the demand is answerable, so the refusal is
-  // about collision and not about the goal.
+  // The same request against a scene is answerable, so the refusal is about the
+  // missing scene and not about the goal.
+  const crane_model::CollisionScene empty;
+  request.scene = &empty;
+  auto checked = crane_planning::plan_motion(model, context, request);
+  ASSERT_TRUE(checked.ok()) << checked.status().message;
+  EXPECT_TRUE(checked.value().primitive.check.checked);
+  EXPECT_GT(checked.value().primitive.check.path.samples, 2U);
+
+  // And the same request without the demand is answerable too, and says in as
+  // many words that nothing was checked.
+  request.scene = nullptr;
   request.avoid_collisions = false;
   auto planned = crane_planning::plan_motion(model, context, request);
-  EXPECT_TRUE(planned.ok()) << planned.status().message;
+  ASSERT_TRUE(planned.ok()) << planned.status().message;
+  EXPECT_FALSE(planned.value().primitive.check.checked);
+  EXPECT_NE(planned.value().primitive.check.note.find("Nothing was checked"), std::string::npos)
+    << planned.value().primitive.check.note;
 }
 
 TEST(PlanMotion, TheScaleIsRefusedBeforeTheSolveRatherThanAfterIt)

@@ -554,12 +554,12 @@ TEST(EquilibriumIk, AnUnboundedSolveIsRefusedOutright)
   }
 }
 
-TEST(EquilibriumIk, ANonZeroClearanceWeightIsRefusedNamingItsIssue)
+TEST(EquilibriumIk, AClearanceWeightWithNoReferenceToMeasureItAgainstIsRefused)
 {
   // `robot_model` 2.2 step 3 scores the telescope redundancy by joint-range
-  // centring *and* clearance. This planner has no scene, so the second half is
-  // refused rather than read and silently ignored -- the interface has the place
-  // to put it and issue 041 fills it.
+  // centring *and* clearance. Both halves are real now, and what is refused is a
+  // weight with nothing to measure against: every candidate would then score the
+  // same and the second half of the score would vote for nothing.
   const Machine & machine = crane_planning_test::machines().front();
   const crane_model::Model model = crane_planning_test::build_model(machine);
   const crane_planning::PlannerContext context =
@@ -572,9 +572,10 @@ TEST(EquilibriumIk, ANonZeroClearanceWeightIsRefusedNamingItsIssue)
 
   crane_planning::EquilibriumIkSettings settings = context.settings.equilibrium;
   settings.redundancy.clearance = 1.0;
+  settings.redundancy.clearance_reference_m = 0.0;
   auto refused = crane_planning::solve_equilibrium_constrained_ik(
     model, context.geometry, context.limits, context.settings.ik, settings, request);
   ASSERT_FALSE(refused.ok());
-  EXPECT_NE(refused.status().message.find("041"), std::string::npos)
+  EXPECT_NE(refused.status().message.find("reference clearance"), std::string::npos)
     << refused.status().message;
 }

@@ -47,18 +47,18 @@ crane_model::Result<MotionPlan> plan_motion(
   const crane_model::Model & model, const PlannerContext & context,
   const MotionRequest & request)
 {
-  // Refused, not stubbed. `crane_msgs/PlanMotion` defaults `avoid_collisions` to
-  // true, so a caller that fills nothing in gets this message rather than a
-  // trajectory that reads as collision-checked and is not.
-  if (request.avoid_collisions) {
+  // `crane_msgs/PlanMotion` defaults `avoid_collisions` to true, so a caller
+  // that fills nothing in asks for a checked plan -- and gets a refusal rather
+  // than a trajectory that reads as checked when no scene has arrived.
+  if (request.avoid_collisions && request.scene == nullptr) {
     return Result<MotionPlan>::failure(
       failure(
-        ErrorCode::InvalidArgument,
-        "avoid_collisions=true is refused: this planner checks no collision at all -- it does not "
-        "subscribe to /crane/collision_scene and it knows nothing about the truck bed or the "
-        "runges. Collision, including the tool sway envelope of trajectory_planning 4.3, arrives "
-        "with issue 041. Set avoid_collisions=false to ask for the collision-blind plan this can "
-        "actually produce"));
+        ErrorCode::NotReady,
+        "avoid_collisions is set and nothing has been received on /crane/collision_scene, so "
+        "there is no scene to check against. The truck bed and the runges of "
+        "trajectory_planning 4.2 are keyed to the truck pose that scene carries, so they are not "
+        "known either. Set avoid_collisions=false to ask for a plan that says in as many words "
+        "that nothing was checked"));
   }
   {
     Status status = check_margin_factor(request.margin_factor);
@@ -79,6 +79,12 @@ crane_model::Result<MotionPlan> plan_motion(
   // `/crane/plan_grip`, which is issue 044.
   goal.q8 = request.q_a_start[static_cast<Eigen::Index>(kToolRow)];
   goal.payload = request.payload;
+  // The clearance half of robot_model 2.2 step 3's redundancy score, which is a
+  // preference between telescope extensions rather than a check. It is offered
+  // the scene whenever there is one: `avoid_collisions` governs whether the path
+  // is *checked*, and a well-cleared extension is not a worse answer to a caller
+  // who asked for no check.
+  goal.scene = request.scene;
 
   // The route decision of robot_model 2.2's closing paragraph, made here rather
   // than asked of the caller: a `/crane/plan_motion` goal is a *placement* goal,
@@ -113,7 +119,12 @@ crane_model::Result<MotionPlan> plan_motion(
   primitive.q_start[5] = settled_start.value()[1];
   primitive.q_goal = plan.endpoint.q;
   primitive.payload = request.payload;
-  // The one read of the scene there is, and it reads nothing: issue 041.
+  primitive.payload_shape = request.payload_shape;
+  primitive.avoid_collisions = request.avoid_collisions;
+  // The scene, once, for both the transfer altitude and the check. Without one
+  // the altitude clears the two endpoints and says so, and the check either was
+  // not asked for or has already been refused above.
+  primitive.collision_scene = request.scene;
   primitive.scene = scene_without_obstacles();
 
   auto built = build_structured_primitive(

@@ -25,6 +25,7 @@ find_package(urdfdom REQUIRED)
 # object, so no `--exclude-libs` workaround is needed.
 add_library(planner_core STATIC
   src/arm_geometry.cpp
+  src/collision.cpp
   src/equilibrium_ik.cpp
   src/geometric_path.cpp
   src/inverse_kinematics.cpp
@@ -173,6 +174,15 @@ if(BUILD_TESTING)
   ament_add_gtest(test_structured_primitive test/test_structured_primitive.cpp TIMEOUT 900)
   target_link_libraries(test_structured_primitive planner_core)
   target_compile_definitions(test_structured_primitive PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: collision, the truck model keyed to a measured pose, the sway
+  # envelope of trajectory_planning §4.3 and the self-collision of §4.2's
+  # `[!todo]` — every scene built in the test rather than subscribed, so nothing
+  # here needs a graph. Offline C++ against both machine descriptions.
+  ament_add_gtest(test_collision test/test_collision.cpp TIMEOUT 900)
+  target_link_libraries(test_collision planner_core)
+  target_compile_definitions(test_collision PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes

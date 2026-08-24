@@ -118,8 +118,14 @@ constexpr double kRestorationTolerance = 1.0e-3;
  * step's scalar search, and measured against it this objective then moves the
  * centring score by less than a part in a million. Their job is to keep the
  * redundant direction non-degenerate, so the Gauss-Newton step cannot wander
- * along the one direction the task cannot see, and to be the row issue 041's
- * clearance is added to once there is a scene to score against.
+ * along the one direction the task cannot see.
+ *
+ * **Step 3's clearance term is therefore not a row here**, and that is a
+ * decision rather than an omission: it votes where the redundancy is resolved,
+ * which is the scalar search the seed comes off (`redundancy.hpp`). Adding it
+ * here would cost a `Model::collision_query` per finite-difference probe, on a
+ * residual that is not smooth where the closest pair changes, to move an answer
+ * this objective is already measured not to move.
  */
 constexpr double kCentringScale = 1.0e-3;
 

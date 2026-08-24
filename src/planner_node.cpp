@@ -4,12 +4,14 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "crane_msgs/msg/collision_primitive.hpp"
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_planning/crane_planner_parameters.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -34,6 +36,45 @@ bool tool_from_string(const std::string & name, crane_model::Tool & tool)
   return false;
 }
 
+/// The message's shape enumeration, as `crane_model`'s.
+/**
+ * The two lists are the same three shapes in the same order and are still
+ * converted rather than cast: a shape the message adds later would then be a
+ * refusal here instead of whatever the cast happened to land on.
+ */
+bool shape_from_message(std::uint8_t shape, crane_model::CollisionShape & out)
+{
+  switch (shape) {
+    case crane_msgs::msg::CollisionScene::SHAPE_BOX:
+      out = crane_model::CollisionShape::Box;
+      return true;
+    case crane_msgs::msg::CollisionScene::SHAPE_CYLINDER:
+      out = crane_model::CollisionShape::Cylinder;
+      return true;
+    case crane_msgs::msg::CollisionScene::SHAPE_SPHERE:
+      out = crane_model::CollisionShape::Sphere;
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// A `geometry_msgs/Pose` as the isometry the model's scene is expressed in.
+bool pose_from_message(const geometry_msgs::msg::Pose & pose, Eigen::Isometry3d & out)
+{
+  // ROS carries the quaternion scalar-last and Eigen scalar-first
+  // (wiki/nomenclature.md 5); the reorder is this boundary's job.
+  const Eigen::Quaterniond orientation(
+    pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+  if (!std::isfinite(orientation.norm()) || !(orientation.norm() > 0.0)) {
+    return false;
+  }
+  out = Eigen::Isometry3d::Identity();
+  out.linear() = orientation.normalized().toRotationMatrix();
+  out.translation() = Eigen::Vector3d(pose.position.x, pose.position.y, pose.position.z);
+  return out.matrix().allFinite();
+}
+
 }  // namespace
 
 namespace crane_planning
@@ -47,6 +88,11 @@ rclcpp::QoS reference_qos()
 rclcpp::QoS input_qos()
 {
   return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().durability_volatile();
+}
+
+rclcpp::QoS collision_scene_qos()
+{
+  return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
 }
 
 rclcpp::QoS robot_description_qos()
@@ -95,6 +141,30 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.primitive.fit.rate_headroom = parameters.path_rate_headroom;
   settings_.primitive.fit.acceleration_span = parameters.path_acceleration_span;
   settings_.primitive.fit.jerk_span = parameters.path_jerk_span;
+
+  // The sway envelope of trajectory_planning 4.3, at the bound mpc 3 constraint
+  // 3 imposes. `fixed_size<>` on the parameter is what keeps this pair a pair.
+  settings_.primitive.collision.sway.q_sway_max =
+    Eigen::Vector2d(parameters.q_sway_max.at(0), parameters.q_sway_max.at(1));
+  settings_.primitive.collision.resolution_m = parameters.check_resolution;
+  settings_.primitive.collision.min_resolution_m = parameters.min_check_resolution;
+  settings_.primitive.collision.max_samples =
+    static_cast<std::size_t>(parameters.max_check_samples);
+  settings_.primitive.collision.max_sway_samples =
+    static_cast<std::size_t>(parameters.max_sway_samples);
+  truck_.runge_dimensions_m = Eigen::Vector3d(
+    parameters.truck.runge_dimensions.at(0), parameters.truck.runge_dimensions.at(1),
+    parameters.truck.runge_dimensions.at(2));
+  truck_.station_offsets_m = parameters.truck.runge_stations;
+  truck_.bed_thickness_m = parameters.truck.bed_thickness;
+  settings_.primitive.collision.truck = truck_;
+
+  // The second half of robot_model 2.2 step 3's redundancy score. Both routes
+  // spend the leftover freedom the same way, so both carry the same weights.
+  settings_.ik.redundancy.clearance = parameters.clearance_weight;
+  settings_.ik.redundancy.clearance_reference_m = parameters.clearance_reference;
+  settings_.equilibrium.redundancy = settings_.ik.redundancy;
+
   settings_.ramp.Ts = parameters.Ts;
   settings_.ramp.min_duration = parameters.min_duration;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
@@ -110,6 +180,11 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   robot_description_subscription_ = create_subscription<std_msgs::msg::String>(
     kRobotDescriptionTopic, robot_description_qos(),
     [this](std_msgs::msg::String::ConstSharedPtr message) {on_robot_description(message);});
+  collision_scene_subscription_ = create_subscription<crane_msgs::msg::CollisionScene>(
+    kCollisionSceneTopic, collision_scene_qos(),
+    [this](crane_msgs::msg::CollisionScene::ConstSharedPtr message) {
+      on_collision_scene(message);
+    });
   plan_motion_ = create_service<crane_msgs::srv::PlanMotion>(
     kPlanMotionService,
     [this](
@@ -127,10 +202,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "-- the geometry is the structured lift/traverse/descend primitive of trajectory_planning "
     "4.4, built C2 in sigma with its transfer altitude derived from the endpoints and the tool's "
     "own reach rather than hard-coded, and the timing is one velocity-limited ramp run along it. "
-    "There is no collision check of any kind (issue 041), no sampling fallback when the "
-    "primitive is refused (issue 042) and no path-constrained OCP, so no force, flow or kappa "
-    "margin (issue 043). Each of those is refused or named rather than approximated.",
-    kPlanMotionService, kReferenceTopic);
+    "The path is checked against %s -- the scene, the truck bed and the runges of "
+    "trajectory_planning 4.2 keyed to the measured truck pose, and the crane against itself -- "
+    "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. There is no sampling "
+    "fallback when the primitive is blocked (issue 042) and no path-constrained OCP, so no force, "
+    "flow or kappa margin (issue 043). Each of those is refused or named rather than "
+    "approximated.",
+    kPlanMotionService, kReferenceTopic, kCollisionSceneTopic);
 }
 
 void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr message)
@@ -177,6 +255,95 @@ void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr mes
     "(robot_model 2.2), probed out of the description rather than written down.",
     kRobotDescriptionTopic, context_->geometry.a2, context_->geometry.a3,
     context_->geometry.d45_0, context_->geometry.d45_gain);
+}
+
+void PlannerNode::on_collision_scene(crane_msgs::msg::CollisionScene::ConstSharedPtr message)
+{
+  // The frame is checked and never assumed, on the same terms as the goal pose.
+  // ROS 2 Interfaces 4 gives this row `K0_mounting_base` and names the world
+  // model as the element that has already converted `world` into it; a scene in
+  // any other frame is a scene about somewhere else, and taking it as K0 would
+  // put the truck wherever the vehicle happens to be parked.
+  if (message->header.frame_id != kPlanningFrame) {
+    scene_note_ = std::string("the newest ") + kCollisionSceneTopic + " is in frame '" +
+      message->header.frame_id + "' and this planner plans in '" + kPlanningFrame +
+      "', so it was refused rather than reinterpreted";
+    RCLCPP_ERROR(get_logger(), "%s", scene_note_.c_str());
+    return;
+  }
+
+  crane_model::CollisionScene scene;
+  std::vector<std::string> ids;
+  scene.primitives.reserve(message->primitives.size());
+  ids.reserve(message->primitives.size());
+
+  for (const crane_msgs::msg::CollisionPrimitive & incoming : message->primitives) {
+    std::string why;
+    crane_model::CollisionPrimitive primitive;
+    primitive.id = incoming.id;
+    primitive.structural = incoming.structural;
+    primitive.dimensions_m = Eigen::Vector3d(
+      incoming.dimensions.x, incoming.dimensions.y, incoming.dimensions.z);
+
+    if (incoming.id.empty()) {
+      why = "a primitive arrived with no id, and crane_model needs one to name it in a refusal";
+    } else if (incoming.id == kPayloadId) {
+      why = "a primitive arrived with the reserved id '" + std::string(kPayloadId) +
+        "', which crane_model reads as geometry the tool is carrying and does not check against "
+        "the links that carry it. The planner places the payload; the scene does not";
+    } else if (std::find(ids.begin(), ids.end(), incoming.id) != ids.end()) {
+      why = "the id '" + incoming.id + "' arrived twice";
+    } else if (!shape_from_message(incoming.shape, primitive.shape)) {
+      why = "primitive '" + incoming.id + "' carries shape " +
+        std::to_string(static_cast<int>(incoming.shape)) + ", which is none of the three";
+    } else if (!pose_from_message(incoming.pose, primitive.pose_in_mounting_base)) {
+      why = "primitive '" + incoming.id + "' does not carry a usable pose";
+    } else if (!primitive.dimensions_m.allFinite() ||
+      (primitive.dimensions_m.array() <= 0.0).any())
+    {
+      why = "primitive '" + incoming.id +
+        "' has no positive extent along every axis of its own frame; dimensions are the extent "
+        "per axis, so a box carries its three side lengths and a cylinder (2r, 2r, length)";
+    }
+    if (!why.empty()) {
+      scene_note_ = "the newest scene was refused whole rather than silently shortened: " + why;
+      RCLCPP_ERROR(get_logger(), "%s", scene_note_.c_str());
+      return;
+    }
+    ids.push_back(incoming.id);
+
+    // The truck is not an obstacle, it is a *pose*: trajectory_planning 4.2's
+    // structural geometry is keyed to it here, so that the bed and the runges
+    // move when the vehicle does and nothing hard-codes where they are.
+    if (incoming.id == kTruckId) {
+      auto expanded = expand_truck(primitive, truck_);
+      if (!expanded.ok()) {
+        scene_note_ = "the truck model does not fit the truck the scene measured: " +
+          expanded.status().message;
+        RCLCPP_ERROR(get_logger(), "%s", scene_note_.c_str());
+        return;
+      }
+      for (const crane_model::CollisionPrimitive & piece : expanded.value()) {
+        scene.primitives.push_back(piece);
+      }
+      continue;
+    }
+    scene.primitives.push_back(std::move(primitive));
+  }
+
+  const std::size_t structural = static_cast<std::size_t>(
+    std::count_if(
+      scene.primitives.begin(), scene.primitives.end(),
+      [](const crane_model::CollisionPrimitive & primitive) {return primitive.structural;}));
+  scene_note_ = std::to_string(message->primitives.size()) + " primitives arrived on " +
+    kCollisionSceneTopic + " and became " + std::to_string(scene.primitives.size()) + ", " +
+    std::to_string(structural) + " of them structural";
+  scene_note_ += (std::find(ids.begin(), ids.end(), kTruckId) != ids.end()) ?
+    ". The truck pose was expanded into the bed and the runges of trajectory_planning 4.2, at the "
+    "legacy dimensions and keyed to that pose" :
+    ". No primitive carried the reserved id 'truck', so no bed and no runges were placed";
+  scene_.emplace(std::move(scene));
+  RCLCPP_INFO(get_logger(), "%s", scene_note_.c_str());
 }
 
 bool PlannerNode::read_start(crane_model::QA & q_a_start, std::string & why) const
@@ -296,11 +463,46 @@ void PlannerNode::plan(
     motion.payload.mass_kg = request.payload.mass;
     motion.payload.center_of_mass_k8_m = Eigen::Vector3d(
       request.payload.com.x, request.payload.com.y, request.payload.com.z);
+
+    // The other half of the same message: the shape and the extent, which the
+    // equilibrium has no use for and the collision check cannot do without. It
+    // becomes the scene primitive with the reserved id `payload`, placed at the
+    // K8 pose of every configuration the path is checked at.
+    motion.payload_shape.declared = true;
+    motion.payload_shape.dimensions_m = Eigen::Vector3d(
+      request.payload.dimensions.x, request.payload.dimensions.y, request.payload.dimensions.z);
+    motion.payload_shape.center_k8_m = motion.payload.center_of_mass_k8_m;
+    if (!shape_from_message(request.payload.shape, motion.payload_shape.shape)) {
+      response.message = "the payload carries shape " +
+        std::to_string(static_cast<int>(request.payload.shape)) +
+        ", which is no shape this planner can place in the collision scene";
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      return;
+    }
+    if (!motion.payload_shape.dimensions_m.allFinite() ||
+      (motion.payload_shape.dimensions_m.array() <= 0.0).any())
+    {
+      response.message = "a payload shape was declared with no positive extent along every axis; "
+        "dimensions are the extent per axis, so a box carries its three side lengths and a "
+        "cylinder (2r, 2r, length)";
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      return;
+    }
   }
+
+  // The scene, if one has arrived. Whether its absence is fatal is the core's
+  // decision and depends on `avoid_collisions`, so the note travels either way.
+  motion.scene = scene_.has_value() ? &scene_.value() : nullptr;
 
   auto solved = plan_motion(*model_, *context_, motion);
   if (!solved.ok()) {
     response.message = solved.status().message;
+    if (!scene_note_.empty()) {
+      // What the planner knows about the world it just refused to plan in. A
+      // refusal that says "blocked" without saying which scene it was blocked
+      // against leaves an operator nothing to act on.
+      response.message += ". As for the scene: " + scene_note_;
+    }
     RCLCPP_WARN(get_logger(), "planning refused: %s", response.message.c_str());
     return;
   }
@@ -373,6 +575,9 @@ void PlannerNode::plan(
     std::to_string(motion_plan.primitive.path.segment_count()) + " phases: " +
     describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note +
     ". The timing is the ramp of this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";
+  if (!scene_note_.empty()) {
+    response.message += ". As for the scene: " + scene_note_;
+  }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }
 

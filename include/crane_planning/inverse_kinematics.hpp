@@ -6,7 +6,8 @@
 //
 //   1. slewing      q1 = atan2(y_d, x_d), which reduces the rest to the arm plane
 //   2. two-link     q2 and q3 in closed form at a given d45, by the law of cosines
-//   3. redundancy   a scalar search over d45, scored by joint-range centring
+//   3. redundancy   a scalar search over d45, scored by joint-range centring and
+//                   by collision clearance -- see `redundancy.hpp`
 //   4. wrist offset the two-link chain reaches K5, not the tool, so the target is
 //                   corrected by fixed-point iteration
 //   5. rotator      q7 takes the residual yaw
@@ -63,6 +64,7 @@
 #include "crane_model/model.hpp"
 #include "crane_planning/arm_geometry.hpp"
 #include "crane_planning/joint_limits.hpp"
+#include "crane_planning/redundancy.hpp"
 
 namespace crane_planning
 {
@@ -83,6 +85,7 @@ struct IkSettings
   std::size_t fixed_point_iterations{4};  ///< step 4's budget
   std::size_t refinement_iterations{6};   ///< the Jacobian polish's budget
   GeometryTolerance geometry{};
+  RedundancyWeights redundancy{};         ///< how step 3 spends the leftover freedom
 };
 
 /// One goal, as 2.2 poses it: a position and a yaw, with the tool coordinate held.
@@ -92,6 +95,14 @@ struct IkRequest
   double phi_z_d{};                                  ///< desired yaw, rad
   double q8{};                                       ///< the tool coordinate, held
   crane_model::Payload payload{};                    ///< it moves q_eq (robot_model 5.1)
+
+  /// The scene step 3's clearance term is scored against. Null skips that term.
+  /**
+   * A *preference* and not the safety check: the answer is put through
+   * `check_path` before it is flown, and a goal whose only reachable
+   * configuration is in collision is refused there, not here.
+   */
+  const crane_model::CollisionScene * scene{nullptr};
 };
 
 /// Which of 2.2's two formulations produced an endpoint.

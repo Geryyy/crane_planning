@@ -85,6 +85,45 @@ crane_planner:
     Ts: 0.04
     min_duration: 0.5
 
+    # **The admissible sway bound, and this is where it lives.**  wiki/mpc.md 3
+    # constraint 3 imposes `|q_u - q_eq| <= q_u^+` as a state box, the swing
+    # envelope of wiki/trajectory_planning.md 4.3 clears the path over that same
+    # box, and the virtual working cell of wiki/control_architecture.md 5.1
+    # consumes the same number -- derived independently of this planner's data,
+    # as 5.1 requires, but not a different number.  A design value: 0.2 rad is
+    # half a metre of tool travel on a 2.5 m pendulum, and it is the swing
+    # crane_supervisor's own `dq_u_max` of 0.4 rad/s was derived from.
+    q_sway_max: [0.2, 0.2]
+
+    # What "checked" means, in metres.  The path and the sway envelope are both
+    # sampled at this step, and the check tightens it to half the thinnest
+    # primitive in the scene when the scene carries something thinner -- the
+    # runges are 0.28 m across, so a scene with the truck in it checks at 0.14 m.
+    # A scene that would need a finer step than the floor is refused, because a
+    # path checked at a step it does not resolve is not checked.
+    check_resolution: 0.10
+    min_check_resolution: 0.01
+    max_check_samples: 2048
+    max_sway_samples: 15
+
+    # The second half of wiki/robot_model.md 2.2 step 3's redundancy score.  It
+    # is a preference between telescope extensions and not the check: the check
+    # is the one along the path, and it refuses.
+    clearance_weight: 1.0
+    clearance_reference: 0.5
+
+    # The truck, as a property of the vehicle.  **The legacy dimensions,
+    # preserved and no longer hard-coded**: the timber planner carried two rows
+    # of three 0.28 x 0.31 x 2.12 m boxes as `postsRight`/`postsLeft` in a
+    # motion-planning YAML, and trajectory_planning 4.2 asks for the geometry to
+    # be kept and the position to come from the measured truck pose instead.  It
+    # does: the scene carries one primitive with the reserved id `truck`, and the
+    # bed and the six runges are placed on it.  Move the truck and they move.
+    truck:
+      runge_dimensions: [0.28, 0.31, 2.12]
+      runge_stations: [-2.0, 0.0, 2.0]
+      bed_thickness: 0.10
+
     # How old /joint_states may be and still be a start state.  Planning from a
     # moving start is issue 045; this one plans from a machine that is standing
     # still, and refuses when it cannot tell that it is.
