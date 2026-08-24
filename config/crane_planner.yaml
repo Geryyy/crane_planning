@@ -56,6 +56,29 @@ crane_planner:
       length: 1.0e-6
       bearing: 1.0e-6
 
+    # The structured lift/traverse/descend primitive of
+    # wiki/trajectory_planning.md 4.4.  **The transfer altitude is not here**, and
+    # that is the point: 9's open items ask for it to come from the scene rather
+    # than be hard-coded as the legacy planner has it, so it is derived from the
+    # two endpoints raised by the mounted tool's own reach -- a different number
+    # for the rail gripper and for the jaw, both read off the model -- and from
+    # the obstacle extent once issue 041 supplies one.  These two are the only
+    # configured say in it and both are empty: a floor may raise the derivation
+    # and a ceiling may lower it, and neither may be it.
+    transfer_altitude_floor: []
+    transfer_altitude_ceiling: []
+
+    # How sigma is distributed along that path.  Shape numbers, not machine
+    # limits: sigma is a path parameter and not a time, and what the machine can
+    # actually traverse is settled by the path-constrained OCP of 5.2, which is
+    # issue 043.  The jerk span is what rounds the acceleration profile, and a
+    # jerk-limited profile is why q_a''(sigma) is defined everywhere -- the
+    # property 4.5 says a kinked path lacks, and whose absence stops the machine
+    # dead at every waypoint.
+    path_rate_headroom: 2.0
+    path_acceleration_span: 4.0
+    path_jerk_span: 4.0
+
     # The emitted reference: 25 Hz, which is the rate the horizon is consumed at
     # (ROS 2 Interfaces 4), and a floor so that a goal a few millimetres away is
     # still a trajectory rather than a step.

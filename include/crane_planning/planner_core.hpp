@@ -2,9 +2,11 @@
 // tracer bullet, with no ROS in it.
 //
 // `wiki/trajectory_planning.md` 2 splits planning into a geometric stage and a
-// timing stage. This carries the thinnest honest version of each: the geometric
-// stage is the endpoint IK of `wiki/robot_model.md` 2.2 and a straight line
-// between the two configurations, the timing stage is one scaled ramp.
+// timing stage. The geometric stage is the endpoint IK of
+// `wiki/robot_model.md` 2.2 followed by the structured lift/traverse/descend
+// primitive of `trajectory_planning` 4.4, built `C2` in sigma; the timing stage
+// is still one scaled ramp, run along that path rather than straight between two
+// configurations.
 //
 // **Which of 2.2's two formulations solves the endpoint is decided here and not
 // by the caller.** 2.2's closing paragraph is the rule -- the semi-analytic
@@ -19,7 +21,6 @@
 // the boundary instead of stubbed:
 //
 //   collision of any kind, and the sway envelope       issue 041
-//   the lift/traverse/descend primitive                issue 040
 //   the sampling fallback and its smoothing            issue 042
 //   the path-constrained OCP, force, flow, kappa       issue 043
 //   replanning from a moving, swinging state           issue 045
@@ -40,8 +41,10 @@
 #include "crane_model/model.hpp"
 #include "crane_planning/arm_geometry.hpp"
 #include "crane_planning/equilibrium_ik.hpp"
+#include "crane_planning/geometric_path.hpp"
 #include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/joint_limits.hpp"
+#include "crane_planning/structured_primitive.hpp"
 #include "crane_planning/trajectory_timing.hpp"
 
 namespace crane_planning
@@ -52,6 +55,7 @@ struct PlannerSettings
 {
   IkSettings ik{};
   EquilibriumIkSettings equilibrium{};
+  PrimitiveSettings primitive{};
   RampSettings ramp{};
   std::size_t geometry_samples{9};  ///< telescope extensions the structure check runs over
 };
@@ -86,6 +90,7 @@ struct MotionPlan
   TimedTrajectory trajectory{};
   std::vector<crane_model::Pose> tcp_path{};  ///< for visualization only
   IkSolution endpoint{};
+  StructuredPrimitive primitive{};  ///< the geometry the trajectory was timed along
 };
 
 /// Plan one move, or refuse it and say which of the six absences above applies.

@@ -8,6 +8,7 @@ find_package(crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(ruckig REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
@@ -25,9 +26,11 @@ find_package(urdfdom REQUIRED)
 add_library(planner_core STATIC
   src/arm_geometry.cpp
   src/equilibrium_ik.cpp
+  src/geometric_path.cpp
   src/inverse_kinematics.cpp
   src/joint_limits.cpp
   src/planner_core.cpp
+  src/structured_primitive.cpp
   src/trajectory_timing.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
 set_target_properties(planner_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -42,10 +45,16 @@ target_include_directories(planner_core
 # velocity limits the description gives the six actuated joints, which the frozen
 # model API does not expose and this planner may not invent (see
 # include/crane_planning/joint_limits.hpp).
+# ruckig is PUBLIC because `geometric_path.hpp` holds one of its trajectories per
+# path segment: `wiki/implementation/libraries.md` §1 lists it for "jerk-limited
+# interpolation and the clamped B-spline fit" against "spline bases,
+# boundary-condition solves", and the C² primitive of trajectory_planning §4.4 is
+# exactly a sequence of boundary-condition solves. No spline basis is written here.
 target_link_libraries(planner_core
   PUBLIC
     crane_model::crane_model
     Eigen3::Eigen
+    ruckig::ruckig
   PRIVATE
     urdfdom::urdfdom_model)
 
@@ -103,6 +112,7 @@ ament_export_dependencies(
   Eigen3
   geometry_msgs
   rclcpp
+  ruckig
   sensor_msgs
   std_msgs
   trajectory_msgs)
@@ -149,9 +159,20 @@ if(BUILD_TESTING)
 
   # S4 as well: the timing ramp and the refusals the core owes. Plain data in,
   # plain data out.
-  ament_add_gtest(test_trajectory_timing test/test_trajectory_timing.cpp)
+  ament_add_gtest(test_trajectory_timing test/test_trajectory_timing.cpp TIMEOUT 600)
   target_link_libraries(test_trajectory_timing planner_core)
   target_compile_definitions(test_trajectory_timing PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: the structured lift/traverse/descend primitive of
+  # trajectory_planning §4.4, its C² junctions, the transfer altitude derived
+  # from the scene, and the refusals it owes -- over both machine descriptions,
+  # because the descend phase's clearance is the mounted tool's own reach and the
+  # rail gripper and the jaw do not have the same one. Offline C++: the only
+  # thing this binary links besides gtest is the planner core.
+  ament_add_gtest(test_structured_primitive test/test_structured_primitive.cpp TIMEOUT 900)
+  target_link_libraries(test_structured_primitive planner_core)
+  target_compile_definitions(test_structured_primitive PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes

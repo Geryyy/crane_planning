@@ -15,6 +15,14 @@
   <depend>generate_parameter_library</depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp</depend>
+  <!-- The jerk-limited interpolation and boundary-condition solve of
+       Libraries §1.  The structured primitive of trajectory_planning §4.4 is
+       built C² by construction, which means each of its three phases is a
+       boundary-value problem whose end velocity and end acceleration the next
+       phase starts from; ruckig is the listed library for exactly that, and
+       Libraries names "spline bases, boundary-condition solves" as the thing it
+       replaces. -->
+  <depend>ruckig</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>trajectory_msgs</depend>

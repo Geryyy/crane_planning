@@ -20,8 +20,10 @@ absent, and the point of this package as it stands is that every absence is
 | redundancy | the scalar search over `d45` of §2.2 step 3, scored by joint-range centring |
 | acceptance | the forward-kinematics residual of §2.2, on **every** call, before the result is used |
 | assertion | the answer's passive pair against `Model::passive_equilibrium`, through the frozen API |
-| geometric path | a straight line in joint space between the start and the endpoint |
-| timing | one scaled ramp obeying the velocity limits |
+| geometric path | the structured lift/traverse/descend primitive of `trajectory_planning` §4.4, built C² |
+| transfer altitude | derived from the endpoints and the mounted tool's own reach, never configured |
+| collision check | the middle step of §4.4's generate–check–accept, wired and stubbed (issue 041) |
+| timing | one scaled ramp obeying the velocity limits, run along that path |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
 parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
@@ -58,6 +60,58 @@ so the semi-analytic answer is already feasible and the NLP converges in a singl
 iteration. The 7040's tool sits off the tilt axis, its seed is only close, and
 the worst of twenty five sampled goals took 24 iterations.
 
+## The structured primitive, and where its transfer altitude comes from
+
+Most crane moves are *lift, traverse, descend*, and `trajectory_planning` §4.4
+makes that the first mechanism tried: it is cheap, deterministic, and smooth by
+construction, where a sampling planner is stochastic with an unbounded runtime.
+§4.4's order is **generate, check, accept** and all three happen inside one call,
+`build_structured_primitive`. The check passes unconditionally today and says so;
+issue 041 replaces its body rather than the structure around it. A blocked
+primitive is a **refusal** naming which of the three phases failed — the sampling
+fallback that would take over is issue 042.
+
+The path is built **C² by construction and never smoothed into C² afterwards**.
+Each phase is a boundary-value problem solved with `ruckig`
+(`libraries.md` §1: "jerk-limited interpolation … boundary-condition solves"),
+and the next phase starts from exactly the velocity and acceleration the previous
+one ended at, so continuity is a property of the construction rather than of a
+tolerance. §4.5 is why that matters and the reason is behavioural, not numerical:
+at a point of discontinuous curvature the path-velocity limit collapses to
+`σ̇ = 0`, so the machine **stops dead at every waypoint** — the worst possible
+output for a crane whose purpose is smooth, sway-free motion. A jerk-limited
+profile has continuous acceleration by definition, which is what makes `q_a''(σ)`
+*defined* everywhere rather than only away from the junctions.
+
+**The transfer altitude is derived, not configured.** §9's open items ask for
+exactly that, and it is the one thing the legacy planner hard-codes. The
+derivation lives in `derive_transfer_altitude` and nowhere else:
+
+    z = max over endpoints of ( z_tcp + | p_tool − p_rotator | )
+
+so at the transfer altitude everything hanging below the rotator bearing sits at
+or above the altitude the TCP held at the higher endpoint. The tool's reach is
+read off the model at that endpoint's own configuration, which makes it a
+property of the mounted tool: **0.7705 m on the PZS100's rail gripper and a
+different number on the Epsilon 7040's jaw.** The two are not even described to
+the same depth — only the 7040 carries a `tool_contact_point` link, and
+`Frame::ToolContact` is `FrameUnavailable` on the PZS100 by the model API
+contract's own design — so the answer records *which* frame the clearance was
+measured to instead of leaving a caller to assume.
+
+Two bounds a deployment may configure, both empty by default:
+`transfer_altitude_floor` may only raise the derivation and
+`transfer_altitude_ceiling` may only lower it. Neither can *be* the answer: with
+no endpoints there is no altitude at all, whatever is configured. A ceiling that
+takes the altitude below both endpoints does not shorten the lift, it refuses it.
+
+The obstacle term of the derivation is **a named gap, not a zero**.
+`SceneExtent` carries `obstacles_known == false` with a NaN extent, and
+`scene_without_obstacles()` is the one place the planner would read
+`/crane/collision_scene` and says why it does not. The term itself is written and
+waiting for its input, so issue 041 supplies a producer rather than
+restructuring the derivation.
+
 The four numbers the closure needs — `a2`, `a3`, `d45(q4)` and the bearing they
 are measured from — are **probed out of the model** at startup rather than
 written down, and the probe is also a check: a description whose arm is not
@@ -86,10 +140,17 @@ description the controllers were configured against.
   non-zero clearance weight is **refused** rather than read and silently ignored.
   It joins the score at **issue 041**, and
   `include/crane_planning/redundancy.hpp` is the one place the rule is written.
-- The structured lift/traverse/descend primitive is **issue 040**, the sampling
-  fallback and its mandatory smoothing **issue 042**, `/crane/plan_grip` **issue
-  044**, replanning from a moving and swinging start **issue 045**, and the
-  `a2b_movement` adapter **issue 046**.
+- **The primitive's clearance is a lower bound on the tool's true envelope.** The
+  deepest tool frame either description carries is the contact point or the TCP;
+  the rail's and the jaw's tips live in links the frozen `Frame` enum does not
+  name (the PZS100's rails run a further metre from `K9`, the 7040's jaws 0.81 m),
+  so the derivation cannot see them and must not invent them. The real envelope
+  arrives with the collision geometry of **issue 041**, which is also what
+  inflates the tool by the sway envelope of §4.3. Until then a deployment that
+  knows its site needs more says so with `transfer_altitude_floor`.
+- The sampling fallback and its mandatory smoothing is **issue 042**,
+  `/crane/plan_grip` **issue 044**, replanning from a moving and swinging start
+  **issue 045**, and the `a2b_movement` adapter **issue 046**.
 
 ## It is not a second command producer
 
@@ -123,7 +184,9 @@ reading these sources.
     include/crane_planning/inverse_kinematics.hpp  robot_model §2.2, semi-analytic
     include/crane_planning/equilibrium_ik.hpp      robot_model §2.2, constrained
     include/crane_planning/redundancy.hpp          §2.2 step 3's leftover freedom
-    include/crane_planning/trajectory_timing.hpp   the ramp
+    include/crane_planning/geometric_path.hpp      q_a(σ) and its two derivatives, C² by ruckig
+    include/crane_planning/structured_primitive.hpp  §4.4 lift/traverse/descend, and the altitude
+    include/crane_planning/trajectory_timing.hpp   the ramp, and the seam it meets the path at
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free
     include/crane_planning/planner_node.hpp        the adapter
     config/crane_planner.yaml                      what a deployment configures

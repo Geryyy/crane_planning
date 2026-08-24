@@ -81,6 +81,20 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.equilibrium.max_iterations =
     static_cast<std::size_t>(parameters.nlp_max_iterations);
   settings_.equilibrium.max_wall_clock_s = parameters.nlp_max_wall_clock;
+  // An empty list is "no floor" and one element is the floor. The bound is
+  // optional in the derivation itself (structured_primitive.hpp), so it is
+  // optional here too rather than being a sentinel number a reader has to know
+  // about; `size_lt<>` on the parameter is what keeps the list from carrying a
+  // second one.
+  if (!parameters.transfer_altitude_floor.empty()) {
+    settings_.primitive.altitude.floor_m = parameters.transfer_altitude_floor.front();
+  }
+  if (!parameters.transfer_altitude_ceiling.empty()) {
+    settings_.primitive.altitude.ceiling_m = parameters.transfer_altitude_ceiling.front();
+  }
+  settings_.primitive.fit.rate_headroom = parameters.path_rate_headroom;
+  settings_.primitive.fit.acceleration_span = parameters.path_acceleration_span;
+  settings_.primitive.fit.jerk_span = parameters.path_jerk_span;
   settings_.ramp.Ts = parameters.Ts;
   settings_.ramp.min_duration = parameters.min_duration;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
@@ -110,11 +124,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "transient-local. This is the slice-5 tracer: a goal here is a placement goal, so the "
     "endpoint is the equilibrium-constrained IK of wiki/robot_model.md 2.2 -- the passive pair "
     "is a decision variable under g_u(q) = 0 rather than a pinning, so the tool arrives at rest "
-    "-- and the timing is one velocity-limited ramp. There is no collision check of any kind "
-    "(issue 041), no "
-    "structured lift/traverse/descend primitive (issue 040) and no path-constrained OCP, so no "
-    "force, flow or kappa margin (issue 043). Each of those is refused or named rather than "
-    "approximated.",
+    "-- the geometry is the structured lift/traverse/descend primitive of trajectory_planning "
+    "4.4, built C2 in sigma with its transfer altitude derived from the endpoints and the tool's "
+    "own reach rather than hard-coded, and the timing is one velocity-limited ramp run along it. "
+    "There is no collision check of any kind (issue 041), no sampling fallback when the "
+    "primitive is refused (issue 042) and no path-constrained OCP, so no force, flow or kappa "
+    "margin (issue 043). Each of those is refused or named rather than approximated.",
     kPlanMotionService, kReferenceTopic);
 }
 
@@ -353,8 +368,11 @@ void PlannerNode::plan(
     std::to_string(motion_plan.endpoint.residual_equilibrium) +
     " rad off Model::passive_equilibrium, so the tool arrives at rest. The peak velocity is " +
     std::to_string(motion_plan.trajectory.limiting_fraction) +
-    " of the scaled limit. No collision was checked (issue 041) and the timing is the ramp of "
-    "this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";
+    " of the scaled limit. The geometry is the lift/traverse/descend primitive of "
+    "trajectory_planning 4.4, built C2 in sigma over " +
+    std::to_string(motion_plan.primitive.path.segment_count()) + " phases: " +
+    describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note +
+    ". The timing is the ramp of this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }
 

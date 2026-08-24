@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "crane_model/model.hpp"
+#include "crane_planning/geometric_path.hpp"
 #include "crane_planning/joint_limits.hpp"
 
 namespace crane_planning
@@ -65,6 +66,31 @@ struct TimedTrajectory
 [[nodiscard]] crane_model::Result<TimedTrajectory> scaled_ramp(
   const crane_model::QA & q_a_start, const crane_model::QA & q_a_goal, const JointLimits & limits,
   double margin_factor, const RampSettings & settings);
+
+/// How densely the path is probed for the peak of `q_a'` the duration follows from.
+inline constexpr std::size_t kPathRateSamples = 401;
+
+/// The same ramp, run along a geometric path instead of straight between two configurations.
+/**
+ * **This is the seam.** Issue 040 produces a `C2` path in sigma and issue 043
+ * produces the timing; until 043 lands, something has to turn the one into the
+ * other, and this is the smallest honest thing that does: sigma follows the same
+ * cubic `s(tau)` the chord ramp uses, so `sigma_dot` is zero at both ends and the
+ * reference still starts and ends at rest, and the traversal time is chosen so
+ * that `|q_a'(sigma)| sigma_dot` clears the scaled velocity bound everywhere.
+ *
+ * The bound is taken conservatively -- the peak of `|q_a'|` over the whole path
+ * against the peak of `sigma_dot`, rather than their true product -- so
+ * `limiting_fraction` here reports the peak the emitted samples actually reach
+ * and is normally below one. That is the honest report: this is not a
+ * time-optimal parametrization and 5.2's OCP is what makes it one.
+ *
+ * Nothing here reads a cylinder force, a pump flow or a sway state, exactly as
+ * `scaled_ramp` does not.
+ */
+[[nodiscard]] crane_model::Result<TimedTrajectory> scaled_ramp_along_path(
+  const GeometricPath & path, const JointLimits & limits, double margin_factor,
+  const RampSettings & settings);
 
 }  // namespace crane_planning
 

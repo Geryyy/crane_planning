@@ -162,6 +162,76 @@ crane_planner:
       validation:
         gt<>: [0.0]
 
+  transfer_altitude_floor:
+    type: double_array
+    default_value: []
+    read_only: true
+    description: "An optional floor on the transfer altitude the structured
+      primitive of wiki/trajectory_planning.md 4.4 lifts to, m in
+      K0_mounting_base. Empty means no floor, and empty is the default, because
+      4.4 read against 9's open items says the altitude comes from the scene: it
+      is derived from the two endpoints raised by the mounted tool's own reach,
+      and from the obstacle extent once issue 041 supplies one. A floor may only
+      raise that derivation and can therefore never be the answer -- with no
+      endpoints there is no altitude here at all, whatever this says. A
+      deployment sets it when the site has a known minimum transit height the
+      endpoints do not imply. At most one element."
+    validation:
+      size_lt<>: [2]
+
+  transfer_altitude_ceiling:
+    type: double_array
+    default_value: []
+    read_only: true
+    description: "An optional ceiling on the same derivation, m in
+      K0_mounting_base, empty by default. It may only lower the derived altitude.
+      Set below both endpoints it makes the primitive impossible rather than
+      short, and the lift phase is then refused by name -- the primitive is
+      refused, never deformed, because a lift that does not clear what it was
+      derived to clear is worse than no plan at all. At most one element."
+    validation:
+      size_lt<>: [2]
+
+  path_rate_headroom:
+    type: double
+    default_value: 2.0
+    read_only: true
+    description: "Peak |q_a'(sigma)| a segment of the primitive is allowed, as a
+      multiple of its own mean rate. This is a *shape* number and not a machine
+      limit: sigma is a path parameter, not a time, and nothing in stage 1
+      establishes what the machine can traverse -- the velocity, acceleration,
+      force and pump-flow feasibility all arrive with the path-constrained OCP of
+      5.2, which is issue 043. Two gives the jerk-limited profile a genuine
+      plateau instead of a triangle, so the path accelerates over roughly a
+      quarter of each segment, cruises, and decelerates again."
+    validation:
+      gt<>: [1.0]
+
+  path_acceleration_span:
+    type: double
+    default_value: 4.0
+    read_only: true
+    description: "Segment spans the interpolation's acceleration bound is
+      expressed in, so that the profile has the same shape on a segment that
+      travels a metre and on one that travels a millimetre. Same caveat as
+      path_rate_headroom: it shapes how sigma is distributed and claims nothing
+      about q_a''(sigma) being reachable in time."
+    validation:
+      gt<>: [0.0]
+
+  path_jerk_span:
+    type: double
+    default_value: 4.0
+    read_only: true
+    description: "The same, one derivative up. It is what rounds the corners of
+      the acceleration profile, and a jerk-limited profile is why q_a''(sigma) is
+      continuous -- and therefore *defined* -- everywhere rather than only away
+      from the junctions. wiki/trajectory_planning.md 4.5 is why that matters: at
+      a point of discontinuous curvature the path-velocity limit collapses to
+      sigma_dot = 0 and the machine stops dead at the waypoint."
+    validation:
+      gt<>: [0.0]
+
   Ts:
     type: double
     default_value: 0.04

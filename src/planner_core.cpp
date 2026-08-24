@@ -96,22 +96,45 @@ crane_model::Result<MotionPlan> plan_motion(
   MotionPlan plan;
   plan.endpoint = std::move(endpoint).value();
 
-  crane_model::QA q_a_goal;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a_goal[static_cast<Eigen::Index>(row)] =
-      plan.endpoint.q[static_cast<Eigen::Index>(kActuatedRows[row])];
+  // The start as all eight coordinates. The passive pair is where it hangs at
+  // the measured actuated configuration -- the stopped-start convention this
+  // package still carries and that trajectory_planning 7 calls a defect, lifted
+  // by issue 045.
+  auto settled_start = model.passive_equilibrium(request.q_a_start, request.payload);
+  if (!settled_start.ok()) {
+    return Result<MotionPlan>::failure(settled_start.status());
   }
+  PrimitiveRequest primitive;
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    primitive.q_start[static_cast<Eigen::Index>(kActuatedRows[row])] =
+      request.q_a_start[static_cast<Eigen::Index>(row)];
+  }
+  primitive.q_start[4] = settled_start.value()[0];
+  primitive.q_start[5] = settled_start.value()[1];
+  primitive.q_goal = plan.endpoint.q;
+  primitive.payload = request.payload;
+  // The one read of the scene there is, and it reads nothing: issue 041.
+  primitive.scene = scene_without_obstacles();
 
-  auto trajectory = scaled_ramp(
-    request.q_a_start, q_a_goal, context.limits, request.margin_factor, context.settings.ramp);
+  auto built = build_structured_primitive(
+    model, context.geometry, context.limits, context.settings.ik, context.settings.primitive,
+    primitive);
+  if (!built.ok()) {
+    return Result<MotionPlan>::failure(built.status());
+  }
+  plan.primitive = std::move(built).value();
+
+  auto trajectory = scaled_ramp_along_path(
+    plan.primitive.path, context.limits, request.margin_factor, context.settings.ramp);
   if (!trajectory.ok()) {
     return Result<MotionPlan>::failure(trajectory.status());
   }
   plan.trajectory = std::move(trajectory).value();
 
   // The visualisation path, and it is only that: the row it fills in the
-  // response is documented `for visualization only`, and a straight line in
-  // joint space is not a straight line here.
+  // response is documented `for visualization only`. It is where the tool hangs
+  // at each sampled configuration, so it shows the lift and the descend as the
+  // operator will see them and it is not what any check ran against.
   plan.tcp_path.reserve(plan.trajectory.q_a_ref.size());
   for (const crane_model::QA & q_a : plan.trajectory.q_a_ref) {
     auto settled = model.passive_equilibrium(q_a, request.payload);
