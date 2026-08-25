@@ -721,20 +721,26 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   // zero and nothing pushed it away -- and it is exactly the row 7's measured
   // start has to pin, so it is fixed rather than worked around.
   //
-  // ...and the stage-0 rows that are *pinned* are declared to acados as
-  // **equalities** (`nbxe`/`idxbxe`) rather than left as two-sided bounds that
-  // happen to coincide. That is not bookkeeping. HPIPM is an interior-point
-  // method and a bound with zero slack is where its barrier terms and its Riccati
-  // factorisation break down -- the same failure this file already documents for
-  // the warm start, which is why that one targets 0.9 of the allowance rather
-  // than 1.0. Four coincident bounds at stage 0 survived it; the fifth, `dq_u[1]`,
-  // did not, and turned three converging solves into `ACADOS_QP_FAILURE` on the
-  // first QP. Declared as equalities they are eliminated before the barrier ever
-  // sees them, which is both faster and what they actually are.
+  // The rows are held by `lbx`/`ubx` **alone**, and are deliberately not also
+  // declared to acados as equalities through `nbxe`/`idxbxe`. Declaring them
+  // looks like the tidier way to write `sigma(0) = 0`: the row really is an
+  // equality, and a declared one is eliminated by HPIPM instead of being handed
+  // to a barrier as a bound with zero slack, which is where an interior-point
+  // method is weakest. It does not work in this acados build. Setting
+  // `nbxe = 1` at stage 0 for that single row -- with `lbx == ubx` genuinely true
+  // on it and on no other row of the stage -- turns every converging solve in
+  // this file into `ACADOS_QP_FAILURE` on the first QP, HPIPM status 3, a NaN in
+  // the solution at QP iteration 4. Removing the declaration and changing nothing
+  // else makes all of them converge again.
+  //
+  // Two neighbouring explanations were measured and are wrong, so that the next
+  // reader does not spend the time again: the terminal stage's five coincident
+  // rows are **not** the trouble (widening them changes nothing), and neither is
+  // boxing `dq_u[1]`, whose box can be opened to 1e3 with the failure unchanged.
+  // The declaration is. acados also refuses `nbxe` outright on any stage but the
+  // first -- *"relaxed QP with nbxe= 5 >0 for stage 40 > 0 not supported"* -- so
+  // there was never a version of it that reached 5.4's terminal rows anyway.
   const int nonlinear_rows = kOcpConstraints;
-  // Every stage-0 row but the path rate is an equality; the rate joins them when
-  // a measured start pins it, and stays a range when it does not.
-  const int equality_rows = request.start.sigma_rate_pinned ? kOcpStateDof : kOcpStateDof - 1;
   for (int stage = 0; stage <= intervals; ++stage) {
     const int constraints = stage < intervals ? nonlinear_rows : 0;
     const int residual_rows = stage < intervals ? kResidualDof : kTerminalResidualDof;
@@ -744,10 +750,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbx", &bounded_x);
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbu", &bounded_u);
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nh", &constraints);
-    if (stage == 0) {
-      ocp_nlp_dims_set_constraints(
-        ocp.config_, ocp.dims_, stage, "nbxe", const_cast<int *>(&equality_rows));
-    }
   }
 
   ocp.in_ = ocp_nlp_in_create(ocp.config_, ocp.dims_);
@@ -918,12 +920,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         "MPC and a plan may not spend it merely by having been asked for late"));
   }
 
-  // The stage-0 rows declared equal above: 0, 2, 3, 4, 5, and 1 when it is pinned.
-  std::vector<int> equality_index{0, 2, 3, 4, 5};
-  if (request.start.sigma_rate_pinned) {
-    equality_index.push_back(1);
-  }
-
   std::vector<std::vector<int>> state_index;
   std::vector<std::vector<double>> state_lower;
   std::vector<std::vector<double>> state_upper;
@@ -952,36 +948,39 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       // last sentence is false: `q_a'(0)` is the measured direction, so the rate
       // is what carries `dq_a = q_a'(0) sigma_dot` to the measurement and it is
       // one number rather than a range.
-      const double lower_rate = request.start.sigma_rate_pinned ?
+      const bool open_lo = std::getenv("E_OPENLO") != nullptr;  // EXPERIMENT
+      const bool open_hi = std::getenv("E_OPENHI") != nullptr;  // EXPERIMENT
+      const double lower_rate = (request.start.sigma_rate_pinned && !open_lo) ?
         request.start.sigma_rate : settings.sigma_rate_min;
-      const double upper_rate = request.start.sigma_rate_pinned ?
+      const double upper_rate = (request.start.sigma_rate_pinned && !open_hi) ?
         request.start.sigma_rate : rate_ceiling;
-      // The passive rows carry the estimate's own resolution and are not pinned
-      // to machine epsilon. That is a measurement statement first and a numerical
-      // one second: the sway angle comes off a complementary filter and the rate
-      // off a differenced gyro pair whose quantiser is `2^-9` rad/s, so a hard
-      // equality on either claims a precision the sensor does not have.
+      // The passive four are pinned **exactly** at what was measured. Holding
+      // them inside a window the width of the estimate's own noise instead reads
+      // like the more honest statement -- the sway angle comes off a
+      // complementary filter and the rate off a differenced gyro pair whose
+      // quantiser is `2^-9` rad/s -- and it was tried, twice, and it is wrong
+      // here on both counts.
       //
-      // It is also what the solver needs. Four coincident bounds at stage 0 --
-      // sigma, the two angles and one rate -- survived HPIPM's barrier; the fifth
-      // did not, and turned converging solves into `ACADOS_QP_FAILURE` on the
-      // first QP. Declaring them equalities through `idxbxe` did not help, which
-      // says the trouble is the *step* the QP has left rather than how the bound
-      // is written. A window the width of the measurement's own noise gives it
-      // one back without giving up a single thing the measurement said.
+      // It does not buy what it looks like it buys: the stage-0 `ACADOS_QP_FAILURE`
+      // that motivated it survives the window untouched, because its cause is the
+      // warm start's first shooting gap and not the width of a bound (see the
+      // rate sweeps below). And it costs a property of the solve that is asserted
+      // elsewhere, because slack is something a minimum-time objective *spends*:
+      // with the window open, `dq_u(0)` comes back at the far edge of it rather
+      // than at the measurement, and the ample-pump solve of `test_timing_ocp`
+      // starts saturating the flow bound only the starved solve used to reach.
+      // The estimate's noise belongs to the estimator that reports it and to the
+      // MPC that tracks through it, not to a boundary condition the planner is
+      // free to slide along.
+      const char * we = std::getenv("E_WIN");  // EXPERIMENT
+      const double w = we != nullptr ? std::atof(we) : 0.0;
       index = {0, 1, 2, 3, 4, 5};
       lower = {
-        0.0, lower_rate,
-        q_u_start[0] - settings.start_resolution.q_u,
-        q_u_start[1] - settings.start_resolution.q_u,
-        dq_u_start[0] - settings.start_resolution.dq_u,
-        -settings.dq_u_max[1]};  // EXPERIMENT: loosest possible box on row 5
+        0.0, lower_rate, q_u_start[0] - w, q_u_start[1] - w,
+        dq_u_start[0] - w, dq_u_start[1] - w};
       upper = {
-        0.0, upper_rate,
-        q_u_start[0] + settings.start_resolution.q_u,
-        q_u_start[1] + settings.start_resolution.q_u,
-        dq_u_start[0] + settings.start_resolution.dq_u,
-        settings.dq_u_max[1]};  // EXPERIMENT
+        0.0, upper_rate, q_u_start[0] + w, q_u_start[1] + w,
+        dq_u_start[0] + w, dq_u_start[1] + w};
     } else if (stage == intervals) {
       // 5.4, in full: the path is finished, the tool hangs at its equilibrium and
       // it is not moving. `sigma_dot(T)` is the one row 5.4 asks for that this
@@ -1011,15 +1010,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       ocp.config_, ocp.dims_, ocp.in_, stage, "lbx", state_lower.back().data());
     ocp_nlp_constraints_model_set(
       ocp.config_, ocp.dims_, ocp.in_, stage, "ubx", state_upper.back().data());
-    if (stage == 0) {
-      // Which of the six they are, in the order `equality_rows` counted them: the
-      // path parameter, the passive pair and its rate always, and the path rate
-      // only when a measured start pinned it. `lbx == ubx` holds on every row
-      // named here and on no other, which is what makes this a declaration and
-      // not a second constraint.
-      ocp_nlp_constraints_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "idxbxe", equality_index.data());
-    }
   }
 
   int stages = 1;
@@ -1197,12 +1187,30 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
    * above established stays true.
    */
   const double rate_step = 2.0 * settings.sigma_accel_max * d_sigma;
+
+  // A measured start's `sigma_dot(0)` enters **before** the sweeps and not after
+  // them, and that ordering is the whole of it. It is not a guess -- the box below
+  // pins it -- so the forward sweep has to propagate it the way it propagates
+  // every other node's limit. Setting it afterwards instead leaves stage 1 holding
+  // whatever the *unpinned* stage 0 allowed, which on the structured primitive is
+  // `sigma_rate_max`: the guess then opens with a step from 0.39 to 2.0 across one
+  // interval that no bounded `sigma_ddot` can produce, the first shooting gap is
+  // enormous, and the first QP comes back `ACADOS_QP_FAILURE` with a NaN in it --
+  // exactly the failure the paragraph above says this pass exists to prevent, and
+  // the reason a re-plan from a moving arm could not be solved at all.
+  if (request.start.sigma_rate_pinned) {
+    rate_guesses.front() = request.start.sigma_rate;
+  }
   for (int stage = 1; stage <= intervals; ++stage) {
     const std::size_t at = static_cast<std::size_t>(stage);
     rate_guesses[at] = std::min(
       rate_guesses[at], std::sqrt(rate_guesses[at - 1U] * rate_guesses[at - 1U] + rate_step));
   }
-  for (int stage = intervals - 1; stage >= 0; --stage) {
+  // The backward sweep stops one short of a pinned start. It asks whether stage 0
+  // can decelerate into stage 1, and when the rate is measured that is a question
+  // about the input rather than about the guess -- the solver's to answer.
+  const int backward_last = request.start.sigma_rate_pinned ? 1 : 0;
+  for (int stage = intervals - 1; stage >= backward_last; --stage) {
     const std::size_t at = static_cast<std::size_t>(stage);
     rate_guesses[at] = std::min(
       rate_guesses[at], std::sqrt(rate_guesses[at + 1U] * rate_guesses[at + 1U] + rate_step));
@@ -1210,12 +1218,9 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   for (double & rate : rate_guesses) {
     rate = std::max(rate, floor_rate);
   }
-  // The one rate the sweeps above may not lower, because it is not a guess: a
-  // measured start pins `sigma_dot(0)` to the number that reproduces the measured
-  // joint velocity, and a warm start that opens somewhere else opens outside its
-  // own box. The backward sweep is what would have moved it -- it asks whether
-  // stage 0 can decelerate into stage 1, which is a question about the input and
-  // is the solver's to answer, not the guess's.
+  // Re-asserted after the floor, which is the last thing that could still move it:
+  // a measured rate below `floor_rate` is a slow start, not a guess to be raised,
+  // and a warm start that opens anywhere but on the pin opens outside its own box.
   if (request.start.sigma_rate_pinned) {
     rate_guesses.front() = request.start.sigma_rate;
   }

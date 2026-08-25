@@ -98,34 +98,6 @@ struct ActuationLimits
   double pump_flow_planning_factor{0.95};
 };
 
-/// How precisely the measured initial passive state is known.
-/**
- * The window the OCP holds `q_u(0)` and `dq_u(0)` inside, and it is a
- * **measurement** number rather than a solver tuning one: the sway angle comes
- * off a complementary filter and the rate off a differenced gyro pair, so
- * pinning either to machine epsilon claims a precision the sensor does not have.
- *
- * It also happens to be what makes the problem solvable. Pinning all four passive
- * rows exactly at stage 0 turns converging solves into `ACADOS_QP_FAILURE` on the
- * first QP -- HPIPM is an interior-point method and a bound with zero slack is
- * where its barrier breaks down, which this file already documents for the warm
- * start. Declaring them equalities through acados' `idxbxe` does not help, so the
- * trouble is the step the QP has left and not how the bound is written. A window
- * the width of the estimate's own noise gives that step back and gives up nothing
- * the estimate actually said.
- */
-struct StartResolution
-{
-  /// Sway angle, rad. **A design value** -- no recording measures the filter's
-  /// angle resolution, and `PendulumState::position_covariance` is the per-request
-  /// number a later issue could read instead of this constant.
-  double q_u{1.0e-3};
-
-  /// Sway rate, rad/s. **Measured**: the gyro quantiser is `2^-9` rad/s, from the
-  /// 7040 recordings, and a differenced pair cannot resolve below it.
-  double dq_u{1.953125e-3};
-};
-
 /// Everything about the solve that a deployment chooses.
 struct TimingOcpSettings
 {
@@ -173,9 +145,6 @@ struct TimingOcpSettings
 
   /// The physical limits kappa is applied to.
   ActuationLimits actuation{};
-
-  /// How precisely `q_u(0)` and `dq_u(0)` are held to the measurement.
-  StartResolution start_resolution{};
 
   /// Sample period of the emitted reference, seconds.
   double sample_period{0.04};

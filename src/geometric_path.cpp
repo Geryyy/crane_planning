@@ -275,17 +275,33 @@ crane_model::Result<GeometricPath> fit_c2_path(
       const double to = request.waypoints[segment + 1U][axis];
       // A start that is already moving may have to leave the box its two
       // waypoints span and come back, and that is not the non-monotone path the
-      // criterion rules out -- it is the machine's own braking distance,
-      // `v^2 / 2a`, which no boundary-value solve can be shorter than. It is
-      // allowed on the **first** segment only and only in the direction the
-      // measurement was moving; every other segment is judged exactly as before.
-      double allowance = 0.0;
-      if (segment == 0U && std::abs(request.start_rate[axis]) > 0.0) {
-        allowance = request.start_rate[axis] * request.start_rate[axis] /
-          (2.0 * input.max_acceleration[row]);
+      // criterion rules out -- it is the machine's own braking distance, which no
+      // boundary-value solve can be shorter than. The lift segment of a re-plan
+      // issued mid-slew is the case: it asks a coordinate that is *moving* to
+      // finish where it started, and no profile does that without going out and
+      // coming back.
+      //
+      // The bound is the distance the coordinate covers decelerating uniformly
+      // from `v` to rest across the segment's whole extent, `|v| span / 2`, and
+      // it is deliberately not the maximum-effort `v^2 / 2a` that reads more
+      // natural here. `max_acceleration` above is a *shape* bound that never
+      // binds -- `minimum_duration` stretches the profile to fill `span`, so
+      // ruckig brakes far more gently than that bound allows and travels
+      // correspondingly further. Judging the result against maximum-effort
+      // braking refuses profiles this file asked for itself.
+      //
+      // Directional, which is what keeps the check worth making: the excursion is
+      // allowed only on the side the measurement was moving towards. A coordinate
+      // that swings the *other* way is still the non-monotone path the criterion
+      // rules out, on the first segment as on every other.
+      double allowance_below = 0.0;
+      double allowance_above = 0.0;
+      if (segment == 0U) {
+        const double reach = std::abs(request.start_rate[axis]) * span / 2.0;
+        (request.start_rate[axis] > 0.0 ? allowance_above : allowance_below) = reach;
       }
-      const double lower = std::min(from, to) - settings.overshoot_tolerance - allowance;
-      const double upper = std::max(from, to) + settings.overshoot_tolerance + allowance;
+      const double lower = std::min(from, to) - settings.overshoot_tolerance - allowance_below;
+      const double upper = std::max(from, to) + settings.overshoot_tolerance + allowance_above;
       if (extrema[row].min < lower || extrema[row].max > upper) {
         return Result<GeometricPath>::failure(
           failure(
