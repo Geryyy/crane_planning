@@ -288,8 +288,15 @@ TEST(Replanning, TwoRequestsDifferingOnlyInTheSwayRateAnswerDifferently)
   // path rate profile getting there.
   ASSERT_FALSE(swung.timing.nodes.empty());
   ASSERT_FALSE(still.timing.nodes.empty());
-  EXPECT_NEAR(swung.timing.nodes.front().dq_u[0], 0.15, 1.0e-4);
-  EXPECT_NEAR(still.timing.nodes.front().dq_u[0], 0.0, 1.0e-4);
+  // To the stated tolerance and not to machine epsilon, and the tolerance is the
+  // solver's own `StartResolution`: stage 0 stands off its measurement by that
+  // width because a zero-width box is where an interior-point method is singular,
+  // and a minimum-time objective spends whatever slack it is given. Asserting
+  // tighter than the window would be asserting that the solve does not do what
+  // this package asked it to do.
+  const double window = fixture().context.settings.timing.start_resolution.dq_u;
+  EXPECT_NEAR(swung.timing.nodes.front().dq_u[0], 0.15, window);
+  EXPECT_NEAR(still.timing.nodes.front().dq_u[0], 0.0, window);
 
   double difference = 0.0;
   const std::size_t common =

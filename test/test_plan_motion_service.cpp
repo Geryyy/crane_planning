@@ -67,8 +67,10 @@ using trajectory_msgs::msg::JointTrajectory;
  * the endpoint IK, the collision check and one `Model::passive_equilibrium` per
  * emitted point. Twenty seconds is then a coin toss rather than a bound, and a
  * flaky suite is worse than a slow one. **This is not a latency budget**: 7's
- * bounded latency is issue 045's, the OCP's own share of it is
- * `TimingOcpSettings::max_wall_clock` and it is enforced inside the solver.
+ * bounded latency is `PlannerSettings::latency` and is charged inside the planner
+ * over every stage of one request, the OCP's own share of it is
+ * `TimingOcpSettings::max_wall_clock`, and this number only decides how long a
+ * *test* waits before calling a missing answer a failure.
  */
 constexpr double kBudget = 60.0;
 
@@ -255,11 +257,53 @@ protected:
     pendulum_state_->publish(pendulum);
   }
 
+  /// One `/crane/payload_estimate`, at the mass and validity the caller asks for.
+  /**
+   * `valid` on this message means "estimated at rest", and both CBS profiles
+   * publish it `false` today (issue 033) -- so the branch that leaves the caller's
+   * own declaration standing is the one that actually runs, and it is the one the
+   * cases below spend most of their assertions on.
+   */
+  void publish_payload_estimate(double mass_kg, bool valid, double age_s = 0.0)
+  {
+    crane_msgs::msg::PayloadEstimate estimate;
+    estimate.header.stamp = client_node_->now() - rclcpp::Duration::from_seconds(age_s);
+    estimate.mass = mass_kg;
+    // A first moment consistent with a centre 0.1 m out along K8's x, so the
+    // substituted centre is a number a reader can check rather than a zero.
+    estimate.m_r_x = 0.1 * mass_kg;
+    estimate.m_r_y = 0.0;
+    estimate.r_z = 0.0;
+    estimate.valid = valid;
+    payload_estimate_->publish(estimate);
+  }
+
+  /// The fixture's goal moved out of the machine's reach, so the endpoint refuses.
+  /**
+   * A refusal that comes from **inside** `plan_motion` rather than from the node's
+   * own field checks, which is what the payload cases below need: the node reads
+   * `/crane/payload_estimate` after the request's own payload and before it plans,
+   * so the note saying what entered this plan only travels on an answer that got
+   * that far.
+   */
+  PlanMotion::Request::SharedPtr out_of_reach_request()
+  {
+    auto request = collision_blind_request();
+    request->goal.pose.position.x += 50.0;
+    return request;
+  }
+
   /// Spin a bounded number of times, to let anything that was going to arrive arrive.
   /**
    * Not a sleep and not a timeout: it is what makes "and nothing else was
    * published" a statement rather than a hope, in the one direction `spin_until`
    * cannot express.
+   *
+   * It is also what makes a *second* request in one case read the state published
+   * just before it. `call` only spins while the service is not yet ready, so by
+   * the second call it spins not at all before sending -- and a case that changes
+   * `/crane/pendulum_state` between two requests would otherwise be racing its own
+   * publication against its own request.
    */
   void settle()
   {
@@ -496,6 +540,128 @@ TEST_F(PlanMotionService, WithoutAStartStateNothingIsPlanned)
     << response->message;
 }
 
+TEST_F(PlanMotionService, AJointStateWithoutVelocitiesIsRefusedRatherThanReadAsAStandstill)
+{
+  // `wiki/trajectory_planning.md` 7 asks for `(q, dq)` **as measured**, and a
+  // `sensor_msgs/JointState` with no `velocity` array is a measurement that does
+  // not say whether the machine is moving. Reading it as a standstill is exactly
+  // the *"we deactivated qDot0, because we now always start in a stopped state"*
+  // the page names as the defect not to inherit, so it is refused instead and the
+  // refusal names the rate rather than the message.
+  publish_joints(start_positions(), {});
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero());
+  settle();
+
+  const auto response = call(collision_blind_request());
+  ASSERT_NE(response, nullptr);
+  EXPECT_FALSE(response->success);
+  EXPECT_NE(response->message.find("velocity"), std::string::npos) << response->message;
+  EXPECT_NE(response->message.find(crane_planning::kJointStatesTopic), std::string::npos)
+    << response->message;
+
+  // And nothing was adopted, so nothing was published: the topic is
+  // transient-local and a refusal that wrote to it would leave a late subscriber
+  // latching onto a plan nobody is executing.
+  settle();
+  EXPECT_TRUE(published_.empty());
+}
+
+TEST_F(PlanMotionService, AnUnusablePendulumStateIsRefusedNamingWhichOfTheThreeAbsencesItWas)
+{
+  // `wiki/control_architecture.md` 5.3: no input may stop arriving without a
+  // defined consequence, and "never connected" and "died" are different things
+  // for an operator to chase. This deployment's `passive_estimate_policy` is
+  // `refuse`, which is 5.3's row for a state the planner closes on -- and the
+  // consequence that is ruled out in all three cases is the silent zero, because
+  // an unknown sway is not a still one.
+  //
+  // The three arrive in the order they can: nothing has been received at all,
+  // then a producer that says `valid == false` about itself, then one that
+  // arrived and stopped.
+  publish_joints(start_positions(), std::vector<double>(start_positions().size(), 0.0));
+  settle();
+  const auto never = call(collision_blind_request());
+  ASSERT_NE(never, nullptr);
+  EXPECT_FALSE(never->success);
+  EXPECT_NE(never->message.find(crane_planning::kPendulumStateTopic), std::string::npos)
+    << never->message;
+  EXPECT_NE(never->message.find("never connected"), std::string::npos) << never->message;
+
+  // The producer is running, is talking, and is telling the truth about itself.
+  // Its own `status` is carried rather than restated: the three causes behind the
+  // flag are the broadcaster's to judge inside its own cycle.
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), false);
+  settle();
+  const auto not_valid = call(collision_blind_request());
+  ASSERT_NE(not_valid, nullptr);
+  EXPECT_FALSE(not_valid->success);
+  EXPECT_NE(not_valid->message.find("valid == false"), std::string::npos) << not_valid->message;
+  EXPECT_NE(not_valid->message.find("IMU1x is degraded"), std::string::npos)
+    << not_valid->message;
+
+  // Past its own 150 ms deadline, which is the row `control_architecture` 5.3's
+  // table gives this topic and not one age shared with every other input.
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), true, 1.0);
+  settle();
+  const auto stale = call(collision_blind_request());
+  ASSERT_NE(stale, nullptr);
+  EXPECT_FALSE(stale->success);
+  EXPECT_NE(stale->message.find("died"), std::string::npos) << stale->message;
+  EXPECT_NE(stale->message.find("deadline"), std::string::npos) << stale->message;
+
+  settle();
+  EXPECT_TRUE(published_.empty());
+}
+
+TEST_F(PlanMotionService, ThePayloadEstimateEntersWhereItIsValidAndIsStatedWhereItIsNot)
+{
+  // The estimate is handled on the pendulum's own terms -- stated, never assumed --
+  // and the answer says which of the two happened. The goal is out of reach in
+  // every case here, because what is under test is what the node put into the plan
+  // and not whether the plan closed; the endpoint refuses and the note travels
+  // with the refusal.
+  publish_start();
+
+  const auto absent = call(out_of_reach_request());
+  ASSERT_NE(absent, nullptr);
+  EXPECT_FALSE(absent->success);
+  EXPECT_NE(absent->message.find(crane_planning::kPayloadEstimateTopic), std::string::npos)
+    << absent->message;
+  EXPECT_NE(absent->message.find("never connected"), std::string::npos) << absent->message;
+
+  // The branch both CBS profiles actually run today (issue 033): the estimator is
+  // there and says it has no estimate taken at rest, so the caller's declaration
+  // stands and the answer says so rather than quietly substituting numbers the
+  // estimator does not stand behind.
+  publish_payload_estimate(137.0, false);
+  settle();
+  const auto not_valid = call(out_of_reach_request());
+  ASSERT_NE(not_valid, nullptr);
+  EXPECT_FALSE(not_valid->success);
+  EXPECT_NE(not_valid->message.find("valid == false"), std::string::npos) << not_valid->message;
+  EXPECT_NE(
+    not_valid->message.find("the payload is the one the request declared"), std::string::npos)
+    << not_valid->message;
+  // ...and it is not consumed: the mass it carries appears nowhere in what was planned.
+  EXPECT_EQ(not_valid->message.find("137.000000 kg"), std::string::npos) << not_valid->message;
+
+  // Where it *is* valid it replaces what the request declared, because the
+  // estimator measured the machine and the request described it
+  // (`wiki/robot_model.md` 5.3: for a gravity moment the payload is a point mass,
+  // which is exactly what this message carries).
+  publish_payload_estimate(137.0, true);
+  settle();
+  const auto valid = call(out_of_reach_request());
+  ASSERT_NE(valid, nullptr);
+  EXPECT_FALSE(valid->success);
+  EXPECT_NE(valid->message.find("137.000000 kg"), std::string::npos) << valid->message;
+  EXPECT_NE(valid->message.find("It replaces what the request declared"), std::string::npos)
+    << valid->message;
+
+  settle();
+  EXPECT_TRUE(published_.empty());
+}
+
 TEST_F(PlanMotionService, AReachableGoalComesBackAsATimedJointTrajectory)
 {
   publish_start();
@@ -594,6 +760,51 @@ TEST_F(PlanMotionService, TheSameTrajectoryArrivesOnTheReferenceTopic)
   EXPECT_EQ(
     published_.front().points.back().positions, response->trajectory.points.back().positions);
   EXPECT_TRUE(published_.front().header.frame_id.empty());
+}
+
+TEST_F(PlanMotionService, ARefusedReplanLeavesTheStandingReferenceAloneAndReportsIt)
+{
+  // `wiki/trajectory_planning.md` 7's fallback, over the wire. A re-plan that is
+  // refused keeps the previous trajectory and reports it; it never emits a partial
+  // plan and it never republishes. `/crane/reference` is transient-local, so a
+  // refusal that wrote to it would leave a late subscriber latching onto a plan
+  // nobody is executing -- and a caller has to be able to tell "I kept planning"
+  // from "here is something new".
+  publish_start();
+  const auto adopted = call(collision_blind_request());
+  ASSERT_NE(adopted, nullptr);
+  ASSERT_TRUE(adopted->success) << adopted->message;
+  ASSERT_TRUE(spin_until([this]() {return !published_.empty();}))
+    << "nothing was published on " << crane_planning::kReferenceTopic;
+  ASSERT_EQ(published_.size(), 1U);
+
+  // Now the passive estimate goes away mid-execution, which is the situation a
+  // stall-recovery re-plan is issued in and the one 7's `[!warning]` is about.
+  publish_start();
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), false);
+  settle();
+  const auto refused = call(collision_blind_request());
+  ASSERT_NE(refused, nullptr);
+  EXPECT_FALSE(refused->success);
+
+  // Which trajectory is still standing is visible in the answer, and it is the
+  // adopted one rather than an empty field: "the previous plan is still running"
+  // and "I have nothing for you" are different answers to the same request.
+  ASSERT_EQ(refused->trajectory.points.size(), adopted->trajectory.points.size());
+  EXPECT_EQ(refused->trajectory.joint_names, adopted->trajectory.joint_names);
+  EXPECT_EQ(
+    refused->trajectory.points.back().positions, adopted->trajectory.points.back().positions);
+  EXPECT_EQ(rclcpp::Time(refused->trajectory.header.stamp),
+    rclcpp::Time(adopted->trajectory.header.stamp));
+  EXPECT_NE(refused->message.find("is unchanged and is the one still being executed"),
+    std::string::npos) << refused->message;
+  // No partial plan travelled with it either: `success` is false, so the
+  // trajectory on the response is the standing one and not something new.
+  EXPECT_TRUE(refused->tcp_path.empty());
+
+  // And the reference itself was left alone.
+  settle();
+  EXPECT_EQ(published_.size(), 1U);
 }
 
 TEST_F(PlanMotionService, TheAnswerNamesWhichOfTheTwoMechanismsProducedTheGeometry)

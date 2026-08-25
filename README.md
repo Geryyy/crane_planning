@@ -40,6 +40,11 @@ package is that every remaining absence is *refused or named*, never approximate
 | margin | §5.5's κ, applied to every physical limit, reserved for the MPC and not spendable by a caller |
 | a grip's descend and lift | every row above, unchanged, except that a descend lowers the transfer altitude's ceiling to its own endpoints |
 | a grip's close and open | §8's **retained** cosine primitive on `q8` alone, C² at both ends, on the arm's own time base (§4.1) |
+| the start state | `(q, dq)` as **measured** over all eight coordinates — §7, and not the stopped start it calls a defect |
+| a moving start | a boundary condition on the geometry and on the OCP, so a seam matches in position *and* velocity |
+| an unmeasured sway | `passive_estimate_policy`: refused by name, or planned inside a reduced box with the reserve stated |
+| latency | §7's bound, `latency_budget`, charged stage by stage **inside** the planner and not in a caller's timeout |
+| an overrun | the previous trajectory keeps standing on `/crane/reference`, and the answer says which one it is |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
 parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
@@ -67,8 +72,9 @@ endpoint takes 0.25 s on the PZS100 and 0.73 s at its worst on the Epsilon 7040.
 Both an iteration cap (`nlp_max_iterations`) and a wall-clock cap
 (`nlp_max_wall_clock`) bound it, and hitting either is a refusal naming the cap,
 never the best iterate dressed as an answer — an unbounded NLP inside a service
-call is a hang, and a caller cannot cancel one. Issue 045 owns the latency bound
-and inherits these numbers.
+call is a hang, and a caller cannot cancel one. These are the numbers the
+per-request latency bound below was sized against, and the IK is the first stage
+it charges.
 
 The seed matters and is measurable: on the PZS100 `dq_eq/dq_a` is
 `[0, -1, -1, 0, 0]` exactly — the tool hangs vertically whatever the arm does —
@@ -211,7 +217,8 @@ sentence says so.
 how fast the machine running the planner is. Exhausting either is a refusal naming
 it, and an *approximate* path that stops short of the goal is refused with the
 rest: it is not a worse answer than none, it is an answer that reads as success.
-The replanning loop's own latency bound is issue 045's and is not this cap. The
+`latency_budget` is the bound over the *whole* request and is not this cap; this
+one is the search's own share of it, and the two are charged separately. The
 search draws from this package's own `std::mt19937` seeded by `sampling_seed` and
 not from OMPL's global generator, which can be seeded once per process and would
 leave whichever test ran second irreproducible; the nearest-neighbour structure is
@@ -325,14 +332,16 @@ pair blocked and where.
   says the smoothed curve is blocked where the sampled one was clear and stops.
   That is the honest answer for a per-call planner and it is also the one place
   the fallback can fail after having found a way round. A graduated retry belongs
-  with the replanning loop of **issue 045**, which is the issue that owns what to
-  do with a plan that could not be produced in time.
+  with whatever decides *when* to re-plan, which is the supervisor's and the task
+  layer's; this node answers requests and says why it could not.
 - **Executing a grip is not this node's.** `/crane/plan_grip` answers one phase
   with a trajectory; sequencing the four, deciding when the sway has settled
   (`crane_msgs/SwaySettled` is the supervisor's, and acting on it the task
   layer's — ROS 2 Interfaces §4) and running them is above this node.
-- Replanning from a moving and swinging start is **issue 045**, and the
-  `a2b_movement` adapter **issue 046**.
+- **Deciding *when* to re-plan is not this node's.** Replanning *from* a moving
+  and swinging start is, and it is below; the trigger — a stall, a tracking
+  fault, a new goal — belongs to `crane_supervisor` and the task layer, and this
+  service answers requests. The `a2b_movement` adapter is **issue 046**.
 
 ## κ is not `speed_scale`
 
@@ -397,8 +406,9 @@ Three things it will not do:
   backend that always reports success removes the only signal a supervisor could
   act on — binds the planner exactly as it binds the controller.
 - **The solve is bounded in wall clock here**, by `timing.max_wall_clock`, and not
-  in a caller's timeout. §7's bounded-latency requirement as a whole is issue
-  045's; this cap is the piece of it that lives inside the OCP. The measured cost
+  in a caller's timeout. §7's bounded-latency requirement as a whole is
+  `latency_budget`, charged over every stage of one request; this cap is the piece
+  of it that lives inside the OCP and refuses in the solver. The measured cost
   of the structured primitive is some 44 SQP iterations and 4 s, and the cap is
   three times that, so an ordinary plan clears it on a slower machine too.
 - **A path the machine cannot hold at rest is refused before the solver runs,**
@@ -413,17 +423,108 @@ Three things it will not do:
   than its working range. On the PZS100 the arm's zero is at `θ₃ = 1.85 rad`,
   which is almost exactly where the URDF's own mid-range falls.
 
-**The OCP starts from rest**, and it is worth being exact about which coordinate
-says so. The passive pair is pinned at the settled `q_u^eq` of the start pose with
-`dq_u(0) = 0`, and the *joints* are at rest because the path meets its start with
-`q_a'(0) = 0` — not because `σ̇(0)` is pinned to zero. It is not: `σ̇` is a path
-rate, the objective divides by it, and pinning it at either end would make the
-first and last stage singular. What is asserted is what the machine does, not what
-the coordinate reads. This is the stopped-start convention `trajectory_planning`
-§7 calls a defect to inherit; issue 045 lifts it, and the boundary condition that
-changes is the *initial* one — `q_u(0)` and `dq_u(0)` become the measured state at
-the replan instant, and the path is refitted so that `q_a'(0)` matches the measured
-velocity instead of vanishing. §5.4's terminal conditions do not change.
+**The OCP starts where the machine is**, and it is worth being exact about which
+coordinate says so. `q_u(0)` and `dq_u(0)` are the measured passive pair; the
+*joints* leave their start at the measured velocity because the path is fitted to
+meet it with a `q_a'(0)` in that direction and `σ̇(0)` is pinned to the one path
+rate that reproduces it. `σ̇` is otherwise not pinned at either end — it is a path
+rate, the objective divides by it, and pinning it at both would make the first and
+last stage singular. What is asserted is what the machine does, not what the
+coordinate reads. §5.4's terminal conditions are untouched by any of this: the
+tool still arrives hanging still.
+
+A machine that really is standing still still gets the plan this package built
+before — `q_a'(0) = 0`, the passive pair at the settled `q_u^eq` — because that is
+the right answer for a machine at rest. What changed is that it is no longer the
+*only* answer.
+
+## Replanning from a moving, swinging state, and the latency bound
+
+`wiki/trajectory_planning.md` §7's `[!warning]` names the convention this package
+had inherited: the legacy stack zeroes the initial velocity outright — *"we
+deactivated qDot0, because we now always start in a stopped state"* — so the whole
+pipeline only works as stop, measure, replan, and a re-plan issued while the tool
+is still moving mis-predicts the sway from the first step. That is exactly the
+situation a stall-recovery re-plan occurs in. §7 draws three consequences and each
+of them is a mechanism here rather than a promise.
+
+**Continuity is a boundary condition.** `MotionRequest::start` is `(q, dq)` as
+measured over all eight coordinates — the six actuated positions and rates off
+`/joint_states`, the passive pair off `/crane/pendulum_state`. A moving start is
+fitted into the *geometry* (`PathFitRequest::start_rate`) and pinned into the
+*timing* (`TimingOcpStart::sigma_rate`), so a concatenated segment matches the
+previous one in position **and** velocity at the seam. When no path rate
+reproduces the measurement — the fitted path leaves its start in a direction the
+machine is not travelling in — that is a refusal naming the residual, never a
+first emitted velocity that steps down to zero.
+
+> [!WARNING]
+> **A re-plan issued at speed can be refused, and that refusal is the honest
+> answer rather than a gap to paper over.** `σ̇(0)` on a re-fitted path is set by
+> the path's own extent — `q_a'(0)` is the measured *direction* scaled by the
+> fit's reference span — so a re-plan issued mid-lift, where the remaining path is
+> short, needs a high path rate to carry the measurement. §5.2's force row carries
+> `q_a''(0) σ̇²`, quadratic in it, so past some fraction of the first plan's peak
+> velocity **no timing of the new path starts where the machine is** and the solve
+> refuses. Slowing before re-planning is what makes one exist. Bounding the fitted
+> path's start curvature so that the feasible seam speed is a stated number rather
+> than a discovered one is not done here.
+
+**The latency bound is the planner's, not the caller's.** `latency_budget` is one
+total over the endpoint IK, the geometric path, the smoothing and the OCP, charged
+stage by stage by `LatencyLedger`; the stage that spends it stops the plan naming
+itself and saying how long it had. §7 is explicit about why a client timeout will
+not do: it bounds how long the caller *waits* and leaves a slow solve running
+under a request nobody is waiting on any more. The OCP's own `max_wall_clock` is
+lowered to whatever the total has left, so the two bounds cannot disagree about
+which of them fired. The ledger reads a `PlanningClock` — a plain `double()` — so
+the tests drive it with a counter and no wall-clock sleep is the mechanism under
+test.
+
+**On overrun the previous trajectory keeps standing.** No partial plan is emitted;
+`/crane/reference` is written in exactly one place, reached only by a plan that
+was adopted. A refusal carries the standing trajectory back on the response and
+says it is unchanged, because a caller has to be able to tell "I kept planning"
+from "here is something new" — and the topic is transient-local, so a refused
+re-plan that republished would leave a late subscriber latching onto a plan nobody
+is executing.
+
+**An absent passive estimate is stated, never read as zero sway.**
+`wiki/control_architecture.md` §5.3 asks every input that stops arriving to end in
+a defined consequence, and "never connected", "died" and "the producer says
+`valid == false`" are three different things for an operator to chase — the answer
+names which. What happens next is the deployment's `passive_estimate_policy` and
+there are exactly two values:
+
+| | `refuse` (default) | `conservative` |
+|---|---|---|
+| answer | `success=false` naming which absence it was | a plan, with what was assumed stated in the answer |
+| sway | not assumed at all | the hanging pose of the measured actuated configuration |
+| box | — | `mpc` §3 constraints 3 and 4 reduced by `conservative_sway`, so sway up to the reserve still fits |
+
+There is no third value, because reading an absent estimate as zero is the
+stopped-start convention §7 removes. One combination is refused under **either**
+policy: a moving arm whose sway nobody measured, which is §7's `[!warning]` in
+full — a machine standing still is a different case, where the hanging pose is
+where a settled tool is rather than an assumption about the sway.
+
+**`/crane/payload_estimate` is read on the same terms.** Where it is valid it
+*replaces* the mass and centre the caller declared, because the estimator measured
+the machine and the caller described it; where it is absent, stale or
+`valid == false` the declaration stands and the answer says so. Both CBS profiles
+publish `valid == false` today (issue 033), so the second branch is the one that
+actually runs and it is the one the tests spend their assertions on.
+
+> [!NOTE]
+> **This is not the MPC's warm start.** `crane_mpc`'s own warm start and fallback
+> are issue 052's, they run at the controller's rate against the reference this
+> node published, and the two mechanisms answer different questions: one is what
+> to do when a *plan* could not be produced in time, the other is what to do when
+> a *control step* could not.
+
+**Deciding when to re-plan is not here.** The trigger belongs to
+`crane_supervisor` — which owns `FAULT_TRACKING` since issue 024 — and to the task
+layer. This node answers requests.
 
 ## `/crane/plan_grip`: four phases, one clock
 
@@ -488,7 +589,7 @@ a *reference*, holds no `controller_manager` client, claims no interface and is
 loaded by no spawner. `crane_bringup`'s launch contract asserts all of that by
 reading these sources.
 
-## Two things a later issue must not inherit
+## One thing a later issue must not inherit
 
 - **The payload goes to the model with a zero inertia tensor.** That is exact for
   what this issue uses it for and only for that: `wiki/robot_model.md` §5.3 says
@@ -496,13 +597,6 @@ reading these sources.
   equilibrium and forward kinematics are the only model calls made here. The
   first issue that evaluates a *dynamics* call for a carried payload owes a real
   tensor at that boundary.
-- **The start state is assumed to be at rest.** The plan begins at the measured
-  configuration on `/joint_states` and its `header.stamp` is that measurement's
-  stamp, but the measured *velocity* is ignored and the ramp starts from zero.
-  `trajectory_planning` §7 is explicit that inheriting the stopped-start
-  convention is a defect; lifting it is issue 045, and until then a request
-  issued while the machine is moving is refused only by the freshness deadline,
-  not by the velocity.
 
 ## Layout
 
@@ -519,6 +613,7 @@ reading these sources.
     include/crane_planning/timing_ocp.hpp          §5.2's OCP, §5.3's constraints and §5.5's κ
     include/crane_planning/tool_axis.hpp           §8's retained grip cosine, on the arm's clock
     include/crane_planning/plan_grip.hpp           the four phases of crane_msgs/PlanGrip
+    include/crane_planning/replanning.hpp          §7's measured start, and its latency ledger
     src/acados_casadi_bridge.hpp                   where acados meets CasADi; not installed
     config/hydraulic_limits.yaml                   Q_P^max and the relief setting, with their evidence
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free

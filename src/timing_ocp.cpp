@@ -938,49 +938,45 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       // pose and zero, which is the convention 7 names and this is where it is
       // now a *choice* rather than the only option.
       //
-      // `sigma_dot(0)` is pinned exactly when the measurement asked for it. A
-      // stopped start leaves it in the same box every running stage carries, for
-      // the same reason the terminal stage does: the objective divides by it, so
-      // a rate the QP may take through zero -- or negative, which is the path run
-      // backwards -- makes `1/sigma_dot` singular on the first step, and the
-      // machine still starts at rest whatever the box says because the path meets
-      // its start with `q_a'(0) = 0`. A **measured** start is the case where that
-      // last sentence is false: `q_a'(0)` is the measured direction, so the rate
-      // is what carries `dq_a = q_a'(0) sigma_dot` to the measurement and it is
-      // one number rather than a range.
-      const bool open_lo = std::getenv("E_OPENLO") != nullptr;  // EXPERIMENT
-      const bool open_hi = std::getenv("E_OPENHI") != nullptr;  // EXPERIMENT
-      const double lower_rate = (request.start.sigma_rate_pinned && !open_lo) ?
-        request.start.sigma_rate : settings.sigma_rate_min;
-      const double upper_rate = (request.start.sigma_rate_pinned && !open_hi) ?
-        request.start.sigma_rate : rate_ceiling;
-      // The passive four are pinned **exactly** at what was measured. Holding
-      // them inside a window the width of the estimate's own noise instead reads
-      // like the more honest statement -- the sway angle comes off a
-      // complementary filter and the rate off a differenced gyro pair whose
-      // quantiser is `2^-9` rad/s -- and it was tried, twice, and it is wrong
-      // here on both counts.
+      // `sigma_dot(0)` carries the measurement only when the measurement asked
+      // for it. A stopped start leaves it in the same box every running stage
+      // carries, for the same reason the terminal stage does: the objective
+      // divides by it, so a rate the QP may take through zero -- or negative,
+      // which is the path run backwards -- makes `1/sigma_dot` singular on the
+      // first step, and the machine still starts at rest whatever the box says
+      // because the path meets its start with `q_a'(0) = 0`. A **measured** start
+      // is the case where that last sentence is false: `q_a'(0)` is the measured
+      // direction, so `dq_a = q_a'(0) sigma_dot` makes the rate the row that
+      // carries the seam, and it is held to the measurement rather than left to
+      // the box.
       //
-      // It does not buy what it looks like it buys: the stage-0 `ACADOS_QP_FAILURE`
-      // that motivated it survives the window untouched, because its cause is the
-      // warm start's first shooting gap and not the width of a bound (see the
-      // rate sweeps below). And it costs a property of the solve that is asserted
-      // elsewhere, because slack is something a minimum-time objective *spends*:
-      // with the window open, `dq_u(0)` comes back at the far edge of it rather
-      // than at the measurement, and the ample-pump solve of `test_timing_ocp`
-      // starts saturating the flow bound only the starved solve used to reach.
-      // The estimate's noise belongs to the estimator that reports it and to the
-      // MPC that tracks through it, not to a boundary condition the planner is
-      // free to slide along.
-      const char * we = std::getenv("E_WIN");  // EXPERIMENT
-      const double w = we != nullptr ? std::atof(we) : 0.0;
+      // **Every measured row stands off its measurement by `start_resolution`
+      // rather than sitting on it**, and that width is a solver number before it
+      // is a measurement one -- see `StartResolution`, which carries the sweep it
+      // was measured by. A zero-width box is where an interior-point method is
+      // singular, and pinning stage 0 exactly is what turns five of this
+      // package's solves into `ACADOS_QP_FAILURE` on the first QP.
+      const double rate_window = request.start.sigma_rate_pinned ?
+        std::abs(request.start.sigma_rate) *
+        settings.start_resolution.sigma_rate_fraction : 0.0;
+      const double lower_rate = request.start.sigma_rate_pinned ?
+        std::max(settings.sigma_rate_min, request.start.sigma_rate - rate_window) :
+        settings.sigma_rate_min;
+      const double upper_rate = request.start.sigma_rate_pinned ?
+        std::min(rate_ceiling, request.start.sigma_rate + rate_window) : rate_ceiling;
       index = {0, 1, 2, 3, 4, 5};
       lower = {
-        0.0, lower_rate, q_u_start[0] - w, q_u_start[1] - w,
-        dq_u_start[0] - w, dq_u_start[1] - w};
+        0.0, lower_rate,
+        q_u_start[0] - settings.start_resolution.q_u,
+        q_u_start[1] - settings.start_resolution.q_u,
+        dq_u_start[0] - settings.start_resolution.dq_u,
+        dq_u_start[1] - settings.start_resolution.dq_u};
       upper = {
-        0.0, upper_rate, q_u_start[0] + w, q_u_start[1] + w,
-        dq_u_start[0] + w, dq_u_start[1] + w};
+        0.0, upper_rate,
+        q_u_start[0] + settings.start_resolution.q_u,
+        q_u_start[1] + settings.start_resolution.q_u,
+        dq_u_start[0] + settings.start_resolution.dq_u,
+        dq_u_start[1] + settings.start_resolution.dq_u};
     } else if (stage == intervals) {
       // 5.4, in full: the path is finished, the tool hangs at its equilibrium and
       // it is not moving. `sigma_dot(T)` is the one row 5.4 asks for that this

@@ -98,6 +98,54 @@ struct ActuationLimits
   double pump_flow_planning_factor{0.95};
 };
 
+/// The width of the window stage 0's measured rows are held inside.
+/**
+ * **This is a solver number first and a measurement number second, and saying it
+ * the other way round would be inventing evidence.** A zero-width box is where an
+ * interior-point method breaks down -- the log barrier is singular on it -- and
+ * HPIPM in this acados build is no exception: with every stage-0 row pinned
+ * exactly, five of this package's solves come back `ACADOS_QP_FAILURE` on the
+ * first QP (status 3, a NaN in the solution) or run to `ACADOS_MAXITER`. The
+ * widths below are the measured answer to that, by sweep on the failing solves:
+ * `1e-3` is not enough and still fails, `1e-2` converges every one of them. That
+ * `1e-3` is also exactly the gyro quantiser's own scale is what makes it a trap --
+ * the sensor-resolution argument gives a number an order of magnitude too small to
+ * be the fix, so the number here cannot be justified by it.
+ *
+ * What the window *costs* is real and is not a rounding: a minimum-time objective
+ * spends slack, so `dq_u(0)` comes back at the edge of the window rather than at
+ * the measurement. The initial condition is therefore honoured **to this
+ * tolerance**, which is what `wiki/trajectory_planning.md` 7's "matches in
+ * position and velocity, to a stated tolerance" asks for -- and it is stated here
+ * rather than discovered by a caller. `PendulumState::position_covariance` is the
+ * per-request number a later issue could size this from instead of a constant,
+ * once something establishes that the covariance is larger than the barrier needs.
+ */
+struct StartResolution
+{
+  /// Sway angle, rad.
+  double q_u{1.0e-2};
+
+  /// Sway rate, rad/s.
+  double dq_u{1.0e-2};
+
+  /// The pinned `sigma_dot(0)`, as a **fraction** of the pinned rate itself.
+  /**
+   * Relative and not absolute, because `sigma_dot` is a path rate and its scale is
+   * the path's: the same absolute window is a tenth of one plan's start rate and a
+   * hundredth of another's. What it bounds in the machine's own terms is the seam,
+   * because `dq_a(0) = q_a'(0) sigma_dot(0)` -- so this is directly the fraction by
+   * which the first emitted joint velocity may differ from the measured one.
+   *
+   * It is needed for the same reason the two above are, and the failure is
+   * asymmetric in a way worth recording: with the box's **lower** edge sitting on
+   * the measured rate the first QP returns a NaN, while opening the lower edge
+   * alone converges (and then the solve takes a rate below the measurement, which
+   * is not the boundary condition 7 asked for). Both edges therefore stand off.
+   */
+  double sigma_rate_fraction{2.0e-2};
+};
+
 /// Everything about the solve that a deployment chooses.
 struct TimingOcpSettings
 {
@@ -145,6 +193,9 @@ struct TimingOcpSettings
 
   /// The physical limits kappa is applied to.
   ActuationLimits actuation{};
+
+  /// How precisely stage 0 is held to the measured start. See `StartResolution`.
+  StartResolution start_resolution{};
 
   /// Sample period of the emitted reference, seconds.
   double sample_period{0.04};

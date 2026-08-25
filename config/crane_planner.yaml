@@ -175,7 +175,48 @@ crane_planner:
       runge_stations: [-2.0, 0.0, 2.0]
       bed_thickness: 0.10
 
-    # How old /joint_states may be and still be a start state.  Planning from a
-    # moving start is issue 045; this one plans from a machine that is standing
-    # still, and refuses when it cannot tell that it is.
+    # How old /joint_states may be and still be a start state.  It carries the
+    # rates as well as the positions, and a message with no `velocity` array is
+    # refused rather than read as a standstill — wiki/trajectory_planning.md §7
+    # asks for `(q, dq)` **as measured**, and a measurement that does not say
+    # whether the machine is moving is not one to plan a re-plan from.
     max_input_age: 0.5
+
+    # **The passive half of that start state**, and what happens when it is not
+    # there.  /crane/pendulum_state carries the sway at 100 Hz with a `valid`
+    # flag; its 150 ms deadline is control_architecture §5.3's own row for this
+    # topic and not one age shared with every input.  Past it, or with the flag
+    # down, or with nothing ever received, `refuse` is §5.3's answer for a state
+    # the planner closes on — the response names which of the three it was, so
+    # that "never connected" and "died" stay different things to chase.
+    #
+    # `conservative` is the other defined consequence: plan from the hanging pose
+    # and hold back `conservative_sway` from the sway box, so sway up to the
+    # reserve can be present without leaving what mpc §3 constraints 3 and 4
+    # permit.  It is a reservation and not an assumption, and the answer says so.
+    # There is no third value: reading an absent estimate as zero sway is the
+    # stopped-start convention §7 exists to remove.
+    pendulum_state_deadline: 0.15
+    passive_estimate_policy: refuse
+    conservative_sway:
+      q_u: 0.05
+      dq_u: 0.10
+
+    # /crane/payload_estimate, on the same terms.  Ten periods of its 10 Hz
+    # publication; past that, or where it reports `valid == false`, the payload is
+    # the one the request declared and the answer says so.  Both CBS profiles
+    # publish `valid == false` today, so that is the branch that runs.
+    payload_estimate_deadline: 1.0
+
+    # **§7's latency bound, and it lives here rather than in a caller's timeout.**
+    # One total over the endpoint IK, the geometry, the smoothing and the OCP,
+    # charged stage by stage: a timeout bounds how long the *caller* waits and
+    # leaves a slow solve running under a request nobody is waiting on.  Sized
+    # against what a plan costs rather than round — one plan is some 14 s here, of
+    # which the OCP's own `max_wall_clock` share is 12 s — because a bound is only
+    # a bound if the ordinary case clears it on a slower machine too.  Exceeding
+    # it names the stage that overran and how long it had, emits no partial plan,
+    # and leaves the previous trajectory standing on /crane/reference.  At or
+    # below zero is no budget at all, and the stages are then charged and reported
+    # without any of them being able to refuse.
+    latency_budget: 45.0
