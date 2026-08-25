@@ -12,6 +12,56 @@ crane_planner:
     validation:
       one_of<>: [["pzs100", "epsilon7040"]]
 
+  gripper_closed_end:
+    type: string
+    default_value: "lower"
+    read_only: true
+    description: "Which end of the range the description gives the tool axis is a
+      **closed** gripper. /crane/plan_grip's PHASE_CLOSE drives q8 to it and
+      PHASE_OPEN drives q8 to the other one, and the description carries neither:
+      it states the range and the velocity limit and says nothing about which way
+      the tool runs.
+      **Measured on the 7040, assumed on the PZS100.** Issue 037's notes probed
+      jaw_stroke(q8).ratio across theta10_outer_jaw_joint's own 0 ... 3.15 rad and
+      record that the cylinder retracts as the outer jaw opens, with the ratio
+      negative at q8 = 0 -- so that range starts at the jaws together and `lower`
+      is measured. The PZS100's q9_left_rail_joint runs 0.2 ... 0.7 m and nothing
+      in this workspace records which way its rails travel; `lower` is the reading
+      a rail pair that opens outward from a 0.2 m minimum has, and
+      wiki/implementation/commissioning_prerequisites.md item 4 already owns that
+      axis as human work. A deployment that measures its own tool replaces this
+      rather than patching the planner."
+    validation:
+      one_of<>: [["lower", "upper"]]
+
+  gripper_transmission_samples:
+    type: int
+    default_value: 65
+    read_only: true
+    description: "How densely J_c,GR is probed across one close or open phase's
+      travel. The 7040's jaw ratio is a smooth four-bar function of q8 alone and
+      **reverses sign inside the joint's own range** -- issue 037's notes measured
+      the crossing at q8 ~= 0.29 rad -- and at the crossing the cylinder moves the
+      jaw through no distance at all, so the axis is not controllable there. A
+      phase whose travel spans it is refused naming it. This is the grid the sign
+      change is bracketed on before it is bisected, so it is a resolution and not
+      a convergence criterion. The PZS100's rail cylinder is one-to-one with q8
+      and nothing crosses there."
+    validation:
+      gt_eq<>: [2]
+
+  gripper_transmission_floor:
+    type: double
+    default_value: 1.0e-3
+    read_only: true
+    description: "|J_c,GR| at or below which the tool axis counts as toggled,
+      m/rad or m/m. A ratio of exactly zero is the crossing above; a ratio a
+      thousandth of the way to it is an axis whose cylinder has to travel a
+      millimetre to turn the jaw through a radian, which no valve resolves. Both
+      are the same refusal for the same reason."
+    validation:
+      gt<>: [0.0]
+
   eps_pos:
     type: double
     default_value: 0.001

@@ -22,6 +22,30 @@ crane_planner:
     # canonical coordinate is, and nothing else in this file changes with it.
     tool: pzs100
 
+    # **The one fact about the mounted tool the description does not carry**, and
+    # the only entry in this file whose right value differs per machine: which end
+    # of the range the URDF gives the tool axis is a closed gripper.
+    # `/crane/plan_grip`'s PHASE_CLOSE drives q8 to it, PHASE_OPEN to the other.
+    #
+    # Measured on the 7040 -- issue 037's notes probed the jaw four-bar across
+    # `theta10_outer_jaw_joint`'s 0 ... 3.15 rad and record that the cylinder
+    # retracts as the outer jaw opens, so that range starts at the jaws together.
+    # **Assumed on the PZS100**, whose `q9_left_rail_joint` runs 0.2 ... 0.7 m
+    # with nothing in this workspace recording which way its rails travel; the
+    # entry below is the reading a rail pair opening outward from a 0.2 m minimum
+    # has, and commissioning_prerequisites.md item 4 already owns that axis. A
+    # deployment that measures its own tool replaces this line.
+    #
+    # The two numbers under it are the probe that finds the 7040 jaw's
+    # transmission reversal -- issue 037 measured it at q8 ~= 0.29 rad, well
+    # inside the joint's own range -- because at a reversal the cylinder moves the
+    # jaw through no distance at all and the axis is not controllable. A close or
+    # an open that would span it is refused naming the crossing, never clipped to
+    # it and never planned through.
+    gripper_closed_end: lower
+    gripper_transmission_samples: 65
+    gripper_transmission_floor: 1.0e-3
+
     # The acceptance test of wiki/robot_model.md 2.2, in metres and radians.
     eps_pos: 0.001
     eps_yaw: 0.001

@@ -40,7 +40,10 @@
 
 #include "crane_model/model.hpp"
 #include "crane_msgs/msg/collision_scene.hpp"
+#include "crane_msgs/msg/payload.hpp"
+#include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
+#include "crane_planning/plan_grip.hpp"
 #include "crane_planning/planner_core.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
@@ -56,6 +59,9 @@ namespace crane_planning
  * deployment can rename from a YAML file is not a contract.
  */
 inline constexpr char kPlanMotionService[] = "/crane/plan_motion";
+
+/// The second service of 5, which 10 keeps separate while the task layer migrates.
+inline constexpr char kPlanGripService[] = "/crane/plan_grip";
 inline constexpr char kReferenceTopic[] = "/crane/reference";
 inline constexpr char kJointStatesTopic[] = "/joint_states";
 inline constexpr char kCollisionSceneTopic[] = "/crane/collision_scene";
@@ -105,8 +111,33 @@ public:
     const crane_msgs::srv::PlanMotion::Request & request,
     crane_msgs::srv::PlanMotion::Response & response);
 
+  /// One `/crane/plan_grip` phase, answered. Public for the same reason `plan` is.
+  /**
+   * It holds no state between calls and none about which phase ran last: the
+   * start of every phase is the newest `/joint_states`, so the task layer
+   * sequences the four by moving the machine and re-measuring.
+   */
+  void grip(
+    const crane_msgs::srv::PlanGrip::Request & request,
+    crane_msgs::srv::PlanGrip::Response & response);
+
 private:
   void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
+
+  /// `crane_msgs/Payload` as the two halves the planner uses, or a reason it is not one.
+  /**
+   * The equilibrium takes a point mass (`wiki/robot_model.md` 5.3) and the
+   * collision check takes a shape and an extent; they are different halves of
+   * one message and both services read it the same way, so the conversion is
+   * here and not written twice.
+   */
+  [[nodiscard]] static bool read_payload(
+    const crane_msgs::msg::Payload & message, crane_model::Payload & payload,
+    PayloadShape & shape, std::string & why);
+
+  /// The six actuated rows of one trajectory as `trajectory_msgs`, with 1's stamp.
+  [[nodiscard]] trajectory_msgs::msg::JointTrajectory as_message(
+    const TimedTrajectory & trajectory, const rclcpp::Time & origin) const;
 
   /// One `/crane/collision_scene`, converted and expanded, or refused with a reason.
   /**
@@ -146,6 +177,7 @@ private:
   rclcpp::Subscription<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_subscription_;
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
   rclcpp::Service<crane_msgs::srv::PlanMotion>::SharedPtr plan_motion_;
+  rclcpp::Service<crane_msgs::srv::PlanGrip>::SharedPtr plan_grip_;
 };
 
 }  // namespace crane_planning

@@ -69,6 +69,7 @@
 #include "crane_planning/sampling_planner.hpp"
 #include "crane_planning/structured_primitive.hpp"
 #include "crane_planning/timing_ocp.hpp"
+#include "crane_planning/tool_axis.hpp"
 #include "crane_planning/trajectory_timing.hpp"
 
 namespace crane_planning
@@ -92,6 +93,14 @@ struct PlannerSettings
    * sway bought.
    */
   TimingOcpSettings timing{};
+
+  /// The mounted tool's own axis, which `/crane/plan_grip`'s close and open drive.
+  /**
+   * Separate from `timing` because it is a property of the *tool* and not of the
+   * solve: which end of the description's range is a closed gripper, and how the
+   * transmission behaves across the travel. See `tool_axis.hpp`.
+   */
+  ToolAxisSettings tool_axis{};
 
   /// The hydraulic relief setting the cylinder force limit is derived from, Pa.
   /**

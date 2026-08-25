@@ -65,10 +65,12 @@ add_library(planner_core STATIC
   src/geometric_path.cpp
   src/inverse_kinematics.cpp
   src/joint_limits.cpp
+  src/plan_grip.cpp
   src/planner_core.cpp
   src/sampling_planner.cpp
   src/structured_primitive.cpp
   src/timing_ocp.cpp
+  src/tool_axis.cpp
   src/trajectory_timing.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
 set_target_properties(planner_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -268,6 +270,30 @@ if(BUILD_TESTING)
   ament_add_gtest(test_timing_ocp test/test_timing_ocp.cpp TIMEOUT 1200)
   target_link_libraries(test_timing_ocp planner_core crane_model::casadi_graph)
   target_compile_definitions(test_timing_ocp PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: the tool coordinate of `/crane/plan_grip`'s close and open --
+  # the retained cosine primitive of trajectory_planning §8 carried on the rate
+  # so it is C² at both ends, the end of the description's own range a phase
+  # drives to, the tool axis's own velocity, acceleration and pump-flow limits,
+  # and the transmission reversal issue 037's notes measured inside the 7040
+  # jaw's range. Offline C++ against both machine descriptions, and cheap: a tool
+  # phase is a cosine and three scalar bounds, with no OCP in it.
+  ament_add_gtest(test_tool_axis test/test_tool_axis.cpp TIMEOUT 600)
+  target_link_libraries(test_tool_axis planner_core)
+  target_compile_definitions(test_tool_axis PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: the four phases of `crane_msgs/PlanGrip`, per phase and per tool.
+  # The two arm phases go through `plan_motion` itself, so this binary solves
+  # OCPs and is priced accordingly; the two tool phases are the cosine above.
+  # What it is really about is the three things the phases owe each other: the
+  # descend endpoint is an equilibrium solution and a descend whose endpoint has
+  # none is refused, every phase is on the arm's one time base, and no phase
+  # remembers which one ran before it.
+  ament_add_gtest(test_plan_grip test/test_plan_grip.cpp TIMEOUT 2400)
+  target_link_libraries(test_plan_grip planner_core)
+  target_compile_definitions(test_plan_grip PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes

@@ -36,6 +36,20 @@ bool tool_from_string(const std::string & name, crane_model::Tool & tool)
   return false;
 }
 
+/// Which end of the tool axis's range a deployment says is a closed gripper.
+bool tool_end_from_string(const std::string & name, crane_planning::ToolEnd & end)
+{
+  if (name == "lower") {
+    end = crane_planning::ToolEnd::Lower;
+    return true;
+  }
+  if (name == "upper") {
+    end = crane_planning::ToolEnd::Upper;
+    return true;
+  }
+  return false;
+}
+
 /// The message's shape enumeration, as `crane_model`'s.
 /**
  * The two lists are the same three shapes in the same order and are still
@@ -205,6 +219,20 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
   max_input_age_ = parameters.max_input_age;
 
+  // The one fact about the mounted tool the description does not carry: which
+  // end of the range it gives the tool axis is a closed gripper. `one_of<>` on
+  // the parameter already refuses anything else, so reaching the throw means the
+  // two lists have drifted apart. `tool_axis.hpp` records what the evidence for
+  // the default is on each machine, and that it is measured on one of them and
+  // assumed on the other.
+  if (!tool_end_from_string(parameters.gripper_closed_end, settings_.tool_axis.closed_end)) {
+    throw std::runtime_error(
+            "crane_planner: unknown gripper_closed_end '" + parameters.gripper_closed_end + "'");
+  }
+  settings_.tool_axis.transmission_samples =
+    static_cast<std::size_t>(parameters.gripper_transmission_samples);
+  settings_.tool_axis.transmission_floor = parameters.gripper_transmission_floor;
+
   reference_ = create_publisher<trajectory_msgs::msg::JointTrajectory>(
     kReferenceTopic, reference_qos());
   joint_states_subscription_ = create_subscription<sensor_msgs::msg::JointState>(
@@ -226,6 +254,13 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
       crane_msgs::srv::PlanMotion::Request::SharedPtr request,
       crane_msgs::srv::PlanMotion::Response::SharedPtr response) {
       plan(*request, *response);
+    });
+  plan_grip_ = create_service<crane_msgs::srv::PlanGrip>(
+    kPlanGripService,
+    [this](
+      crane_msgs::srv::PlanGrip::Request::SharedPtr request,
+      crane_msgs::srv::PlanGrip::Response::SharedPtr response) {
+      grip(*request, *response);
     });
 
   RCLCPP_INFO(
@@ -251,6 +286,22 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "cannot reach it. A solve that does not converge is a refusal carrying the solver's own "
     "status word, never a clipped trajectory.",
     kPlanMotionService, kReferenceTopic, kCollisionSceneTopic, settings_.timing.kappa);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "crane_planner: %s answers the four phases of crane_msgs/PlanGrip on the same six actuated "
+    "joints, the same stamp semantics and the same %s republication. Descend and lift are arm "
+    "motions and are planned by the very same call /crane/plan_motion is -- same endpoint, same "
+    "primitive, same collision check, same sway envelope, same kappa -- with the transfer "
+    "altitude's ceiling lowered to the phase's own endpoints so a descend goes across and down "
+    "rather than up, across and down. Close and open drive q8 alone, on the retained cosine "
+    "primitive of trajectory_planning 8 carried on the rate so it is C2 at both ends, inside the "
+    "tool axis's own velocity, acceleration and pump-flow limits, and emitted on the arm's own "
+    "sample period beside the five held path coordinates -- 4.1's one clock. The %s end of the "
+    "range the description gives the tool axis is taken to be the closed gripper. A travel that "
+    "spans a reversal of that axis's transmission ratio is refused naming the crossing, never "
+    "planned through: at the crossing the cylinder moves the tool through no distance at all.",
+    kPlanGripService, kReferenceTopic, tool_end_name(settings_.tool_axis.closed_end));
 }
 
 void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr message)
@@ -424,6 +475,85 @@ bool PlannerNode::read_start(crane_model::QA & q_a_start, std::string & why) con
   return true;
 }
 
+bool PlannerNode::read_payload(
+  const crane_msgs::msg::Payload & message, crane_model::Payload & payload, PayloadShape & shape,
+  std::string & why)
+{
+  // The payload as the equilibrium needs it. `wiki/robot_model.md` 5.3 is
+  // explicit that for a gravity moment the payload is a point mass -- shape,
+  // size and inertia do not enter the equilibrium condition at all -- so the
+  // inertia goes over as zero, which crane_model accepts as a point mass.
+  payload = crane_model::Payload{};
+  shape = PayloadShape{};
+  payload.valid = true;
+  payload.inertia_k8_kg_m2.setZero();
+  if (message.shape == crane_msgs::msg::Payload::SHAPE_NONE) {
+    payload.mass_kg = 0.0;
+    payload.center_of_mass_k8_m.setZero();
+    return true;
+  }
+  if (!std::isfinite(message.mass) || message.mass <= 0.0) {
+    why = "a payload shape was declared with a mass of " + std::to_string(message.mass) +
+      " kg; an unknown payload is not a zero-mass payload, so declare SHAPE_NONE for an empty "
+      "gripper instead";
+    return false;
+  }
+  payload.mass_kg = message.mass;
+  payload.center_of_mass_k8_m = Eigen::Vector3d(message.com.x, message.com.y, message.com.z);
+
+  // The other half of the same message: the shape and the extent, which the
+  // equilibrium has no use for and the collision check cannot do without. It
+  // becomes the scene primitive with the reserved id `payload`, placed at the
+  // K8 pose of every configuration the path is checked at.
+  shape.declared = true;
+  shape.dimensions_m =
+    Eigen::Vector3d(message.dimensions.x, message.dimensions.y, message.dimensions.z);
+  shape.center_k8_m = payload.center_of_mass_k8_m;
+  if (!shape_from_message(message.shape, shape.shape)) {
+    why = "the payload carries shape " + std::to_string(static_cast<int>(message.shape)) +
+      ", which is no shape this planner can place in the collision scene";
+    return false;
+  }
+  if (!has_positive_extent(shape.dimensions_m)) {
+    why = "a payload shape was declared with no positive extent along every axis; dimensions are "
+      "the extent per axis, so a box carries its three side lengths and a cylinder (2r, 2r, "
+      "length)";
+    return false;
+  }
+  return true;
+}
+
+trajectory_msgs::msg::JointTrajectory PlannerNode::as_message(
+  const TimedTrajectory & trajectory, const rclcpp::Time & origin) const
+{
+  trajectory_msgs::msg::JointTrajectory message;
+  // ROS 2 Interfaces 1: the stamp is the absolute time the first point is valid
+  // for. The first point *is* the measured start configuration, so the stamp is
+  // that measurement's own stamp and not the moment this reply was built.
+  message.header.stamp = origin;
+  message.header.frame_id = "";  // joint space has no geometric frame (1)
+  const std::array<std::string, crane_model::kGeneralizedDof> & names =
+    model_->urdf_joint_names();
+  message.joint_names.reserve(crane_model::kActuatedDof);
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    message.joint_names.push_back(names[kActuatedRows[row]]);
+  }
+  message.points.reserve(trajectory.time_from_start.size());
+  for (std::size_t index = 0; index < trajectory.time_from_start.size(); ++index) {
+    trajectory_msgs::msg::JointTrajectoryPoint point;
+    point.positions.resize(crane_model::kActuatedDof);
+    point.velocities.resize(crane_model::kActuatedDof);
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      const Eigen::Index axis = static_cast<Eigen::Index>(row);
+      point.positions[row] = trajectory.q_a_ref[index][axis];
+      point.velocities[row] = trajectory.dq_a_ref[index][axis];
+    }
+    point.time_from_start = rclcpp::Duration::from_seconds(trajectory.time_from_start[index]);
+    message.points.push_back(std::move(point));
+  }
+  return message;
+}
+
 void PlannerNode::plan(
   const crane_msgs::srv::PlanMotion::Request & request,
   crane_msgs::srv::PlanMotion::Response & response)
@@ -479,53 +609,13 @@ void PlannerNode::plan(
   motion.speed_scale = request.speed_scale;
   motion.avoid_collisions = request.avoid_collisions;
 
-  // The payload as the equilibrium needs it. `wiki/robot_model.md` 5.3 is
-  // explicit that for a gravity moment the payload is a point mass -- shape,
-  // size and inertia do not enter the equilibrium condition at all -- and the
-  // equilibrium and forward kinematics are the only calls this issue makes. So
-  // the inertia goes over as zero, which crane_model accepts as a point mass.
-  // The first issue that evaluates a *dynamics* call for a carried payload owes
-  // a real tensor here; issue 043 is that issue.
-  motion.payload.valid = true;
-  motion.payload.inertia_k8_kg_m2.setZero();
-  if (request.payload.shape == crane_msgs::msg::Payload::SHAPE_NONE) {
-    motion.payload.mass_kg = 0.0;
-    motion.payload.center_of_mass_k8_m.setZero();
-  } else {
-    if (!std::isfinite(request.payload.mass) || request.payload.mass <= 0.0) {
-      response.message = "a payload shape was declared with a mass of " +
-        std::to_string(request.payload.mass) +
-        " kg; an unknown payload is not a zero-mass payload, so declare SHAPE_NONE for an empty "
-        "gripper instead";
-      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
-      return;
-    }
-    motion.payload.mass_kg = request.payload.mass;
-    motion.payload.center_of_mass_k8_m = Eigen::Vector3d(
-      request.payload.com.x, request.payload.com.y, request.payload.com.z);
-
-    // The other half of the same message: the shape and the extent, which the
-    // equilibrium has no use for and the collision check cannot do without. It
-    // becomes the scene primitive with the reserved id `payload`, placed at the
-    // K8 pose of every configuration the path is checked at.
-    motion.payload_shape.declared = true;
-    motion.payload_shape.dimensions_m = Eigen::Vector3d(
-      request.payload.dimensions.x, request.payload.dimensions.y, request.payload.dimensions.z);
-    motion.payload_shape.center_k8_m = motion.payload.center_of_mass_k8_m;
-    if (!shape_from_message(request.payload.shape, motion.payload_shape.shape)) {
-      response.message = "the payload carries shape " +
-        std::to_string(static_cast<int>(request.payload.shape)) +
-        ", which is no shape this planner can place in the collision scene";
-      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
-      return;
-    }
-    if (!has_positive_extent(motion.payload_shape.dimensions_m)) {
-      response.message = "a payload shape was declared with no positive extent along every axis; "
-        "dimensions are the extent per axis, so a box carries its three side lengths and a "
-        "cylinder (2r, 2r, length)";
-      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
-      return;
-    }
+  // The two halves of `crane_msgs/Payload`, read the one way both services read
+  // it. The first issue that evaluates a *dynamics* call for a carried payload
+  // owes a real inertia tensor there; issue 043 is that issue.
+  if (!read_payload(request.payload, motion.payload, motion.payload_shape, why)) {
+    response.message = why;
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
   }
 
   // The scene, if one has arrived. Whether its absence is fatal is the core's
@@ -546,33 +636,9 @@ void PlannerNode::plan(
   }
   const MotionPlan & motion_plan = solved.value();
 
-  // ROS 2 Interfaces 1: the stamp is the absolute time the first point is valid
-  // for. The first point *is* the measured start configuration, so the stamp is
-  // that measurement's own stamp and not the moment this reply was built.
   const rclcpp::Time origin(joint_states_->header.stamp);
-  trajectory_msgs::msg::JointTrajectory & trajectory = response.trajectory;
-  trajectory.header.stamp = origin;
-  trajectory.header.frame_id = "";  // joint space has no geometric frame (1)
-  const std::array<std::string, crane_model::kGeneralizedDof> & names =
-    model_->urdf_joint_names();
-  trajectory.joint_names.reserve(crane_model::kActuatedDof);
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    trajectory.joint_names.push_back(names[kActuatedRows[row]]);
-  }
-  trajectory.points.reserve(motion_plan.trajectory.time_from_start.size());
-  for (std::size_t index = 0; index < motion_plan.trajectory.time_from_start.size(); ++index) {
-    trajectory_msgs::msg::JointTrajectoryPoint point;
-    point.positions.resize(crane_model::kActuatedDof);
-    point.velocities.resize(crane_model::kActuatedDof);
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-      const Eigen::Index axis = static_cast<Eigen::Index>(row);
-      point.positions[row] = motion_plan.trajectory.q_a_ref[index][axis];
-      point.velocities[row] = motion_plan.trajectory.dq_a_ref[index][axis];
-    }
-    point.time_from_start =
-      rclcpp::Duration::from_seconds(motion_plan.trajectory.time_from_start[index]);
-    trajectory.points.push_back(std::move(point));
-  }
+  response.trajectory = as_message(motion_plan.trajectory, origin);
+  const trajectory_msgs::msg::JointTrajectory & trajectory = response.trajectory;
 
   response.tcp_path.reserve(motion_plan.tcp_path.size());
   for (std::size_t index = 0; index < motion_plan.tcp_path.size(); ++index) {
@@ -640,6 +706,129 @@ void PlannerNode::plan(
     "reaches into the margin";
   if (!scene_note_.empty()) {
     response.message += ". As for the scene: " + scene_note_;
+  }
+  RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
+}
+
+void PlannerNode::grip(
+  const crane_msgs::srv::PlanGrip::Request & request,
+  crane_msgs::srv::PlanGrip::Response & response)
+{
+  response.success = false;
+  response.trajectory = trajectory_msgs::msg::JointTrajectory{};
+
+  GripRequest grip_request;
+  if (!grip_phase_from_message(request.phase, grip_request.phase)) {
+    response.message = "phase " + std::to_string(static_cast<int>(request.phase)) +
+      " is none of the four crane_msgs/PlanGrip defines -- PHASE_DESCEND, PHASE_CLOSE, "
+      "PHASE_OPEN, PHASE_LIFT. The .srv is frozen (PRD 15) and a fifth phase is a slice of its "
+      "own, so this is refused rather than mapped onto whichever of the four is nearest";
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
+  }
+  const bool arm_phase = phase_moves_the_arm(grip_request.phase);
+
+  // The frame, on exactly the terms `/crane/plan_motion` checks it -- and only
+  // on the phases that read a pose. A close or an open moves the tool
+  // coordinate to the end of the range the description gives it and reads no
+  // goal at all, so demanding a frame of a field the phase does not use would
+  // refuse a well-formed request for a field it was right to leave empty.
+  if (arm_phase && request.goal.header.frame_id != kPlanningFrame) {
+    response.message = "the goal of this " + std::string(grip_phase_name(grip_request.phase)) +
+      " phase is in frame '" + request.goal.header.frame_id + "', and this planner plans in '" +
+      std::string(kPlanningFrame) +
+      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into "
+      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either";
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
+  }
+  if (!ready()) {
+    response.message = std::string("no usable robot description has arrived on ") +
+      kRobotDescriptionTopic + " yet, so there is no model to plan against";
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
+  }
+
+  crane_model::QA q_a_start;
+  std::string why;
+  if (!read_start(q_a_start, why)) {
+    response.message = "no start configuration: " + why;
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
+  }
+  grip_request.q_a_start = q_a_start;
+  grip_request.speed_scale = request.speed_scale;
+
+  if (arm_phase) {
+    grip_request.p_tcp_0 = Eigen::Vector3d(
+      request.goal.pose.position.x, request.goal.pose.position.y, request.goal.pose.position.z);
+    // ROS carries the quaternion scalar-last and Eigen scalar-first
+    // (wiki/nomenclature.md 5); the reorder is this boundary's job.
+    const Eigen::Quaterniond orientation(
+      request.goal.pose.orientation.w, request.goal.pose.orientation.x,
+      request.goal.pose.orientation.y, request.goal.pose.orientation.z);
+    if (!(orientation.norm() > 0.0)) {
+      response.message = "the goal orientation is a zero quaternion";
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      return;
+    }
+    grip_request.phi_z_d = phi_z_of(orientation);
+    // `crane_msgs/PlanGrip` has no `avoid_collisions` row, and the frozen .srv
+    // is not amended for one (PRD 15). A grip's arm phase is the least
+    // forgiving move the machine makes -- it puts a tool between the runges --
+    // so the absent field is read as the checked plan and never as the blind
+    // one, and a request with no scene behind it is refused by `plan_motion`
+    // naming the topic.
+    grip_request.avoid_collisions = true;
+    grip_request.scene = scene_.has_value() ? &scene_.value() : nullptr;
+  }
+
+  if (!read_payload(request.payload, grip_request.payload, grip_request.payload_shape, why)) {
+    response.message = why;
+    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    return;
+  }
+
+  auto solved = plan_grip(*model_, *context_, grip_request);
+  if (!solved.ok()) {
+    response.message = solved.status().message;
+    if (arm_phase && !scene_note_.empty()) {
+      response.message += ". As for the scene: " + scene_note_;
+    }
+    RCLCPP_WARN(get_logger(), "planning refused: %s", response.message.c_str());
+    return;
+  }
+  const GripPlan & grip_plan = solved.value();
+
+  const rclcpp::Time origin(joint_states_->header.stamp);
+  response.trajectory = as_message(grip_plan.trajectory, origin);
+
+  // The reference the planner answered with, on the row ROS 2 Interfaces 4 gives
+  // it. A grip phase belongs on it for the reason trajectory_planning 4.1 gives:
+  // the MPC tracks all six actuated coordinates, so q8_ref has to have a
+  // producer while a grip is running, and the producer is this.
+  reference_->publish(response.trajectory);
+
+  response.success = true;
+  response.message = describe(grip_plan);
+  if (grip_plan.arm_phase) {
+    const TimingSolution & timing = grip_plan.motion.timing;
+    response.message += ". The endpoint IK closed to " +
+      std::to_string(grip_plan.motion.endpoint.residual_p) + " m and " +
+      std::to_string(grip_plan.motion.endpoint.residual_phi_z) +
+      " rad against forward kinematics, leaving the passive pair " +
+      std::to_string(grip_plan.motion.endpoint.residual_equilibrium) +
+      " rad off Model::passive_equilibrium -- so this phase ends at a genuine steady state of the "
+      "passive subsystem and not at a configuration with the passive joints pinned where they "
+      "happened to be measured. Of the physical limits the peak demand is " +
+      std::to_string(timing.peak_demand.joint_velocity) + " of joint velocity, " +
+      std::to_string(timing.peak_demand.joint_acceleration) + " of joint acceleration, " +
+      std::to_string(timing.peak_demand.cylinder_force) + " of cylinder force and " +
+      std::to_string(timing.peak_demand.pump_flow) + " of pump flow, under kappa = " +
+      std::to_string(timing.kappa) + " with speed_scale = " + std::to_string(timing.speed_scale);
+    if (!scene_note_.empty()) {
+      response.message += ". As for the scene: " + scene_note_;
+    }
   }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }
