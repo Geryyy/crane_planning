@@ -1,8 +1,9 @@
 # crane_planning
 
 The `crane_planner` node of `wiki/implementation/ros2_interfaces.md` §2: it
-serves `/crane/plan_motion` and publishes the trajectory it answered with on
-`/crane/reference`.
+serves `/crane/plan_motion` and `/crane/plan_grip` and publishes the trajectory
+it answered with on `/crane/reference`. §10 keeps the two services separate while
+the tested task layer migrates, and they are one node, one model and one clock.
 
 It grew out of the **slice-5 tracer bullet** of `docs/features/cbs-arch/prd.md`
 §2 — one goal pose in, one timed joint trajectory out, through a real node and a
@@ -37,6 +38,8 @@ package is that every remaining absence is *refused or named*, never approximate
 | sway in the timing | `q_u` is a **state** of that OCP, so §5.4's "arrive hanging still" is an imposed terminal condition |
 | force and flow | the graph's own output-map rows — the expressions `mpc` §3 constraints 6 and 7 are written from |
 | margin | §5.5's κ, applied to every physical limit, reserved for the MPC and not spendable by a caller |
+| a grip's descend and lift | every row above, unchanged, except that a descend lowers the transfer altitude's ceiling to its own endpoints |
+| a grip's close and open | §8's **retained** cosine primitive on `q8` alone, C² at both ends, on the arm's own time base (§4.1) |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
 parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
@@ -324,8 +327,12 @@ pair blocked and where.
   the fallback can fail after having found a way round. A graduated retry belongs
   with the replanning loop of **issue 045**, which is the issue that owns what to
   do with a plan that could not be produced in time.
-- `/crane/plan_grip` is **issue 044**, replanning from a moving and swinging start
-  **issue 045**, and the `a2b_movement` adapter **issue 046**.
+- **Executing a grip is not this node's.** `/crane/plan_grip` answers one phase
+  with a trajectory; sequencing the four, deciding when the sway has settled
+  (`crane_msgs/SwaySettled` is the supervisor's, and acting on it the task
+  layer's — ROS 2 Interfaces §4) and running them is above this node.
+- Replanning from a moving and swinging start is **issue 045**, and the
+  `a2b_movement` adapter **issue 046**.
 
 ## κ is not `speed_scale`
 
@@ -418,6 +425,60 @@ changes is the *initial* one — `q_u(0)` and `dq_u(0)` become the measured stat
 the replan instant, and the path is refitted so that `q_a'(0)` matches the measured
 velocity instead of vanishing. §5.4's terminal conditions do not change.
 
+## `/crane/plan_grip`: four phases, one clock
+
+`crane_msgs/PlanGrip` is frozen at four phases — `PHASE_DESCEND`, `PHASE_CLOSE`,
+`PHASE_OPEN`, `PHASE_LIFT` — and they split two and two.
+
+**Descend and lift are arm motions, and they are `plan_motion` itself.**
+`plan_grip.cpp` assembles a `MotionRequest` and calls it, so a grip's arm phase
+gets the equilibrium-constrained endpoint of `robot_model` §2.2, the structured
+primitive of §4.4, the same collision check, the same §4.3 sway envelope and the
+same κ. There is no second, looser path generator here and there must not be one:
+a grip descend is the phase that puts a tool between the runges.
+
+The one knob a **descend** changes is the transfer altitude's *ceiling*, lowered
+to the higher of its own two endpoints so the phase goes across-and-down instead
+of up, across and down onto the block it is already above. A **lift** keeps the
+derivation, and that asymmetry is measured rather than preferred: capping the
+altitude collapses the primitive's final descend segment, over which §5.4's
+terminal condition on the sway then has no arm motion to steer `dq_u` with. The
+same solve converges in 83 SQP iterations at the derived altitude and runs to
+`ACADOS_MAXITER` at the capped one, erratically in the margin — an
+ill-conditioned problem, not a margin to tune.
+
+**Close and open are the tool alone, on the arm's own clock.**
+`wiki/trajectory_planning.md` §8 *retains* the legacy grip cosine primitive, so
+what changes is not its shape but its clock and its limits. §4.1: "geometrically
+the tool is decoupled from the arm; temporally it is not, and the two must share
+one clock." A tool phase therefore comes back over the same six actuated rows, on
+the same sample period, first point at `time_from_start = 0`, with the five path
+coordinates held and emitted beside `q8` rather than left out. The cosine is
+carried on the **rate**, `h'(s) = 1 - cos 2πs`, because a raised cosine in
+position is only C¹ at its ends and everything else this planner emits is C².
+
+**The tool differs and the planner knows it.** `q9_left_rail_joint` on the
+PZS100, `theta10_outer_jaw_joint` on the 7040 (§3.1). The 7040's jaw
+transmission **reverses sign inside its own range** — issue 037's notes measured
+the crossing at `q8 ≈ 0.29 rad` — and at the crossing the cylinder moves the jaw
+through no distance at all. A phase whose travel spans it is refused naming it,
+never clipped and never planned through. Which end of the range closes the
+gripper is not in the description, so it is the `gripper_closed_end` parameter:
+measured on the 7040, assumed on the PZS100, where
+`commissioning_prerequisites.md` item 4 already owns that axis as human work.
+
+**No memory, in either direction.** The service holds nothing between calls and
+which phase ran last is not a fact it has: every phase starts at the machine's
+own measured configuration, so the task layer sequences the four by moving the
+machine and re-measuring. That is what makes "no phase returns a trajectory whose
+first point is not at the previous phase's last" true by construction.
+
+`crane_msgs/PlanGrip` has no `avoid_collisions` row and the .srv is frozen
+(PRD §15), so the node reads its absence as the **checked** plan — an arm phase
+with nothing on `/crane/collision_scene` is refused naming the topic. A tool
+phase moves no link that was not already where it is, sweeps nothing, and reads
+no goal pose at all, so it demands neither a scene nor a frame.
+
 ## It is not a second command producer
 
 `crane_velocity_controller` is the sole claimant of the six `velocity` command
@@ -456,6 +517,8 @@ reading these sources.
     include/crane_planning/sampling_planner.hpp    §4.4's fallback and §4.5's mandatory smoothing
     include/crane_planning/trajectory_timing.hpp   the ramp, and the seam it meets the path at
     include/crane_planning/timing_ocp.hpp          §5.2's OCP, §5.3's constraints and §5.5's κ
+    include/crane_planning/tool_axis.hpp           §8's retained grip cosine, on the arm's clock
+    include/crane_planning/plan_grip.hpp           the four phases of crane_msgs/PlanGrip
     src/acados_casadi_bridge.hpp                   where acados meets CasADi; not installed
     config/hydraulic_limits.yaml                   Q_P^max and the relief setting, with their evidence
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free

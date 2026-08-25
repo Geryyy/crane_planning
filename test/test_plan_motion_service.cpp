@@ -1,5 +1,5 @@
-// The served contract: `/crane/plan_motion` answered by a real node, and the
-// answer republished on `/crane/reference`.
+// The served contract: `/crane/plan_motion` and `/crane/plan_grip` answered by a
+// real node, and the answer republished on `/crane/reference`.
 //
 // In process. The node object and a client are two nodes in one executor on the
 // isolated domain `ralph/verify.sh` pins, with localhost-only transport: no
@@ -9,12 +9,19 @@
 // The goal poses are not invented either: each one is produced by
 // `crane_model::forward_kinematics` from a configuration the description allows,
 // so what the service is asked for is a pose that certainly exists.
+//
+// The two services are one node and `wiki/implementation/ros2_interfaces.md` 10
+// keeps them separate while the tested task layer migrates, so they are two
+// fixtures here -- the second deriving from the first, because a grip is answered
+// from the same model, the same `/joint_states` and the same scene.
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -30,6 +37,7 @@
 #include "crane_msgs/msg/collision_primitive.hpp"
 #include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
+#include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "crane_planning/planner_node.hpp"
@@ -43,6 +51,7 @@
 namespace
 {
 
+using crane_msgs::srv::PlanGrip;
 using crane_msgs::srv::PlanMotion;
 using sensor_msgs::msg::JointState;
 using trajectory_msgs::msg::JointTrajectory;
@@ -546,4 +555,249 @@ TEST_F(PlanMotionService, TheAnswerNamesWhichOfTheTwoMechanismsProducedTheGeomet
     response->message.find(
       crane_planning::mechanism_name(crane_planning::PathMechanism::SamplingFallback)),
     std::string::npos) << response->message;
+}
+
+namespace
+{
+
+/// `/crane/plan_grip`, the same node's second row in ROS 2 Interfaces 5.
+/**
+ * What this fixture adds to the one above is a client and nothing else: a grip is
+ * answered from the same model, the same `/joint_states` and the same subscribed
+ * scene, because it is the same node object. That is the point of testing it
+ * here rather than beside `test_plan_grip.cpp` -- the offline suite is where the
+ * four phases are asserted, and this is where "the node serves it, and its answer
+ * is `/crane/plan_motion`'s own answer shape" is.
+ *
+ * Two of the four phases solve the OCP of `wiki/trajectory_planning.md` 5.2,
+ * because a grip's descend and lift are `plan_motion` itself. This fixture is
+ * therefore priced like the motion cases above and not like a tool phase, which
+ * is a cosine and costs nothing.
+ */
+class PlanGripService : public PlanMotionService
+{
+protected:
+  void SetUp() override
+  {
+    PlanMotionService::SetUp();
+    grip_client_ = client_node_->create_client<PlanGrip>(crane_planning::kPlanGripService);
+  }
+
+  /// A truck parked well clear of everything this fixture plans through.
+  /**
+   * `crane_msgs/PlanGrip` carries no `avoid_collisions` row and the .srv is
+   * frozen, so the node reads the absent field as the checked plan -- a grip's
+   * arm phase is the move that puts a tool between the runges. An arm phase with
+   * nothing on the scene topic is therefore refused, which is asserted below and
+   * is why every phase meant to succeed publishes this first.
+   */
+  void park_the_truck()
+  {
+    crane_msgs::msg::CollisionScene scene;
+    scene.header.frame_id = crane_planning::kPlanningFrame;
+    scene.header.stamp = client_node_->now();
+    crane_msgs::msg::CollisionPrimitive truck;
+    truck.id = crane_planning::kTruckId;
+    truck.shape = crane_msgs::msg::CollisionScene::SHAPE_BOX;
+    truck.structural = true;
+    truck.pose.position.x = 18.0;
+    truck.pose.orientation.w = 1.0;
+    truck.dimensions.x = 6.5;
+    truck.dimensions.y = 2.4;
+    truck.dimensions.z = 1.2;
+    scene.primitives.push_back(truck);
+    collision_scene_->publish(scene);
+  }
+
+  /// One phase, with the fields the .srv gives every phase.
+  /**
+   * The goal is left in no frame at all, and the two tool phases are called with
+   * it that way on purpose: a close reads no pose, so demanding a frame of a
+   * field the phase does not use would refuse a well-formed request. The arm
+   * phases fill it in below.
+   */
+  static PlanGrip::Request::SharedPtr grip_request(std::uint8_t phase)
+  {
+    auto request = std::make_shared<PlanGrip::Request>();
+    request->phase = phase;
+    request->payload.shape = crane_msgs::msg::Payload::SHAPE_NONE;
+    request->speed_scale = 1.0;
+    return request;
+  }
+
+  PlanGrip::Response::SharedPtr call_grip(const PlanGrip::Request::SharedPtr & request)
+  {
+    EXPECT_TRUE(spin_until([this]() {return grip_client_->service_is_ready();}));
+    auto future = grip_client_->async_send_request(request);
+    const bool answered = spin_until(
+      [&future]() {
+        return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+      });
+    EXPECT_TRUE(answered) << "the service never answered";
+    return answered ? future.get() : nullptr;
+  }
+
+  /// `/crane/plan_motion`'s own answer shape: six rows, one absolute stamp, one grid.
+  void expect_plan_motions_wire_form(const JointTrajectory & trajectory, const char * what)
+  {
+    // The six actuated joints of ROS 2 Interfaces 3.1, in that order -- including
+    // q8, which trajectory_planning 4.1 keeps out of the path and on the clock.
+    const std::vector<std::string> expected{
+      "theta1_slewing_joint", "theta2_boom_joint", "theta3_arm_joint", "q4_big_telescope",
+      "theta8_rotator_joint", "q9_left_rail_joint"};
+    EXPECT_EQ(trajectory.joint_names, expected) << what;
+
+    // Joint space has no geometric frame, and the stamp is the absolute time the
+    // first point is valid for -- which is the measurement the phase started from.
+    EXPECT_TRUE(trajectory.header.frame_id.empty()) << what;
+    EXPECT_EQ(rclcpp::Time(trajectory.header.stamp), start_stamp_) << what;
+
+    ASSERT_GE(trajectory.points.size(), 2U) << what;
+    for (const auto & point : trajectory.points) {
+      EXPECT_EQ(point.positions.size(), crane_model::kActuatedDof) << what;
+      EXPECT_EQ(point.velocities.size(), crane_model::kActuatedDof) << what;
+      EXPECT_TRUE(point.accelerations.empty()) << what;
+      EXPECT_TRUE(point.effort.empty()) << what;
+    }
+
+    // One clock: the first point at zero, strictly increasing after it.
+    EXPECT_EQ(rclcpp::Duration(trajectory.points.front().time_from_start).seconds(), 0.0) << what;
+    for (std::size_t index = 1; index < trajectory.points.size(); ++index) {
+      EXPECT_GT(
+        rclcpp::Duration(trajectory.points[index].time_from_start).seconds(),
+        rclcpp::Duration(trajectory.points[index - 1].time_from_start).seconds()) << what;
+    }
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      EXPECT_NEAR(trajectory.points.front().velocities[row], 0.0, 1.0e-9) << what << " row " << row;
+      EXPECT_NEAR(trajectory.points.back().velocities[row], 0.0, 1.0e-9) << what << " row " << row;
+    }
+  }
+
+  rclcpp::Client<PlanGrip>::SharedPtr grip_client_;
+};
+
+}  // namespace
+
+TEST_F(PlanGripService, AllFourPhasesComeBackOnTheSixActuatedJointsAndOnOneClock)
+{
+  // The served half of the issue's first criterion: all four phases, each
+  // returning a `JointTrajectory` on the same six joints and the same stamp
+  // semantics as `/crane/plan_motion`. Two of them are arm motions through the
+  // OCP and two are the tool's own cosine, and 4.1's claim is that a caller
+  // cannot tell which from the shape of the answer -- geometrically the tool is
+  // decoupled from the arm, temporally it is not.
+  const crane_planning::JointLimits limits = fixture_limits();
+  const crane_model::QA start =
+    crane_planning_test::working_centred(limits, crane_planning_test::machines().front());
+  crane_model::QA lower = start;
+  lower[1] -= 0.15;  // theta2_boom_joint, which drops the tool
+  crane_model::QA higher = start;
+  higher[1] += 0.15;
+
+  park_the_truck();
+
+  auto descend = grip_request(PlanGrip::Request::PHASE_DESCEND);
+  descend->goal = reachable_goal(lower);
+  auto lift = grip_request(PlanGrip::Request::PHASE_LIFT);
+  lift->goal = reachable_goal(higher);
+
+  const std::array<std::pair<const char *, PlanGrip::Request::SharedPtr>, 4U> phases{
+    {{"descend", descend},
+      {"close", grip_request(PlanGrip::Request::PHASE_CLOSE)},
+      {"open", grip_request(PlanGrip::Request::PHASE_OPEN)},
+      {"lift", lift}}};
+
+  for (const auto & phase : phases) {
+    // The machine is re-measured before every phase, and that is not test
+    // scaffolding: a served descend costs some 7 s -- the endpoint IK, the
+    // collision check and the OCP of 5.2 -- against a `max_input_age` of 0.5 s,
+    // so four phases answered from one `/joint_states` would have three of them
+    // refused for planning a crane that has moved. Sequencing the four by moving
+    // the machine and re-measuring is what the task layer does anyway; it is the
+    // same fact that makes the planner able to hold no state between phases.
+    publish_start(positions_of(start));
+
+    const auto response = call_grip(phase.second);
+    ASSERT_NE(response, nullptr) << phase.first;
+    ASSERT_TRUE(response->success) << phase.first << ": " << response->message;
+    expect_plan_motions_wire_form(response->trajectory, phase.first);
+
+    // Every phase starts at the measurement it was answered from, over all six
+    // rows -- which is what makes a sequence join without the planner
+    // remembering which phase ran last. The four are asked in one order here and
+    // the planner is answering each from the same `/joint_states`, so if it kept
+    // any phase-to-phase state at all this is where it would show.
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      EXPECT_NEAR(
+        response->trajectory.points.front().positions[row],
+        start[static_cast<Eigen::Index>(row)], 1.0e-12) << phase.first << " row " << row;
+    }
+  }
+}
+
+TEST_F(PlanGripService, APhaseTheMessageDoesNotDefineIsRefusedRatherThanMappedOntoTheNearest)
+{
+  // `crane_msgs/PlanGrip` is frozen at four phases (PRD 15). A fifth value is a
+  // caller talking about something this .srv does not define, and the refusal
+  // names the four rather than picking whichever is closest.
+  publish_start();
+  auto request = grip_request(5U);
+  request->goal.header.frame_id = crane_planning::kPlanningFrame;
+  const auto response = call_grip(request);
+  ASSERT_NE(response, nullptr);
+  EXPECT_FALSE(response->success);
+  EXPECT_NE(response->message.find("PHASE_DESCEND"), std::string::npos) << response->message;
+  EXPECT_TRUE(response->trajectory.points.empty());
+}
+
+TEST_F(PlanGripService, AnArmPhaseIsCheckedAgainstTheSceneAndAToolPhaseNeedsNeitherSceneNorGoal)
+{
+  // The frozen .srv has no `avoid_collisions` row, so the node has to decide what
+  // its absence means, and for a grip it means the checked plan. With nothing on
+  // the scene topic a descend is refused naming it -- while a close moves no link
+  // that was not already where it is, reads no goal, and is answered.
+  const crane_planning::JointLimits limits = fixture_limits();
+  const crane_model::QA start =
+    crane_planning_test::working_centred(limits, crane_planning_test::machines().front());
+  publish_start(positions_of(start));
+
+  crane_model::QA lower = start;
+  lower[1] -= 0.15;
+  auto descend = grip_request(PlanGrip::Request::PHASE_DESCEND);
+  descend->goal = reachable_goal(lower);
+  const auto refused = call_grip(descend);
+  ASSERT_NE(refused, nullptr);
+  EXPECT_FALSE(refused->success);
+  EXPECT_NE(refused->message.find(crane_planning::kCollisionSceneTopic), std::string::npos)
+    << refused->message;
+  // ...and it says which phase it was answering, because the task layer calls
+  // this service four times for one grip.
+  EXPECT_NE(refused->message.find("descend phase"), std::string::npos) << refused->message;
+  EXPECT_TRUE(refused->trajectory.points.empty());
+
+  const auto planned = call_grip(grip_request(PlanGrip::Request::PHASE_CLOSE));
+  ASSERT_NE(planned, nullptr);
+  ASSERT_TRUE(planned->success) << planned->message;
+  EXPECT_FALSE(planned->trajectory.points.empty());
+}
+
+TEST_F(PlanGripService, AGripPhaseArrivesOnTheReferenceTopicToo)
+{
+  // ROS 2 Interfaces 4 gives `/crane/reference` all six actuated coordinates and
+  // trajectory_planning 4.1 puts q8 among them, so `q8_ref` needs a producer
+  // while a grip is running and this is it. A close is the cheapest phase to ask
+  // that with: no OCP, no endpoint IK, just the cosine.
+  publish_start();
+  const auto response = call_grip(grip_request(PlanGrip::Request::PHASE_CLOSE));
+  ASSERT_NE(response, nullptr);
+  ASSERT_TRUE(response->success) << response->message;
+
+  ASSERT_TRUE(spin_until([this]() {return !published_.empty();}))
+    << "nothing was published on " << crane_planning::kReferenceTopic;
+  ASSERT_EQ(published_.size(), 1U);
+  EXPECT_EQ(published_.front().joint_names, response->trajectory.joint_names);
+  ASSERT_EQ(published_.front().points.size(), response->trajectory.points.size());
+  EXPECT_EQ(
+    published_.front().points.back().positions, response->trajectory.points.back().positions);
+  EXPECT_TRUE(published_.front().header.frame_id.empty());
 }

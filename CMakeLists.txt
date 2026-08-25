@@ -296,11 +296,17 @@ if(BUILD_TESTING)
   target_compile_definitions(test_plan_grip PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
-  # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes
-  # in one in-process executor -- the deployment's own node object and a client
-  # -- and no launch, no controller manager and no simulator, because the planner
-  # claims no interface and joins no cascade.
-  ament_add_gtest(test_plan_motion_service test/test_plan_motion_service.cpp TIMEOUT 300)
+  # S5: the served contract of both rows the planner has in ROS 2 Interfaces §5 —
+  # `/crane/plan_motion` and `/crane/plan_grip` — on the isolated domain
+  # `verify.sh` pins. Two nodes in one in-process executor: the deployment's own
+  # node object and a client, and no launch, no controller manager and no
+  # simulator, because the planner claims no interface and joins no cascade.
+  #
+  # The timeout was 300 s while `/crane/plan_motion` was the only row. A grip's
+  # descend and lift are `plan_motion` itself, so serving the four phases adds
+  # two more OCP solves of §5.2 at some 14 s each; 900 s is that with room, and
+  # it bounds a hang rather than budgeting a latency (§7's latency is issue 045's).
+  ament_add_gtest(test_plan_motion_service test/test_plan_motion_service.cpp TIMEOUT 900)
   target_link_libraries(test_plan_motion_service
     planner_node
     ${crane_msgs_TARGETS}
