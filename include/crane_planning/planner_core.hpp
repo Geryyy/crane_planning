@@ -5,8 +5,12 @@
 // timing stage. The geometric stage is the endpoint IK of
 // `wiki/robot_model.md` 2.2 followed by the structured lift/traverse/descend
 // primitive of `trajectory_planning` 4.4, built `C2` in sigma; the timing stage
-// is still one scaled ramp, run along that path rather than straight between two
-// configurations.
+// is the path-constrained optimal control problem of 5.2, solved with acados
+// over `crane_model`'s symbolic graph -- the sway carried as a state, the
+// cylinder force and pump flow constrained out of the same expressions
+// `crane_mpc` will use, and the kappa margin of 5.5 held back for the
+// controller. The scaled ramp it replaced is still in the package, as the
+// no-dynamics answer the OCP is measured against.
 //
 // **Which of 2.2's two formulations solves the endpoint is decided here and not
 // by the caller.** 2.2's closing paragraph is the rule -- the semi-analytic
@@ -20,7 +24,6 @@
 // **absent** is named rather than approximated, and every absence is refused at
 // the boundary instead of stubbed:
 //
-//   the path-constrained OCP, force, flow, kappa       issue 043
 //   replanning from a moving, swinging state           issue 045
 //
 // Collision is no longer among them: the scene of `/crane/collision_scene`, the
@@ -65,6 +68,7 @@
 #include "crane_planning/joint_limits.hpp"
 #include "crane_planning/sampling_planner.hpp"
 #include "crane_planning/structured_primitive.hpp"
+#include "crane_planning/timing_ocp.hpp"
 #include "crane_planning/trajectory_timing.hpp"
 
 namespace crane_planning
@@ -78,6 +82,27 @@ struct PlannerSettings
   PrimitiveSettings primitive{};
   SamplingSettings sampling{};      ///< the fallback of 4.4, reached only when the primitive is not
   RampSettings ramp{};
+
+  /// The path-constrained OCP of 5.2, which is what times every plan.
+  /**
+   * `RampSettings` above no longer times anything a caller receives. It is kept
+   * because `scaled_ramp` and `scaled_ramp_along_path` are still the thing the
+   * timing tests pose the OCP against -- a ramp is the answer the machine would
+   * give with no dynamics in the loop, and the difference is what carrying the
+   * sway bought.
+   */
+  TimingOcpSettings timing{};
+
+  /// The hydraulic relief setting the cylinder force limit is derived from, Pa.
+  /**
+   * `config/hydraulic_limits.yaml` carries it and the evidence for it, which is
+   * thin: `wiki/implementation/parameters.md` 7 lists the pressure constants
+   * among its gaps, so this is the one number in the force limit that is neither
+   * measured nor readable off the description. The chamber areas *are* the
+   * model's, through `derive_cylinder_force_limits`.
+   */
+  double system_pressure_pa{2.5e7};
+
   std::size_t geometry_samples{9};  ///< telescope extensions the structure check runs over
 };
 
@@ -87,11 +112,22 @@ struct PlannerContext
   ArmGeometry geometry{};
   JointLimits limits{};
   PlannerSettings settings{};
+
+  /// The config the model was built from, kept because the OCP needs it.
+  /**
+   * `crane_model::symbolic::casadi_graph` takes a `ModelConfig` and not a
+   * `Model`: the model keeps its parse behind a private pimpl and its header is
+   * frozen, so there is no route from a `const Model &` to what it parsed. Issue
+   * 035's notes record that as structural rather than incidental. Holding the
+   * config here is what lets `plan_motion` build the graph for the same machine
+   * the `Model` describes instead of re-deriving one.
+   */
+  crane_model::ModelConfig model_config{};
 };
 
-/// Derive the context from one model and the description it was built from.
+/// Derive the context from one model and the config it was built from.
 [[nodiscard]] crane_model::Result<PlannerContext> build_planner(
-  const crane_model::Model & model, const std::string & robot_description_xml,
+  const crane_model::Model & model, const crane_model::ModelConfig & model_config,
   const PlannerSettings & settings);
 
 /// One `/crane/plan_motion` request, with the message already off it.
@@ -102,7 +138,15 @@ struct MotionRequest
   crane_model::QA q_a_start{crane_model::QA::Zero()};  ///< where the machine is now
   crane_model::Payload payload{};                      ///< what is in the gripper
   PayloadShape payload_shape{};                        ///< and what shape it is
-  double margin_factor{1.0};                           ///< kappa, i.e. `speed_scale`
+  /// `crane_msgs/PlanMotion.speed_scale`, in (0, 1]. **Not** kappa.
+  /**
+   * The caller's request to go slower, and nothing more. kappa of
+   * `wiki/trajectory_planning.md` 5.5 is `PlannerSettings::timing.kappa`, it is
+   * the authority the planner reserves for the MPC, and it is not reachable from
+   * a request: the two multiply, so asking for more speed can only ever lower the
+   * demand this places on the machine and never raise it above kappa.
+   */
+  double speed_scale{1.0};
   bool avoid_collisions{true};                         ///< honoured, per `crane_msgs/PlanMotion`
 
   /// The newest `/crane/collision_scene`, already expanded and in K0. May be null.
@@ -113,6 +157,16 @@ struct MotionRequest
 struct MotionPlan
 {
   TimedTrajectory trajectory{};
+
+  /// What the OCP spent, and how close to the machine's limits it came.
+  /**
+   * Carried out rather than kept inside, because `PeakDemand` is what makes
+   * 5.5's margin checkable by a caller instead of trusted: every entry is a
+   * fraction of the **physical** limit, so a plan built at `kappa = 0.8` reports
+   * peaks at or below 0.8 and not at 1.0. `solver_status` is acados' own word,
+   * and it says `ACADOS_SUCCESS` on every plan that exists.
+   */
+  TimingSolution timing{};
   std::vector<crane_model::Pose> tcp_path{};  ///< for visualization only
   IkSolution endpoint{};
 

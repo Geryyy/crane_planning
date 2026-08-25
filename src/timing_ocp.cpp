@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -17,7 +15,6 @@
 #include "acados_casadi_bridge.hpp"
 
 extern "C" {
-#include "acados/utils/external_function_generic.h"
 #include "acados_c/ocp_nlp_interface.h"
 }
 
@@ -139,11 +136,6 @@ SX path_dynamics(
   const SX state16 = full_state(
     symbols.q_a_mid, symbols.q_u, symbols.dq_a_mid * symbols.sigma_rate, symbols.dq_u);
 
-  if (std::getenv("CRANE_PLANNING_OCP_TRIVIAL") != nullptr) {
-    return SX::vertcat(
-      {SX(1.0), symbols.u / symbols.sigma_rate, symbols.dq_u / symbols.sigma_rate,
-        (-symbols.q_u - symbols.dq_u) / symbols.sigma_rate});
-  }
   const std::vector<SX> rows = graph.passive_rows(std::vector<SX>{state16});
   const SX & mass_uu = rows[0];
   const SX & mass_ua = rows[1];
@@ -198,18 +190,25 @@ ScaledLimits scale_limits(
  * *velocity* is absent because it is `|q_a'(sigma_k)| sigma_dot` with a known
  * `q_a'`, i.e. a per-stage bound on one state and cheaper as a box than as a
  * nonlinear row.
+ *
+ * **Every row is divided by its own scaled limit**, so the vector is a set of
+ * *fractions of the allowance* and the box is plain `[-1, 1]`. That is not
+ * cosmetic. Written in physical units the thirteen rows span nine decades --
+ * radians per second squared near one, newtons near `1e5`, cubic metres per
+ * second near `1e-3` -- and the QP's constraint Jacobian inherits the spread.
+ * HPIPM fails on it: `ACADOS_QP_FAILURE` on the first step, for a problem whose
+ * functions are all finite and whose solution exists. Normalised, the same
+ * problem converges.
  */
 SX constraint_vector(
-  const crane_model::symbolic::CasadiGraph & graph, const Symbols & symbols)
+  const crane_model::symbolic::CasadiGraph & graph, const Symbols & symbols,
+  const ScaledLimits & scaled)
 {
   const SX ddq_a = joint_acceleration(
     symbols.dq_a_node, symbols.ddq_a_node, symbols.sigma_rate, symbols.u);
   const SX state16 = full_state(
     symbols.q_a_node, symbols.q_u, symbols.dq_a_node * symbols.sigma_rate, symbols.dq_u);
 
-  if (std::getenv("CRANE_PLANNING_OCP_SIMPLE_H") != nullptr) {
-    return SX::vertcat({ddq_a, ddq_a, symbols.sigma_rate});
-  }
   // The output map of mpc.md 3, read rather than rebuilt: `F_cyl` is constraint
   // 6's left-hand side and the per-axis `Q` sums to constraint 7's, with 3.1's
   // smoothing already inside it.
@@ -221,7 +220,17 @@ SX constraint_vector(
 
   const SX cylinder_force = z(casadi::Slice(force, force + dof));
   const SX pump_flow = SX::sum1(z(casadi::Slice(flow, flow + dof)));
-  return SX::vertcat({ddq_a, cylinder_force, pump_flow});
+
+  std::vector<SX> rows;
+  rows.reserve(static_cast<std::size_t>(kOcpConstraints));
+  for (int row = 0; row < dof; ++row) {
+    rows.push_back(ddq_a(row) / scaled.ddq_a_max[row]);
+  }
+  for (int row = 0; row < dof; ++row) {
+    rows.push_back(cylinder_force(row) / scaled.force_max[row]);
+  }
+  rows.push_back(pump_flow / scaled.flow_max);
+  return SX::vertcat(rows);
 }
 
 /// The Gauss-Newton residual whose half-square-norm is 5.2's objective.
@@ -462,13 +471,12 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       {densify(terminal_rows), densify(SX::jacobian(terminal_rows, symbols.x).T()),
         SX::zeros(kTerminalResidualDof, 0)});
 
-    const SX constraint_rows = constraint_vector(*graph, symbols);
+    const SX constraint_rows = constraint_vector(*graph, symbols, scaled);
     constraint = casadi::Function(
       "nl_constr_h_fun", {symbols.x, symbols.u, algebraic, symbols.p}, {densify(constraint_rows)});
     constraint_jacobian = casadi::Function(
       "nl_constr_h_fun_jac", {symbols.x, symbols.u, algebraic, symbols.p},
-      {densify(constraint_rows), densify(SX::jacobian(constraint_rows, variables).T()),
-        SX::zeros(0, kOcpConstraints)});
+      {densify(constraint_rows), densify(SX::jacobian(constraint_rows, variables).T())});
   } catch (const std::exception & error) {
     return Result<TimingSolution>::failure(
       failure(
@@ -501,21 +509,26 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
 
   const ScaledLimits scaled = scale_limits(limits, settings, request.speed_scale);
 
-  // The passive pair at both ends. 5.4's terminal condition is `q_u(T) = q_eq`,
-  // and the start is the settled pose the stopped-start convention gives -- both
-  // are `Model::passive_equilibrium` and neither is guessed here.
-  const crane_model::QA q_a_start = actuated(nodes.front(), 0);
-  const crane_model::QA q_a_goal = actuated(nodes.back(), 0);
-  auto start_equilibrium = model.passive_equilibrium(q_a_start, request.payload);
-  if (!start_equilibrium.ok()) {
-    return Result<TimingSolution>::failure(start_equilibrium.status());
+  // The passive pair the machine hangs at, at **every** node and not only at the
+  // two ends. 5.4's terminal condition is `q_u(T) = q_eq` and the start is the
+  // settled pose the stopped-start convention gives, so both ends are pinned
+  // here -- but `mpc.md` 3 constraint 3 writes the sway box around `q_u^eq` and
+  // that equilibrium moves with the arm. Slewing the tool out along the path
+  // carries the hanging pose with it by far more than `q_u_max`, so a box drawn
+  // once around the *goal* equilibrium excludes the machine's own resting
+  // configuration over most of the path and the QP is infeasible before the
+  // first step. One `Model::passive_equilibrium` per node, none of it guessed.
+  std::vector<crane_model::QU> q_u_equilibrium;
+  q_u_equilibrium.reserve(nodes.size());
+  for (const PathSample & node : nodes) {
+    auto equilibrium = model.passive_equilibrium(actuated(node, 0), request.payload);
+    if (!equilibrium.ok()) {
+      return Result<TimingSolution>::failure(equilibrium.status());
+    }
+    q_u_equilibrium.push_back(equilibrium.value());
   }
-  auto goal_equilibrium = model.passive_equilibrium(q_a_goal, request.payload);
-  if (!goal_equilibrium.ok()) {
-    return Result<TimingSolution>::failure(goal_equilibrium.status());
-  }
-  const crane_model::QU q_u_start = start_equilibrium.value();
-  const crane_model::QU q_u_goal = goal_equilibrium.value();
+  const crane_model::QU q_u_start = q_u_equilibrium.front();
+  const crane_model::QU q_u_goal = q_u_equilibrium.back();
 
   // ------------------------------------------------------------------
   // The acados problem
@@ -528,8 +541,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   // `1/sigma_dot`, whose Gauss-Newton curvature *falls* as the rate rises, so a
   // full Newton step from a slow guess overshoots by orders of magnitude and the
   // QP is then asked about a state the model has no answer for.
-  ocp.plan_->globalization =
-    std::getenv("CRANE_PLANNING_OCP_FIXED_STEP") != nullptr ? FIXED_STEP : MERIT_BACKTRACKING;
+  ocp.plan_->globalization = MERIT_BACKTRACKING;
   ocp.plan_->ocp_qp_solver_plan.qp_solver = PARTIAL_CONDENSING_HPIPM;
   for (int stage = 0; stage <= intervals; ++stage) {
     ocp.plan_->nlp_cost[stage] = NONLINEAR_LS;
@@ -560,8 +572,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   // because the path meets its own start with `q_a' = 0`, so no joint moves
   // there whatever the rate is.
   const int bounded_x0 = kOcpStateDof - 1;
-  const int nonlinear_rows =
-    std::getenv("CRANE_PLANNING_OCP_NOH") != nullptr ? 0 : kOcpConstraints;
+  const int nonlinear_rows = kOcpConstraints;
   for (int stage = 0; stage <= intervals; ++stage) {
     const int constraints = stage < intervals ? nonlinear_rows : 0;
     const int residual_rows = stage < intervals ? kResidualDof : kTerminalResidualDof;
@@ -610,17 +621,13 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   }
   const std::vector<double> reference(static_cast<std::size_t>(kResidualDof), 0.0);
 
-  std::vector<double> lower_h(static_cast<std::size_t>(kOcpConstraints), 0.0);
-  std::vector<double> upper_h(static_cast<std::size_t>(kOcpConstraints), 0.0);
+  // Every row of `constraint_vector` is already a fraction of its own scaled
+  // limit, so the box is the unit one and carries no machine number at all. The
+  // flow row is one-sided because `Q` is a draw and not a signed force.
+  std::vector<double> lower_h(static_cast<std::size_t>(kOcpConstraints), -1.0);
+  std::vector<double> upper_h(static_cast<std::size_t>(kOcpConstraints), 1.0);
   const int dof = static_cast<int>(crane_model::kActuatedDof);
-  for (int row = 0; row < dof; ++row) {
-    lower_h[static_cast<std::size_t>(row)] = -scaled.ddq_a_max[row];
-    upper_h[static_cast<std::size_t>(row)] = scaled.ddq_a_max[row];
-    lower_h[static_cast<std::size_t>(dof + row)] = -scaled.force_max[row];
-    upper_h[static_cast<std::size_t>(dof + row)] = scaled.force_max[row];
-  }
   lower_h[static_cast<std::size_t>(2 * dof)] = 0.0;
-  upper_h[static_cast<std::size_t>(2 * dof)] = scaled.flow_max;
 
   std::vector<int> input_index{0};
   std::vector<double> input_lower{-settings.sigma_accel_max};
@@ -745,13 +752,14 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       lower = {1.0, settings.sigma_rate_min, q_u_goal[0], q_u_goal[1], 0.0, 0.0};
       upper = {1.0, rate_ceiling, q_u_goal[0], q_u_goal[1], 0.0, 0.0};
     } else {
+      const crane_model::QU & rest = q_u_equilibrium[static_cast<std::size_t>(stage)];
       index = {0, 1, 2, 3, 4, 5};
       lower = {
-        0.0, settings.sigma_rate_min, q_u_goal[0] - settings.q_u_max[0],
-        q_u_goal[1] - settings.q_u_max[1], -settings.dq_u_max[0], -settings.dq_u_max[1]};
+        0.0, settings.sigma_rate_min, rest[0] - settings.q_u_max[0],
+        rest[1] - settings.q_u_max[1], -settings.dq_u_max[0], -settings.dq_u_max[1]};
       upper = {
-        1.0, rate_ceiling, q_u_goal[0] + settings.q_u_max[0],
-        q_u_goal[1] + settings.q_u_max[1], settings.dq_u_max[0], settings.dq_u_max[1]};
+        1.0, rate_ceiling, rest[0] + settings.q_u_max[0],
+        rest[1] + settings.q_u_max[1], settings.dq_u_max[0], settings.dq_u_max[1]};
     }
     state_index.push_back(std::move(index));
     state_lower.push_back(std::move(lower));
@@ -772,10 +780,12 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "timeout_max_time", &budget);
   double regularisation = settings.levenberg_marquardt;
   ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "levenberg_marquardt", &regularisation);
-  if (std::getenv("CRANE_PLANNING_OCP_DEBUG") != nullptr) {
-    int print_level = 3;
-    ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "print_level", &print_level);
-  }
+  double tolerance_stationarity = settings.tolerance_stationarity;
+  double tolerance_feasibility = settings.tolerance_feasibility;
+  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_stat", &tolerance_stationarity);
+  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_eq", &tolerance_feasibility);
+  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_ineq", &tolerance_feasibility);
+  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_comp", &tolerance_feasibility);
   for (int stage = 0; stage < intervals; ++stage) {
     stages = 4;
     steps = 1;
@@ -794,14 +804,32 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         "acados could not precompute the timing OCP: " + acados_status_word(precompute)));
   }
 
-  // A guess that already satisfies the boundary conditions: the path rate at the
-  // velocity-limited value, the sway at the equilibrium it starts and ends at.
+  // A guess that already satisfies the boundary conditions and every box: the
+  // path rate on the classical velocity-limit curve of 5.1 -- the largest rate at
+  // which the path's own curvature alone, with `sigma_ddot = 0`, still respects
+  // the acceleration limit -- and the sway at the node's own hanging pose, not
+  // moving. Starting at the velocity limit instead would put the arm's
+  // acceleration several times over its bound at the path's tightest bends, and
+  // the first QP is then asked to repair a violation it has no feasible step for.
+  std::vector<double> rate_guesses(static_cast<std::size_t>(intervals) + 1U, 0.0);
+  for (int stage = 0; stage <= intervals; ++stage) {
+    const crane_model::QA curvature_row = actuated(nodes[static_cast<std::size_t>(stage)], 2);
+    double rate = rate_ceilings[static_cast<std::size_t>(stage)];
+    for (int row = 0; row < dof; ++row) {
+      const double curvature = std::abs(curvature_row[row]);
+      if (curvature > 1.0e-9) {
+        rate = std::min(rate, std::sqrt(scaled.ddq_a_max[row] / curvature));
+      }
+    }
+    rate_guesses[static_cast<std::size_t>(stage)] =
+      std::max(rate, 2.0 * settings.sigma_rate_min);
+  }
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);
     guess[0] = static_cast<double>(stage) * d_sigma;
-    guess[1] = 0.5 * rate_ceilings[static_cast<std::size_t>(stage)];
-    guess[2] = q_u_start[0] + (q_u_goal[0] - q_u_start[0]) * guess[0];
-    guess[3] = q_u_start[1] + (q_u_goal[1] - q_u_start[1]) * guess[0];
+    guess[1] = rate_guesses[static_cast<std::size_t>(stage)];
+    guess[2] = q_u_equilibrium[static_cast<std::size_t>(stage)][0];
+    guess[3] = q_u_equilibrium[static_cast<std::size_t>(stage)][1];
     ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "x", guess.data());
     if (stage < intervals) {
       double input = 0.0;
@@ -817,82 +845,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     if (stage < intervals) {
       ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "pi", zeros.data());
     }
-  }
-
-  if (std::getenv("CRANE_PLANNING_OCP_DEBUG") != nullptr) {
-    for (int stage = 0; stage <= intervals; ++stage) {
-      std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);
-      guess[0] = static_cast<double>(stage) * d_sigma;
-      guess[1] = 0.5 * rate_ceilings[static_cast<std::size_t>(stage)];
-      guess[2] = q_u_start[0] + (q_u_goal[0] - q_u_start[0]) * guess[0];
-      guess[3] = q_u_start[1] + (q_u_goal[1] - q_u_start[1]) * guess[0];
-      const casadi::DM x_dm(guess);
-      const casadi::DM u_dm(std::vector<double>{0.0});
-      const casadi::DM p_dm(parameters[static_cast<std::size_t>(stage)]);
-      const auto report = [stage](const char * name, const std::vector<casadi::DM> & out) {
-          for (std::size_t index = 0; index < out.size(); ++index) {
-            double peak = 0.0;
-            bool finite = true;
-            for (double value : out[index].nonzeros()) {
-              finite = finite && std::isfinite(value);
-              peak = std::max(peak, std::abs(value));
-            }
-            std::fprintf(
-              stderr, "stage %d: %s output %zu finite=%d peak=%g\n", stage, name, index,
-              finite ? 1 : 0, peak);
-            if (stage == 0 && index == 0) {
-              for (double value : out[index].nonzeros()) {
-                std::fprintf(stderr, "   %g\n", value);
-              }
-            }
-          }
-        };
-      if (stage < intervals) {
-        report("ode", ode(std::vector<casadi::DM>{x_dm, u_dm, p_dm}));
-        report(
-          "residual_jacobian",
-          residual_jacobian(
-            std::vector<casadi::DM>{x_dm, u_dm, casadi::DM(0, 1), casadi::DM(0.0), p_dm}));
-        report(
-          "constraint_jacobian",
-          constraint_jacobian(
-            std::vector<casadi::DM>{x_dm, u_dm, casadi::DM(0, 1), p_dm}));
-      } else {
-        report(
-          "terminal_jacobian",
-          terminal_residual_jacobian(
-            std::vector<casadi::DM>{x_dm, casadi::DM(0, 1), casadi::DM(0, 1), casadi::DM(0.0),
-              p_dm}));
-      }
-    }
-  }
-
-  if (std::getenv("CRANE_PLANNING_OCP_DEBUG") != nullptr) {
-    // Round-trip: evaluate the constraint through acados' own wrapper at the
-    // stage-0 guess and print it, so the trampoline is compared against the
-    // direct CasADi call rather than assumed equal to it.
-    std::vector<double> x0(static_cast<std::size_t>(kOcpStateDof), 0.0);
-    x0[1] = 0.5 * rate_ceilings[0];
-    x0[2] = q_u_start[0];
-    x0[3] = q_u_start[1];
-    double u0 = 0.0;
-    std::vector<double> h(static_cast<std::size_t>(kOcpConstraints), -1.0);
-    std::vector<double> jac(
-      static_cast<std::size_t>((kOcpStateDof + kOcpInputDof) * kOcpConstraints), -1.0);
-    ext_fun_arg_t types_in[4] = {COLMAJ, COLMAJ, COLMAJ, COLMAJ};
-    void * ins[4] = {x0.data(), &u0, nullptr, nullptr};
-    struct colmaj_args jac_args
-    {
-      jac.data(), kOcpStateDof + kOcpInputDof
-    };
-    ext_fun_arg_t types_out[3] = {COLMAJ, COLMAJ_ARGS, COLMAJ_ARGS};
-    void * outs[3] = {h.data(), &jac_args, &jac_args};
-    auto * fun = static_cast<external_function_external_param_casadi *>(
-      bound_constraint_jacobian.handle(0U));
-    fun->evaluate(fun, types_in, ins, types_out, outs);
-    std::fprintf(stderr, "wrapper h:");
-    for (double value : h) {std::fprintf(stderr, " %g", value);}
-    std::fprintf(stderr, "\n");
   }
 
   const int status = ocp_nlp_solve(ocp.solver_, ocp.in_, ocp.out_);
@@ -1006,7 +958,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     const crane_model::QA slope = actuated(node, 1);
     const crane_model::QA curvature = actuated(node, 2);
 
-    std::vector<double> q_a(static_cast<std::size_t>(crane_model::kGeneralizedDof), 0.0);
     std::vector<double> acceleration(static_cast<std::size_t>(crane_model::kActuatedDof), 0.0);
     const crane_model::QA position = actuated(node, 0);
     for (int row = 0; row < dof; ++row) {
@@ -1047,7 +998,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     solution.peak_demand.pump_flow = std::max(
       solution.peak_demand.pump_flow,
       flow / (settings.actuation.pump_flow_planning_factor * settings.actuation.pump_flow_max));
-    (void)q_a;
   }
 
   return Result<TimingSolution>::success(std::move(solution));

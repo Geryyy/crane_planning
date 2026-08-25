@@ -1,5 +1,6 @@
 #include "acados_casadi_bridge.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdlib>
@@ -30,15 +31,12 @@ struct Slot
   std::vector<std::vector<int>> sparsity_in{};
   std::vector<std::vector<int>> sparsity_out{};
 
-  /// This function's own workspaces. acados' integer workspace is not usable
-  /// here: this image's CasADi counts in 64 bits, so the two widths never meet.
-  std::vector<casadi_int> integer_work{};
-  std::vector<double> float_work{};
-
   int n_in{};
   int n_out{};
   int sz_arg{};
   int sz_res{};
+  int sz_iw{};
+  int sz_w{};
 };
 
 std::mutex & slot_mutex()
@@ -85,12 +83,34 @@ std::vector<int> compress_sparsity(const casadi::Sparsity & sparsity)
 // The trampolines. One instantiation per slot, because acados takes a bare C
 // function pointer and there is nowhere to put a `this`.
 
+/// Forward one acados call into the live `casadi::Function` bound to this slot.
+/**
+ * **acados' own buffers may not be handed to CasADi, and neither may acados'
+ * workspaces.** `casadi::Function::sz_arg()` and `sz_res()` are documented as
+ * the *required length of the arg and res fields*, not as `n_in` and `n_out`:
+ * CasADi treats those two pointer tables as scratch it owns for the duration of
+ * a call. acados' `args` table is not scratch -- entry `idx_in_p` is the stage's
+ * parameter pointer, set once at registration and expected to survive every
+ * evaluation. Handing it over is what the first version of this bridge did, and
+ * the failure was quiet rather than loud: the first evaluation on a horizon was
+ * right, every later one read a clobbered parameter table, and the OCP came back
+ * `ACADOS_NAN_DETECTED` at iteration zero with finite functions everywhere a
+ * direct CasADi call was tried.
+ *
+ * The vector overload is CasADi's own answer to exactly this: it copies both
+ * pointer tables, sizes `iw` and `w` itself from `sz_iw()`/`sz_w()`, and takes a
+ * scoped memory checkout rather than assuming memory zero exists. Four small
+ * allocations per evaluation is the price, and this is off the control cycle by
+ * contract 10 -- the graph itself allocates on every call.
+ */
 template<int Index>
 int slot_evaluate(const double ** arg, double ** res, int * /*iw*/, double * /*w*/, void * /*mem*/)
 {
-  Slot & slot = slots()[static_cast<std::size_t>(Index)];
-  return static_cast<int>(
-    slot.function(arg, res, slot.integer_work.data(), slot.float_work.data(), 0));
+  const Slot & slot = slots()[static_cast<std::size_t>(Index)];
+  slot.function(
+    std::vector<const double *>(arg, arg + slot.sz_arg),
+    std::vector<double *>(res, res + slot.sz_res));
+  return 0;
 }
 
 template<int Index>
@@ -99,11 +119,11 @@ int slot_work(int * sz_arg, int * sz_res, int * sz_iw, int * sz_w)
   const Slot & slot = slots()[static_cast<std::size_t>(Index)];
   *sz_arg = slot.sz_arg;
   *sz_res = slot.sz_res;
-  // acados allocates these and hands them to `slot_evaluate`, which ignores
-  // them. They are reported truthfully anyway, so that an acados which one day
-  // touches them finds room rather than a short buffer.
-  *sz_iw = static_cast<int>(slot.integer_work.size());
-  *sz_w = static_cast<int>(slot.float_work.size());
+  // acados allocates these and hands them to `slot_evaluate`, which does not use
+  // them -- see the note there. They are reported truthfully all the same, so
+  // that an acados which one day touches them finds room and not a short buffer.
+  *sz_iw = slot.sz_iw;
+  *sz_w = slot.sz_w;
   return 0;
 }
 
@@ -193,8 +213,6 @@ AcadosCasadiFunction::~AcadosCasadiFunction()
     slot.function = casadi::Function{};
     slot.sparsity_in.clear();
     slot.sparsity_out.clear();
-    slot.integer_work.clear();
-    slot.float_work.clear();
     slot.taken = false;
     slot_ = -1;
   }
@@ -238,8 +256,8 @@ std::string AcadosCasadiFunction::bind(const casadi::Function & function, std::s
   slot.n_out = static_cast<int>(function.n_out());
   slot.sz_arg = static_cast<int>(function.sz_arg());
   slot.sz_res = static_cast<int>(function.sz_res());
-  slot.integer_work.assign(function.sz_iw() + 1U, 0);
-  slot.float_work.assign(function.sz_w() + 1U, 0.0);
+  slot.sz_iw = static_cast<int>(function.sz_iw());
+  slot.sz_w = static_cast<int>(function.sz_w());
   slot.sparsity_in.reserve(static_cast<std::size_t>(function.n_in()));
   for (casadi_int input = 0; input < function.n_in(); ++input) {
     slot.sparsity_in.push_back(compress_sparsity(function.sparsity_in(input)));

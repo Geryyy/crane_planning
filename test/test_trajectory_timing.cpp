@@ -200,7 +200,7 @@ TEST(PlanMotion, TheScaleIsRefusedBeforeTheSolveRatherThanAfterIt)
   request.q_a_start = crane_model::QA::Zero();
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = false;
-  request.margin_factor = 1.5;
+  request.speed_scale = 1.5;
 
   auto refused = crane_planning::plan_motion(model, context, request);
   ASSERT_FALSE(refused.ok());

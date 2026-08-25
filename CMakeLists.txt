@@ -282,10 +282,3 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
-
-if(BUILD_TESTING)
-  ament_add_gtest(test_sweep_tmp test/test_sweep_tmp.cpp TIMEOUT 600)
-  target_link_libraries(test_sweep_tmp planner_core)
-  target_compile_definitions(test_sweep_tmp PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../crane_model/test/description")
-endif()

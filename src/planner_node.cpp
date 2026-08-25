@@ -263,7 +263,7 @@ void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr mes
   }
   model_.emplace(std::move(model).value());
 
-  auto context = build_planner(*model_, message->data, settings_);
+  auto context = build_planner(*model_, config, settings_);
   if (!context.ok()) {
     RCLCPP_ERROR(
       get_logger(),
@@ -460,7 +460,7 @@ void PlannerNode::plan(
   }
   motion.phi_z_d = phi_z_of(orientation);
   motion.q_a_start = q_a_start;
-  motion.margin_factor = request.speed_scale;
+  motion.speed_scale = request.speed_scale;
   motion.avoid_collisions = request.avoid_collisions;
 
   // The payload as the equilibrium needs it. `wiki/robot_model.md` 5.3 is

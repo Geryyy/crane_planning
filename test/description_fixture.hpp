@@ -144,7 +144,10 @@ inline crane_planning::PlannerContext build_context(
   const crane_model::Model & model, const Machine & machine,
   const crane_planning::PlannerSettings & settings = crane_planning::PlannerSettings{})
 {
-  auto context = crane_planning::build_planner(model, description(machine), settings);
+  crane_model::ModelConfig config;
+  config.robot_description_xml = description(machine);
+  config.tool = machine.tool;
+  auto context = crane_planning::build_planner(model, config, settings);
   if (!context.ok()) {
     throw std::runtime_error(machine.name + std::string(": ") + context.status().message);
   }

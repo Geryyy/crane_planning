@@ -23,10 +23,10 @@ Status failure(ErrorCode code, std::string message)
 }  // namespace
 
 crane_model::Result<PlannerContext> build_planner(
-  const crane_model::Model & model, const std::string & robot_description_xml,
+  const crane_model::Model & model, const crane_model::ModelConfig & model_config,
   const PlannerSettings & settings)
 {
-  auto limits = read_joint_limits(robot_description_xml, model.urdf_joint_names());
+  auto limits = read_joint_limits(model_config.robot_description_xml, model.urdf_joint_names());
   if (!limits.ok()) {
     return Result<PlannerContext>::failure(limits.status());
   }
@@ -35,11 +35,22 @@ crane_model::Result<PlannerContext> build_planner(
   if (!geometry.ok()) {
     return Result<PlannerContext>::failure(geometry.status());
   }
+  // The force limit of trajectory_planning 3, derived here rather than per
+  // request: the chamber areas are the description's and do not move, and the
+  // relief setting is a deployment constant. A description whose cylinders have
+  // no usable area is refused here instead of at the first plan, so a machine
+  // that cannot have a force limit never answers a request as though it had one.
+  auto forces = derive_cylinder_force_limits(model, settings.system_pressure_pa);
+  if (!forces.ok()) {
+    return Result<PlannerContext>::failure(forces.status());
+  }
 
   PlannerContext context;
   context.limits = std::move(limits).value();
   context.geometry = std::move(geometry).value();
   context.settings = settings;
+  context.settings.timing.actuation.cylinder_force_max = forces.value();
+  context.model_config = model_config;
   return Result<PlannerContext>::success(std::move(context));
 }
 
@@ -61,7 +72,7 @@ crane_model::Result<MotionPlan> plan_motion(
         "that nothing was checked"));
   }
   {
-    Status status = check_margin_factor(request.margin_factor);
+    Status status = check_margin_factor(request.speed_scale);
     if (!status.ok()) {
       return Result<MotionPlan>::failure(std::move(status));
     }
@@ -176,12 +187,21 @@ crane_model::Result<MotionPlan> plan_motion(
     plan.path = plan.sampled.path;
   }
 
-  auto trajectory = scaled_ramp_along_path(
-    plan.path, context.limits, request.margin_factor, context.settings.ramp);
-  if (!trajectory.ok()) {
-    return Result<MotionPlan>::failure(trajectory.status());
+  // trajectory_planning 5.2, and not 038's ramp: the timing that carries the
+  // sway, holds the cylinder force and the pump flow inside what the hydraulics
+  // can deliver, and leaves 5.5's kappa of the machine's authority unspent for
+  // the MPC. A solve that does not converge is a refusal carrying acados' own
+  // status word -- never a clipped trajectory (mpc.md 5.3 requirement 1).
+  TimingOcpRequest timing;
+  timing.payload = request.payload;
+  timing.speed_scale = request.speed_scale;
+  auto solved = solve_timing_ocp(
+    model, context.model_config, plan.path, context.limits, timing, context.settings.timing);
+  if (!solved.ok()) {
+    return Result<MotionPlan>::failure(solved.status());
   }
-  plan.trajectory = std::move(trajectory).value();
+  plan.timing = std::move(solved).value();
+  plan.trajectory = plan.timing.trajectory;
 
   // The visualisation path, and it is only that: the row it fills in the
   // response is documented `for visualization only`. It is where the tool hangs

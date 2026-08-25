@@ -152,7 +152,20 @@ struct TimingOcpSettings
   double max_wall_clock{5.0};
 
   /// SQP iteration cap. Hitting it is a refusal, never a clipped trajectory.
-  int max_iterations{60};
+  int max_iterations{120};
+
+  /// When the SQP step is small enough to stop, in the two units it has.
+  /**
+   * Separate on purpose. The feasibility residuals are in the units of the
+   * constraints -- radians per second squared, newtons, cubic metres per second
+   * -- and `1e-6` there is far below anything the machine can be commanded at.
+   * The stationarity residual is in the units of the *objective's gradient*,
+   * which carries `1/sigma_dot` and its `sqrt`, so it is a couple of decades
+   * larger for the same quality of answer; asking it for `1e-6` spends the whole
+   * iteration budget polishing a trajectory that stopped changing long before.
+   */
+  double tolerance_stationarity{1.0e-4};
+  double tolerance_feasibility{1.0e-6};
 
   /// Levenberg-Marquardt term on the Gauss-Newton Hessian.
   /**
