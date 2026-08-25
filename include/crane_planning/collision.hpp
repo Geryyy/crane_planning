@@ -99,10 +99,12 @@
 //
 // # What is not here
 //
-// The sampling fallback when a primitive is blocked is issue 042 -- a blocked
-// primitive is a refusal. Coal's broadphase is `crane_model`'s and is issue
-// 034's *left undone*: `collision_queries` is O(links x primitives + pairs), and
-// the shortcut above is what keeps this affordable without one.
+// The sampling fallback a blocked primitive falls back to is
+// `sampling_planner.hpp`; what is here is the check both mechanisms are cleared
+// by, and `watched_frame_travel_m` below is the resolution rule shared with it.
+// Coal's broadphase is `crane_model`'s and is issue 034's *left undone*:
+// `collision_queries` is O(links x primitives + pairs), and the shortcut above is
+// what keeps this affordable without one.
 
 #ifndef CRANE_PLANNING__COLLISION_HPP_
 #define CRANE_PLANNING__COLLISION_HPP_
@@ -266,6 +268,33 @@ struct CollisionSettings
   TruckModel truck{};
 };
 
+/// What a scene decides about the step a check will run at, before any of it runs.
+struct SceneResolution
+{
+  double step_m{};                   ///< the resolution actually used
+  bool tightened{false};             ///< the scene asked for a finer step than configured
+  double thinnest_primitive_m{};     ///< smallest extent in the checked scene
+  std::size_t primitives{};
+  std::size_t structural_primitives{};
+};
+
+/// The step, and the scene validation that decides it. **The one place.**
+/**
+ * Split out of `check_path` because the sampling fallback has to subdivide its
+ * motions at the same step, and a second derivation of "the resolution" is a
+ * second answer waiting to drift. The rule is the file header's: the configured
+ * `resolution_m`, tightened to at most half the thinnest extent anything in the
+ * scene has, and a scene that would need a step finer than `min_resolution_m` is
+ * refused rather than checked at a step that does not resolve it.
+ *
+ * A primitive with no id, no pose or no positive extent, and the reserved
+ * `payload` id in a scene the planner did not place it in, are refusals here --
+ * which is where they were before, and is before any query has been run.
+ */
+[[nodiscard]] crane_model::Result<SceneResolution> resolve_scene(
+  const crane_model::CollisionScene & scene, const PayloadShape & payload,
+  const CollisionSettings & settings);
+
 /// Which obstacle blocked, and where the two bodies were closest.
 struct Blocker
 {
@@ -296,6 +325,24 @@ struct ConfigurationCheck
   const crane_model::Model & model, const crane_model::CollisionScene & scene,
   const PayloadShape & payload, const CollisionSettings & settings, const crane_model::Q & q,
   double step_m);
+
+/// How far the frames this file watches move between two configurations, m.
+/**
+ * The quantity `resolution_m` is measured in, exposed because the sampling
+ * fallback of `sampling_planner.hpp` has to subdivide its motions at the **same**
+ * stated resolution -- a fallback validated at its endpoints and a primitive
+ * sampled every `resolution_m` would not be cleared on the same terms, which is
+ * the whole point of reusing this check.
+ *
+ * It is a straight-line measure between two configurations and not a path
+ * integral: the caller is expected to subdivide until the answer is under the
+ * step, which is what makes it the same rule `check_path` applies along a fitted
+ * path. The passive pair is taken as each argument carries it, so a caller
+ * measuring how fast the geometry travels may leave it at zero exactly as
+ * `check_path`'s own travel probe does.
+ */
+[[nodiscard]] crane_model::Result<double> watched_frame_travel_m(
+  const crane_model::Model & model, const crane_model::Q & from, const crane_model::Q & to);
 
 /// One path, checked along its length.
 struct PathCheck

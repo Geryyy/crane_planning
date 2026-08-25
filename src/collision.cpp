@@ -46,6 +46,20 @@ constexpr std::array<Frame, kWatchedFrameCount> kWatchedFrames{
 /// The positions of `kWatchedFrames` at one configuration.
 using WatchedFrames = Eigen::Matrix<double, 3, kWatchedFrameCount>;
 
+/// Where the watched frames stand at one configuration.
+Result<WatchedFrames> watched_frames_at(const crane_model::Model & model, const Q & q)
+{
+  WatchedFrames frames;
+  for (std::size_t index = 0; index < kWatchedFrames.size(); ++index) {
+    auto pose = model.forward_kinematics(q, Frame::MountingBase, kWatchedFrames[index]);
+    if (!pose.ok()) {
+      return Result<WatchedFrames>::failure(pose.status());
+    }
+    frames.col(static_cast<Eigen::Index>(index)) = pose.value().position_m;
+  }
+  return Result<WatchedFrames>::success(frames);
+}
+
 /// How many places the path's own travel is measured at before it is sampled.
 constexpr std::size_t kTravelProbes = 33;
 
@@ -519,20 +533,72 @@ crane_model::Result<ConfigurationCheck> check_configuration(
   return Result<ConfigurationCheck>::success(std::move(check));
 }
 
-crane_model::Result<PathCheck> check_path(
-  const crane_model::Model & model, const GeometricPath & path, const CollisionScene & scene,
-  const crane_model::Payload & payload, const PayloadShape & shape,
-  const CollisionSettings & settings)
+crane_model::Result<SceneResolution> resolve_scene(
+  const CollisionScene & scene, const PayloadShape & payload, const CollisionSettings & settings)
 {
   if (!(settings.resolution_m > 0.0) || !std::isfinite(settings.resolution_m) ||
     !(settings.min_resolution_m > 0.0) || settings.min_resolution_m > settings.resolution_m)
   {
-    return Result<PathCheck>::failure(
+    return Result<SceneResolution>::failure(
       failure(
         ErrorCode::InvalidArgument,
         "the check resolution and its floor have to be positive with the floor no coarser than "
         "the resolution"));
   }
+
+  SceneResolution resolution;
+  resolution.primitives = scene.primitives.size();
+  resolution.thinnest_primitive_m = std::numeric_limits<double>::infinity();
+  for (const CollisionPrimitive & primitive : scene.primitives) {
+    Status status = check_primitive_is_usable(primitive, "scene");
+    if (!status.ok()) {
+      return Result<SceneResolution>::failure(std::move(status));
+    }
+    if (primitive.id == kPayloadId) {
+      return Result<SceneResolution>::failure(
+        failure(
+          ErrorCode::InvalidScene,
+          "the scene carries a primitive with the reserved id 'payload', which crane_model reads "
+          "as geometry the tool is carrying and does not check against the links that carry it"));
+    }
+    resolution.structural_primitives += primitive.structural ? 1U : 0U;
+    resolution.thinnest_primitive_m =
+      std::min(resolution.thinnest_primitive_m, primitive.dimensions_m.minCoeff());
+  }
+  if (payload.declared) {
+    resolution.thinnest_primitive_m =
+      std::min(resolution.thinnest_primitive_m, payload.dimensions_m.minCoeff());
+  }
+
+  // The resolution, and the one relation it has to obey: a step coarser than the
+  // thinnest thing being checked can carry the tool across that thing without
+  // ever landing inside it.
+  resolution.step_m = settings.resolution_m;
+  if (std::isfinite(resolution.thinnest_primitive_m)) {
+    const double asked = kThinnestFraction * resolution.thinnest_primitive_m;
+    if (asked < resolution.step_m) {
+      resolution.step_m = asked;
+      resolution.tightened = true;
+    }
+  }
+  if (resolution.step_m < settings.min_resolution_m) {
+    return Result<SceneResolution>::failure(
+      failure(
+        ErrorCode::InvalidScene,
+        "the thinnest primitive in the scene is " + metres(resolution.thinnest_primitive_m) +
+        ", which asks for a step of " + metres(resolution.step_m) + " against a floor of " +
+        metres(settings.min_resolution_m) +
+        ". Checking at the floor would leave that primitive unresolved, and a path checked at a "
+        "step it does not resolve is not checked"));
+  }
+  return Result<SceneResolution>::success(resolution);
+}
+
+crane_model::Result<PathCheck> check_path(
+  const crane_model::Model & model, const GeometricPath & path, const CollisionScene & scene,
+  const crane_model::Payload & payload, const PayloadShape & shape,
+  const CollisionSettings & settings)
+{
   if (settings.max_samples < 2U) {
     return Result<PathCheck>::failure(
       failure(
@@ -540,51 +606,17 @@ crane_model::Result<PathCheck> check_path(
         "a path checked at fewer than its two endpoints is not checked"));
   }
 
-  PathCheck check;
-  check.scene_primitives = scene.primitives.size();
-  check.thinnest_primitive_m = std::numeric_limits<double>::infinity();
-  for (const CollisionPrimitive & primitive : scene.primitives) {
-    Status status = check_primitive_is_usable(primitive, "scene");
-    if (!status.ok()) {
-      return Result<PathCheck>::failure(std::move(status));
-    }
-    if (primitive.id == kPayloadId) {
-      return Result<PathCheck>::failure(
-        failure(
-          ErrorCode::InvalidScene,
-          "the scene carries a primitive with the reserved id 'payload', which crane_model reads "
-          "as geometry the tool is carrying and does not check against the links that carry it"));
-    }
-    check.structural_primitives += primitive.structural ? 1U : 0U;
-    check.thinnest_primitive_m =
-      std::min(check.thinnest_primitive_m, primitive.dimensions_m.minCoeff());
-  }
-  if (shape.declared) {
-    check.thinnest_primitive_m =
-      std::min(check.thinnest_primitive_m, shape.dimensions_m.minCoeff());
+  auto resolution = resolve_scene(scene, shape, settings);
+  if (!resolution.ok()) {
+    return Result<PathCheck>::failure(resolution.status());
   }
 
-  // The resolution, and the one relation it has to obey: a step coarser than the
-  // thinnest thing being checked can carry the tool across that thing without
-  // ever landing inside it.
-  check.step_m = settings.resolution_m;
-  if (std::isfinite(check.thinnest_primitive_m)) {
-    const double asked = kThinnestFraction * check.thinnest_primitive_m;
-    if (asked < check.step_m) {
-      check.step_m = asked;
-      check.resolution_tightened = true;
-    }
-  }
-  if (check.step_m < settings.min_resolution_m) {
-    return Result<PathCheck>::failure(
-      failure(
-        ErrorCode::InvalidScene,
-        "the thinnest primitive in the scene is " + metres(check.thinnest_primitive_m) +
-        ", which asks for a step of " + metres(check.step_m) + " against a floor of " +
-        metres(settings.min_resolution_m) +
-        ". Checking at the floor would leave that primitive unresolved, and a path checked at a "
-        "step it does not resolve is not checked"));
-  }
+  PathCheck check;
+  check.scene_primitives = resolution.value().primitives;
+  check.structural_primitives = resolution.value().structural_primitives;
+  check.thinnest_primitive_m = resolution.value().thinnest_primitive_m;
+  check.step_m = resolution.value().step_m;
+  check.resolution_tightened = resolution.value().tightened;
 
   // How far the crane actually moves along this path, measured rather than
   // assumed. The pair is held at zero for this pass only: it is a measurement of
@@ -594,18 +626,14 @@ crane_model::Result<PathCheck> check_path(
   for (std::size_t probe = 0; probe < kTravelProbes; ++probe) {
     const double sigma = static_cast<double>(probe) / static_cast<double>(kTravelProbes - 1U);
     const Q q = configuration_of(path.at(sigma));
-    WatchedFrames current;
-    for (std::size_t index = 0; index < kWatchedFrames.size(); ++index) {
-      auto pose = model.forward_kinematics(q, Frame::MountingBase, kWatchedFrames[index]);
-      if (!pose.ok()) {
-        return Result<PathCheck>::failure(pose.status());
-      }
-      current.col(static_cast<Eigen::Index>(index)) = pose.value().position_m;
+    auto current = watched_frames_at(model, q);
+    if (!current.ok()) {
+      return Result<PathCheck>::failure(current.status());
     }
     if (probe > 0) {
-      check.travel_m += (current - previous).colwise().norm().maxCoeff();
+      check.travel_m += (current.value() - previous).colwise().norm().maxCoeff();
     }
-    previous = current;
+    previous = current.value();
   }
 
   const double intervals = std::ceil(check.travel_m / check.step_m);
@@ -711,6 +739,26 @@ std::string describe(const PathCheck & check)
     metres(check.blocked_at.pendulum_length_m) + " long" :
     ", with the tool hanging still";
   return text;
+}
+
+crane_model::Result<double> watched_frame_travel_m(
+  const crane_model::Model & model, const Q & from, const Q & to)
+{
+  if (!from.allFinite() || !to.allFinite()) {
+    return Result<double>::failure(
+      failure(ErrorCode::NonFiniteInput, "a configuration the travel is measured between is "
+      "not finite"));
+  }
+  auto first = watched_frames_at(model, from);
+  if (!first.ok()) {
+    return Result<double>::failure(first.status());
+  }
+  auto second = watched_frames_at(model, to);
+  if (!second.ok()) {
+    return Result<double>::failure(second.status());
+  }
+  return Result<double>::success(
+    (second.value() - first.value()).colwise().norm().maxCoeff());
 }
 
 crane_model::Result<double> clearance_at(

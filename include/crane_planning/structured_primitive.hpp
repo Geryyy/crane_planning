@@ -33,13 +33,14 @@
 //
 // # What is out of scope here, and where it is
 //
-// The sampling fallback and its smoothing is issue 042, and a blocked primitive
-// is a **refusal** here rather than a fallback; the time parametrization, the
-// sway-carrying OCP, the force and flow constraints and kappa are issue 043, so
-// this file produces geometry and no timing; `/crane/plan_grip`'s own
-// descend/close/open/lift phases are issue 044 and are a different set on a
-// different time base -- the descend phase here is the arm's, not the
-// gripper's.
+// A blocked primitive is a **refusal** here and never a fallback: 4.4's second
+// mechanism lives in `sampling_planner.hpp` and the order between the two is
+// `planner_core.hpp`'s to enforce, so nothing in this file knows that a fallback
+// exists. The time parametrization, the sway-carrying OCP, the force and flow
+// constraints and kappa are issue 043, so this file produces geometry and no
+// timing; `/crane/plan_grip`'s own descend/close/open/lift phases are issue 044
+// and are a different set on a different time base -- the descend phase here is
+// the arm's, not the gripper's.
 
 #ifndef CRANE_PLANNING__STRUCTURED_PRIMITIVE_HPP_
 #define CRANE_PLANNING__STRUCTURED_PRIMITIVE_HPP_
@@ -289,8 +290,9 @@ struct StructuredPrimitive
  * transfer altitude that ends up below both endpoints, a waypoint the arm cannot
  * reach, a segment that will not interpolate monotonically: each of these
  * returns a failure whose message names which of lift, traverse and descend
- * could not be built. There is no fallback here -- the sampling planner of 4.4
- * is issue 042, and until it exists a blocked primitive is a refusal.
+ * could not be built. There is no fallback *here*: 4.4's second mechanism is
+ * `sampling_planner.hpp` and whether a refusal becomes one is `plan_motion`'s
+ * decision, which is what keeps 4.4's order in one place.
  *
  * The two interior waypoints are solved with the **semi-analytic** route of
  * `wiki/robot_model.md` 2.2 rather than with the equilibrium-constrained NLP.

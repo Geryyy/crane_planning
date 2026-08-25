@@ -153,6 +153,19 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.primitive.fit.acceleration_span = parameters.path_acceleration_span;
   settings_.primitive.fit.jerk_span = parameters.path_jerk_span;
 
+  // The fallback of trajectory_planning 4.4, which runs only when the primitive
+  // above has been generated, checked and refused. The seed is a parameter and a
+  // constant: a stochastic planner answering two identical requests with two
+  // different paths is not something an operator or a test can reason about.
+  settings_.sampling.seed = static_cast<std::uint32_t>(parameters.sampling_seed);
+  settings_.sampling.time_budget_s = parameters.sampling_time_budget;
+  settings_.sampling.max_validity_checks =
+    static_cast<std::size_t>(parameters.sampling_max_validity_checks);
+  settings_.sampling.extension_span = parameters.sampling_extension_span;
+  settings_.sampling.shortcut_attempts =
+    static_cast<std::size_t>(parameters.shortcut_attempts);
+  settings_.sampling.unbounded_margin_rad = parameters.sampling_unbounded_margin;
+
   // The sway envelope of trajectory_planning 4.3, at the bound mpc 3 constraint
   // 3 imposes. `fixed_size<>` on the parameter is what keeps this pair a pair.
   settings_.primitive.collision.sway.q_sway_max =
@@ -215,10 +228,12 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "own reach rather than hard-coded, and the timing is one velocity-limited ramp run along it. "
     "The path is checked against %s -- the scene, the truck bed and the runges of "
     "trajectory_planning 4.2 keyed to the measured truck pose, and the crane against itself -- "
-    "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. There is no sampling "
-    "fallback when the primitive is blocked (issue 042) and no path-constrained OCP, so no force, "
-    "flow or kappa margin (issue 043). Each of those is refused or named rather than "
-    "approximated.",
+    "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. A primitive that is "
+    "blocked falls back to the RRT-Connect sampling planner of 4.4 over the five path coordinates "
+    "of 4.1, shortcut, refitted C2 and re-checked as 4.5 makes mandatory, from a fixed seed and "
+    "inside a per-call budget -- and which of the two answered is in every reply. There is no "
+    "path-constrained OCP, so no force, flow or kappa margin (issue 043); that absence is refused "
+    "or named rather than approximated.",
     kPlanMotionService, kReferenceTopic, kCollisionSceneTopic);
 }
 
@@ -577,10 +592,15 @@ void PlannerNode::plan(
     std::to_string(motion_plan.endpoint.residual_equilibrium) +
     " rad off Model::passive_equilibrium, so the tool arrives at rest. The peak velocity is " +
     std::to_string(motion_plan.trajectory.limiting_fraction) +
-    " of the scaled limit. The geometry is the lift/traverse/descend primitive of "
-    "trajectory_planning 4.4, built C2 in sigma over " +
-    std::to_string(motion_plan.primitive.path.segment_count()) + " phases: " +
-    describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note +
+    " of the scaled limit. The geometry came from " + mechanism_name(motion_plan.mechanism) +
+    ", over " + std::to_string(motion_plan.path.segment_count()) + " segments in sigma. ";
+  // Which mechanism answered, in as many words, because a caller cannot
+  // otherwise tell a deterministic plan from a sampled one -- and 4.4's whole
+  // ordering argument is that the two are not the same product.
+  response.message += (motion_plan.mechanism == PathMechanism::SamplingFallback) ?
+    describe(motion_plan.sampled) :
+    describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note;
+  response.message +=
     ". The timing is the ramp of this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";
   if (!scene_note_.empty()) {
     response.message += ". As for the scene: " + scene_note_;

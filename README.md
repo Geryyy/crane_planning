@@ -4,11 +4,18 @@ The `crane_planner` node of `wiki/implementation/ros2_interfaces.md` §2: it
 serves `/crane/plan_motion` and publishes the trajectory it answered with on
 `/crane/reference`.
 
-This is the **slice-5 tracer bullet** of `docs/features/cbs-arch/prd.md` §2 — one
-goal pose in, one timed joint trajectory out, through a real node and a real
-service. Almost everything `wiki/trajectory_planning.md` specifies is still
-absent, and the point of this package as it stands is that every absence is
-*refused or named*, never approximated.
+It grew out of the **slice-5 tracer bullet** of `docs/features/cbs-arch/prd.md`
+§2 — one goal pose in, one timed joint trajectory out, through a real node and a
+real service. Stage 1 of `wiki/trajectory_planning.md` is now there in full; stage
+2 is not, and the point of this package is that every absence is *refused or
+named*, never approximated.
+
+> **Build note.** This package needs **OMPL** (`libraries.md` §1) for §4.4's
+> sampling fallback, and the devcontainer image does not carry it yet: add
+> `ros-humble-ompl` — what `rosdep resolve ompl` returns for this package's
+> `<depend>ompl</depend>` — to `.devcontainer/Dockerfile.vscode`'s apt block.
+> `find_package(ompl REQUIRED)` is deliberate: a planner that quietly compiled
+> without its fallback is worse than one that does not build.
 
 ## What it does
 
@@ -24,6 +31,8 @@ absent, and the point of this package as it stands is that every absence is
 | transfer altitude | derived from the endpoints and the mounted tool's own reach, never configured |
 | collision check | the middle step of §4.4's generate–check–accept, against the scene, the truck and the crane itself |
 | sway | §4.3's envelope, at the `q_sway_max` of `mpc` §3 constraint 3, resolved rather than inflated |
+| fallback | §4.4's second mechanism, RRT-Connect over `q_a`, reached **only** when the primitive is blocked |
+| smoothing | §4.5's mandatory shortcut → C² fit → re-check, on every sampled path and on no primitive |
 | timing | one scaled ramp obeying the velocity limits, run along that path |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
@@ -67,10 +76,9 @@ Most crane moves are *lift, traverse, descend*, and `trajectory_planning` §4.4
 makes that the first mechanism tried: it is cheap, deterministic, and smooth by
 construction, where a sampling planner is stochastic with an unbounded runtime.
 §4.4's order is **generate, check, accept** and all three happen inside one call,
-`build_structured_primitive`. The check passes unconditionally today and says so;
-issue 041 replaces its body rather than the structure around it. A blocked
-primitive is a **refusal** naming which of the three phases failed — the sampling
-fallback that would take over is issue 042.
+`build_structured_primitive`. A blocked primitive is a refusal naming which of the
+three phases failed, and `plan_motion` is where that refusal turns into §4.4's
+second mechanism — see *The fallback* below.
 
 The path is built **C² by construction and never smoothed into C² afterwards**.
 Each phase is a boundary-value problem solved with `ruckig`
@@ -123,6 +131,83 @@ the residual in the message. The joint position and velocity limits come out of
 the same `robot_description` XML, because the frozen model API does not expose
 them and a limit restated beside a node is a limit that drifts away from the
 description the controllers were configured against.
+
+## The fallback, and why it is second
+
+`trajectory_planning` §4.4 names two mechanisms and fixes their order: generate
+the primitive, check it, accept it if clear, **otherwise** sample. `plan_motion`
+is where that order lives, and §4.4's `[!important]` is why it is an order and not
+a preference — a sampling planner is stochastic and its runtime is not bounded, so
+primitive-first is what buys deterministic latency in the common case and leaves
+completeness to the rare one. Nothing runs the fallback beside the primitive, to
+compare with it or to "check" it; a fallback that runs anyway spends exactly what
+the ordering was for, and there is a test that asserts a clear scene comes back
+with the primitive's own path and **zero** configurations sampled.
+
+Which of the two answered is on `MotionPlan::mechanism` and in the service
+`message`, because a caller cannot otherwise tell a lucky deterministic plan from
+a sampled one, and they are not the same product.
+
+**RRT-Connect, and the reason, which closes §9's open item.** `libraries.md` §1
+lists OMPL for sampling-based path planning against "RRT/PRM and their smoothing",
+so the library was never a decision; which planner out of it is. It is
+feasibility-only and bidirectional: it stops at the first solution rather than
+improving one, so a solve ends when it has an answer instead of spending its whole
+budget — which is what a per-call wall-clock cap needs — and growing from both ends
+matters here because the goal is a *placement*, down among the runges, in exactly
+the narrow passage a single tree explores last. Not RRT\*, BIT\* or any
+asymptotically optimal planner: they are anytime, they use the whole budget by
+construction, and their answer is a function of how long they were given. Not PRM:
+a roadmap pays for itself over many queries against a static scene, and
+`/crane/collision_scene` is republished as the site changes. Not MoveIt's pipeline,
+which is `libraries.md` §5's *deliberately absent* row against "Pinocchio + Coal +
+OMPL directly" — its SRDF format is not rejected and `crane_model` reads one.
+
+**Five coordinates, never the passive pair.** §4.1's `[!warning]` is that a
+sampling planner handed a joint group with `q5`/`q6` in it interpolates them as
+free variables and returns paths that satisfy every joint limit while being
+dynamically impossible, and that the legacy MoveIt SRDF declares exactly such a
+group. So the state space is five dimensional, built from `JointLimits` — the
+description's own range — and the passive pair is *solved* at every checked
+configuration through `Model::passive_equilibrium` rather than sampled. The tool
+coordinate `q8` is not in it either, for §4.1's other reason. The metric is not a
+norm over a vector that mixes radians with metres: each axis is a subspace weighted
+by `1/dq_max`, so a distance is a sum of times at each axis's own limit — the unit
+`geometric_path.hpp` already distributes σ by. The rotator is a `continuous` joint
+in both descriptions and therefore has no range to take; it is searched over what
+the two endpoints ask for widened by half a turn either way, which is every
+distinct pose it has because `q7` and `q7 + 2π` are the same geometry.
+
+**The check is issue 041's.** `isValid` is `check_configuration`: the scene, the
+truck keyed to its measured pose, the crane against itself, and §4.3's sway
+envelope. Motion validation subdivides at the **same** stated resolution
+`check_path` samples at, measured with the same `watched_frame_travel_m` — OMPL's
+own validator would have subdivided in state-space distance, which says nothing
+about how far the geometry moved, and half a radian of slewing moves the tool much
+further with the boom out than with it in.
+
+**Smoothing is mandatory and so is re-checking it.** §4.5, all three steps and in
+order: shortcut, then the same `fit_c2_path` the primitive is built with, then
+`check_path` over the whole curve — and a path that fails the last one is refused.
+The third step is not a formality. The first two both move the path off the
+polyline the search cleared: the shortcut replaces a detour by its chord, and the
+fit is monotone inside each waypoint box but is not the chord between two
+waypoints. So what was cleared is not what would be flown, and only the re-check
+answers for what would be. The primitive needs none of this and §4.5's last
+sentence says so.
+
+**Bounded, and deterministic.** Two per-call caps — `sampling_time_budget` and
+`sampling_max_validity_checks`, the second being the half that does not depend on
+how fast the machine running the planner is. Exhausting either is a refusal naming
+it, and an *approximate* path that stops short of the goal is refused with the
+rest: it is not a worse answer than none, it is an answer that reads as success.
+The replanning loop's own latency bound is issue 045's and is not this cap. The
+search draws from this package's own `std::mt19937` seeded by `sampling_seed` and
+not from OMPL's global generator, which can be seeded once per process and would
+leave whichever test ran second irreproducible; the nearest-neighbour structure is
+linear for the same reason — OMPL's default GNAT picks pivots from that same global
+generator, and the tree is small enough that an exact linear search is free beside
+one 39 ms validity check.
 
 ## Collision, the truck, and the sway envelope
 
@@ -222,8 +307,14 @@ pair blocked and where.
   primitives, not the frame tree — so an altitude that looks generous and a path
   that is refused are consistent, not contradictory. A deployment that knows its
   site needs more says so with `transfer_altitude_floor`.
-- The sampling fallback and its mandatory smoothing is **issue 042**,
-  `/crane/plan_grip` **issue 044**, replanning from a moving and swinging start
+- **A smoothed path the re-check refuses is a refusal, not a retry.** The
+  fallback does not back the smoothing off segment by segment and try again: it
+  says the smoothed curve is blocked where the sampled one was clear and stops.
+  That is the honest answer for a per-call planner and it is also the one place
+  the fallback can fail after having found a way round. A graduated retry belongs
+  with the replanning loop of **issue 045**, which is the issue that owns what to
+  do with a plan that could not be produced in time.
+- `/crane/plan_grip` is **issue 044**, replanning from a moving and swinging start
   **issue 045**, and the `a2b_movement` adapter **issue 046**.
 
 ## It is not a second command producer
@@ -261,6 +352,7 @@ reading these sources.
     include/crane_planning/geometric_path.hpp      q_a(σ) and its two derivatives, C² by ruckig
     include/crane_planning/structured_primitive.hpp  §4.4 lift/traverse/descend, and the altitude
     include/crane_planning/collision.hpp           §4.2's scene and truck, §4.3's sway envelope
+    include/crane_planning/sampling_planner.hpp    §4.4's fallback and §4.5's mandatory smoothing
     include/crane_planning/trajectory_timing.hpp   the ramp, and the seam it meets the path at
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free
     include/crane_planning/planner_node.hpp        the adapter

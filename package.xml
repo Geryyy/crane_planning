@@ -14,6 +14,14 @@
   <depend>crane_msgs</depend>
   <depend>generate_parameter_library</depend>
   <depend>geometry_msgs</depend>
+  <!-- Sampling-based path planning, per Libraries §1, for the fallback of
+       trajectory_planning §4.4 when the structured primitive is blocked.  RRT
+       and its shortcutting are what §1 names it against hand-rolling; the
+       planner chosen out of it is RRT-Connect and the reason is recorded in
+       include/crane_planning/sampling_planner.hpp.  Libraries §5 rejects
+       MoveIt's planning pipeline and not OMPL, which it names in the same row as
+       the direct replacement. -->
+  <depend>ompl</depend>
   <depend>rclcpp</depend>
   <!-- The jerk-limited interpolation and boundary-condition solve of
        Libraries §1.  The structured primitive of trajectory_planning §4.4 is

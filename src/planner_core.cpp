@@ -127,16 +127,57 @@ crane_model::Result<MotionPlan> plan_motion(
   primitive.collision_scene = request.scene;
   primitive.scene = scene_without_obstacles();
 
+  // trajectory_planning 4.4's order, and the whole of it: generate the
+  // primitive, check it, accept it if clear -- and only then, and only because it
+  // was not, sample. Nothing below runs the fallback beside the primitive or to
+  // compare with it; 4.4's [!important] says the deterministic common case is
+  // what primitive-first buys, and a fallback that runs anyway spends it.
   auto built = build_structured_primitive(
     model, context.geometry, context.limits, context.settings.ik, context.settings.primitive,
     primitive);
-  if (!built.ok()) {
-    return Result<MotionPlan>::failure(built.status());
+  if (built.ok()) {
+    plan.mechanism = PathMechanism::StructuredPrimitive;
+    plan.primitive = std::move(built).value();
+    plan.path = plan.primitive.path;
+  } else {
+    plan.primitive_refusal = built.status().message;
+
+    // There is a fallback only when there is something to sample around. A
+    // collision-blind request never gets here -- an unchecked primitive is never
+    // blocked -- and a checked request without a scene was refused at the top of
+    // this function, so what is left is a primitive that could not be *built*
+    // for a request nobody asked to be checked. Sampling that would be sampling
+    // against nothing.
+    if (!request.avoid_collisions || request.scene == nullptr) {
+      return Result<MotionPlan>::failure(built.status());
+    }
+
+    SamplingRequest sampling;
+    sampling.q_start = primitive.q_start;
+    sampling.q_goal = primitive.q_goal;
+    sampling.payload = request.payload;
+    sampling.payload_shape = request.payload_shape;
+    sampling.collision_scene = request.scene;
+
+    auto sampled = plan_sampled_path(
+      model, context.limits, context.settings.primitive.fit,
+      context.settings.primitive.collision, context.settings.sampling, sampling);
+    if (!sampled.ok()) {
+      // Both refusals, in the order they happened. A caller told only that the
+      // search timed out cannot tell whether the primitive was blocked by a
+      // runge or was never reachable at all.
+      return Result<MotionPlan>::failure(
+        failure(
+          sampled.status().code,
+          plan.primitive_refusal + ". So the fallback ran, and " + sampled.status().message));
+    }
+    plan.mechanism = PathMechanism::SamplingFallback;
+    plan.sampled = std::move(sampled).value();
+    plan.path = plan.sampled.path;
   }
-  plan.primitive = std::move(built).value();
 
   auto trajectory = scaled_ramp_along_path(
-    plan.primitive.path, context.limits, request.margin_factor, context.settings.ramp);
+    plan.path, context.limits, request.margin_factor, context.settings.ramp);
   if (!trajectory.ok()) {
     return Result<MotionPlan>::failure(trajectory.status());
   }

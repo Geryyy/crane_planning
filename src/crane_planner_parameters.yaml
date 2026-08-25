@@ -232,6 +232,97 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
+  sampling_seed:
+    type: int
+    default_value: 20420042
+    read_only: true
+    description: "The seed the sampling fallback of wiki/trajectory_planning.md
+      4.4 draws every sample and every shortcut pair from. **A constant, and
+      never a clock.** A stochastic planner in an automated suite is the
+      flaky-test failure the PRD's testing decisions rule out, so this makes two
+      identical requests against one scene give one answer and makes a test get
+      the answer the deployment would. The generator is this package's own
+      std::mt19937 and not OMPL's global one, which can be seeded once per
+      process and would leave whichever test ran second irreproducible. Change it
+      to explore a scene this seed happens to do badly on; do not derive it from
+      the time."
+    validation:
+      gt_eq<>: [0]
+
+  sampling_time_budget:
+    type: double
+    default_value: 5.0
+    read_only: true
+    description: "Wall-clock cap on one RRT-Connect search, s. Exhausting it is a
+      refusal naming the cap and never an approximate path: a path that stops
+      short of the goal is not a worse answer than none, it is an answer that
+      reads as success, and stage 2 would time the machine straight into whatever
+      the search had not got round yet. This is a **per-call** cap on the
+      fallback and is not the replanning loop's latency bound, which is issue
+      045's."
+    validation:
+      gt<>: [0.0]
+
+  sampling_max_validity_checks:
+    type: int
+    default_value: 4000
+    read_only: true
+    description: "Cap on the configurations one search may check, whatever the
+      clock says. The half of the bound that does not depend on how fast the
+      machine running the planner is, and therefore the half a test can rely on.
+      Each check is a Model::passive_equilibrium -- some 45 ms, because the pose
+      the tool hangs in is a function of the configuration -- plus the collision
+      queries of its sway envelope, so this is also the honest unit of what a
+      search costs. The smoothing pass of 4.5 is given the same allowance again
+      rather than the search's leftovers, so how hard a search was does not
+      decide how much smoothing its answer may have."
+    validation:
+      gt_eq<>: [2]
+
+  sampling_extension_span:
+    type: double
+    default_value: 2.0
+    read_only: true
+    description: "Longest motion the search's trees may extend by, in the state
+      space's own metric -- the sum over the five path coordinates of |dq| /
+      dq_max, i.e. seconds at each axis's own limit. That is the unit
+      geometric_path.hpp already distributes sigma by, and the only unit in which
+      radians of slewing and metres of telescope are comparable at all. Zero asks
+      OMPL for its own default, a fraction of the space's extent, which knows
+      nothing about this machine."
+    validation:
+      gt_eq<>: [0.0]
+
+  shortcut_attempts:
+    type: int
+    default_value: 120
+    read_only: true
+    description: "How many replacements the shortcut pass of
+      wiki/trajectory_planning.md 4.5 tries on a sampled polyline. Every one is
+      put through the same motion validation the search used, so a larger number
+      buys a shorter path and never a less checked one -- and the collision
+      answer for what it produces is still the re-check that runs after the C2
+      fit, because the fit is not the polyline. Zero skips the pass, which leaves
+      the fit a raw RRT path with every one of its waypoints in it."
+    validation:
+      gt_eq<>: [0]
+
+  sampling_unbounded_margin:
+    type: double
+    default_value: 3.141592653589793
+    read_only: true
+    description: "How far past the interval its two endpoints span an
+      **unbounded** path coordinate may be searched, rad. The rotator is a
+      `continuous` joint in both descriptions -- it turns without end
+      (wiki/nomenclature.md 4) -- so the description gives it no range and a
+      sampler still needs one. Half a turn either side is every distinct pose it
+      has, because q7 and q7 + 2 pi are the same geometry: wider samples poses
+      the search has already been offered, narrower hides some. The four bounded
+      coordinates take the description's own range and nothing here touches
+      them."
+    validation:
+      gt<>: [0.0]
+
   Ts:
     type: double
     default_value: 0.04

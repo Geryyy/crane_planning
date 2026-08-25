@@ -31,8 +31,8 @@ Status refuse(PrimitivePhase phase, const std::string & why)
     ErrorCode::InvalidArgument,
     std::string("the ") + phase_name(phase) +
     " phase of the structured primitive (trajectory_planning 4.4) could not be built: " + why +
-    ". The primitive is refused rather than deformed, and the sampling fallback that would take "
-    "over is issue 042");
+    ". The primitive is refused rather than deformed; whether this refusal becomes 4.4's sampling "
+    "fallback is plan_motion's decision and not this file's");
 }
 
 /// The path-space part of a canonical eight-vector.
@@ -464,8 +464,8 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
         fitted.status().code,
         "the structured primitive of trajectory_planning 4.4 could not be built: " +
         fitted.status().message +
-        ". The primitive is refused rather than deformed, and the sampling fallback that would "
-        "take over is issue 042"));
+        ". The primitive is refused rather than deformed; whether this refusal becomes 4.4's "
+        "sampling fallback is plan_motion's decision and not this file's"));
   }
   primitive.path = std::move(fitted).value();
 

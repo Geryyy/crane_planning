@@ -8,6 +8,12 @@
 // purpose is smooth, sway-free motion. So the assertions here are on the
 // derivatives at the junctions and not on how the path looks.
 //
+// Those assertions live in `c2_path_assertions.hpp` rather than in this file,
+// because 4.4 has **two** producers and 4.5 holds both to the same requirement:
+// the primitive is built C2 and the sampled path of `test_sampling_planner.cpp`
+// is smoothed into it, and a second copy of the assertions here would be a
+// second, weaker definition of what C2 means.
+//
 // Offline C++ throughout. Nothing here launches, links a simulator or reaches a
 // ROS graph; the two machine descriptions are read where `crane_model` keeps
 // them.
@@ -21,6 +27,7 @@
 #include <string>
 #include <vector>
 
+#include "c2_path_assertions.hpp"
 #include "crane_planning/equilibrium_ik.hpp"
 #include "crane_planning/geometric_path.hpp"
 #include "crane_planning/joint_limits.hpp"
@@ -90,16 +97,11 @@ StructuredPrimitive primitive_for(
   return std::move(built).value();
 }
 
-/// The largest |q_a''| the path reaches, which is what the C2 tolerances are stated against.
-double curvature_scale(const GeometricPath & path)
-{
-  double scale = 1.0;
-  for (std::size_t index = 0; index <= 200U; ++index) {
-    const double sigma = static_cast<double>(index) / 200.0;
-    scale = std::max(scale, path.at(sigma).ddq_a.norm());
-  }
-  return scale;
-}
+// The C2 assertions themselves are shared with the sampling fallback's suite --
+// 4.5 holds both producers to one requirement. See `c2_path_assertions.hpp`.
+using crane_planning_test::curvature_scale;
+using crane_planning_test::expect_at_rest_and_monotone;
+using crane_planning_test::expect_c2_everywhere;
 
 }  // namespace
 
@@ -207,72 +209,10 @@ TEST(C2Path, EveryJunctionIsContinuousInBothDerivativesAndTheSecondIsDefinedEver
     ASSERT_EQ(path.segment_count(), 3U) << machine.name;
     ASSERT_EQ(path.junction_sigmas().size(), 2U) << machine.name;
 
-    // The stated tolerance, and it is stated as two things rather than one
-    // number, because one number cannot tell a continuous derivative from a
-    // discontinuous one. A gap measured across a junction with a finite
-    // difference of step h is the finite difference's own truncation error plus
-    // whatever the jump really is: on a C2 junction it is the first alone and
-    // shrinks with h, on a kink the second dominates and does not. So both are
-    // asserted -- the gap at the fine step is under a thousandth of the largest
-    // curvature the path itself reaches, and shrinking the step by a hundred
-    // shrinks the gap by at least fifty.
-    const double scale = curvature_scale(path);
-    const double coarse = 1.0e-5;
-    const double step = coarse / 100.0;
-
-    for (const double sigma : path.junction_sigmas()) {
-      const PathSample before = path.at(sigma - step);
-      const PathSample after = path.at(sigma + step);
-      const PathSample well_before = path.at(sigma - coarse);
-      const PathSample well_after = path.at(sigma + coarse);
-
-      const double position_gap = (after.q_a - before.q_a).norm();
-      const double rate_gap = (after.dq_a - before.dq_a).norm();
-      const double curvature_gap = (after.ddq_a - before.ddq_a).norm();
-      EXPECT_LT(position_gap, 1.0e-3 * scale) << machine.name << " at junction " << sigma;
-      EXPECT_LT(rate_gap, 1.0e-3 * scale)
-        << machine.name << " q_a' across junction " << sigma;
-      EXPECT_LT(curvature_gap, 1.0e-3 * scale)
-        << machine.name << " q_a'' across junction " << sigma;
-
-      const double coarse_rate_gap = (well_after.dq_a - well_before.dq_a).norm();
-      const double coarse_curvature_gap = (well_after.ddq_a - well_before.ddq_a).norm();
-      EXPECT_LT(50.0 * rate_gap, coarse_rate_gap + 1.0e-12)
-        << machine.name << " q_a' is not closing across junction " << sigma;
-      EXPECT_LT(50.0 * curvature_gap, coarse_curvature_gap + 1.0e-12)
-        << machine.name << " q_a'' is not closing across junction " << sigma;
-    }
-
-    // Defined everywhere, which is the property 4.5 says a kinked path lacks:
-    // there is no sigma at which the second derivative fails to exist, and no
-    // sigma at which it jumps.
-    double worst_jump = 0.0;
-    for (std::size_t index = 0; index <= 2000U; ++index) {
-      const double sigma = static_cast<double>(index) / 2000.0;
-      const PathSample sample = path.at(sigma);
-      ASSERT_TRUE(sample.q_a.allFinite()) << machine.name << " at sigma " << sigma;
-      ASSERT_TRUE(sample.dq_a.allFinite()) << machine.name << " at sigma " << sigma;
-      ASSERT_TRUE(sample.ddq_a.allFinite()) << machine.name << " at sigma " << sigma;
-      if (sigma <= coarse || sigma >= 1.0 - coarse) {
-        continue;
-      }
-      worst_jump = std::max(
-        worst_jump,
-        (path.at(sigma + step).ddq_a - path.at(sigma - step).ddq_a).norm());
-    }
-    EXPECT_LT(worst_jump, 1.0e-3 * scale) << machine.name;
-
-    // And the first derivative really is the derivative of the path, so the
-    // numbers stage 2 would put into q_a' sigma_dot are the ones the path moves
-    // at rather than a second, independently produced set.
-    for (std::size_t index = 1; index < 200U; ++index) {
-      const double sigma = static_cast<double>(index) / 200.0;
-      const double span = 1.0e-6;
-      const PathVector difference =
-        (path.at(sigma + span).q_a - path.at(sigma - span).q_a) / (2.0 * span);
-      EXPECT_LT((difference - path.at(sigma).dq_a).norm(), 1.0e-4 * (1.0 + scale))
-        << machine.name << " at sigma " << sigma;
-    }
+    // The requirement itself, from the one place it is written down. The
+    // sampling fallback's own suite calls the same function on the path it
+    // smoothed, which is what "the same C2 assertions, both producers" means.
+    expect_c2_everywhere(path, machine.name);
   }
 }
 
@@ -286,39 +226,12 @@ TEST(C2Path, ItStartsAndEndsAtRestAndIsMonotoneInSigma)
     const StructuredPrimitive primitive = primitive_for(model, machine, context, limits);
     const GeometricPath & path = primitive.path;
 
-    const double scale = curvature_scale(path);
-    EXPECT_LT(path.at(0.0).dq_a.norm(), 1.0e-9 * (1.0 + scale)) << machine.name;
-    EXPECT_LT(path.at(1.0).dq_a.norm(), 1.0e-9 * (1.0 + scale)) << machine.name;
-    EXPECT_LT(path.at(0.0).ddq_a.norm(), 1.0e-9 * (1.0 + scale)) << machine.name;
-    EXPECT_LT(path.at(1.0).ddq_a.norm(), 1.0e-9 * (1.0 + scale)) << machine.name;
-    EXPECT_DOUBLE_EQ(path.at(0.0).dq8, 0.0) << machine.name;
-    EXPECT_DOUBLE_EQ(path.at(1.0).dq8, 0.0) << machine.name;
-
     // Monotone in sigma, phase by phase: within a phase no coordinate leaves the
     // box its two waypoints span, so the path never runs past a waypoint and
-    // comes back.
-    const std::vector<PathVector> & waypoints = path.waypoints();
-    ASSERT_EQ(waypoints.size(), 4U) << machine.name;
-    std::vector<double> edges{0.0};
-    edges.insert(
-      edges.end(), path.junction_sigmas().begin(), path.junction_sigmas().end());
-    edges.push_back(1.0);
-    for (std::size_t segment = 0; segment + 1U < edges.size(); ++segment) {
-      for (std::size_t step = 0; step <= 100U; ++step) {
-        const double blend = static_cast<double>(step) / 100.0;
-        const double sigma = edges[segment] + blend * (edges[segment + 1U] - edges[segment]);
-        const PathVector q_a = path.at(sigma).q_a;
-        for (std::size_t row = 0; row < crane_planning::kPathDof; ++row) {
-          const Eigen::Index axis = static_cast<Eigen::Index>(row);
-          const double from = waypoints[segment][axis];
-          const double to = waypoints[segment + 1U][axis];
-          EXPECT_GE(q_a[axis], std::min(from, to) - 1.0e-6)
-            << machine.name << " segment " << segment << " row " << row;
-          EXPECT_LE(q_a[axis], std::max(from, to) + 1.0e-6)
-            << machine.name << " segment " << segment << " row " << row;
-        }
-      }
-    }
+    // comes back. Shared with the fallback's suite for the same reason the C2
+    // assertions are.
+    ASSERT_EQ(path.waypoints().size(), 4U) << machine.name;
+    expect_at_rest_and_monotone(path, machine.name);
   }
 }
 
@@ -377,7 +290,9 @@ TEST(StructuredPrimitive, AStartOutsideTheJointLimitsIsRefusedAndNamesTheLiftPha
   ASSERT_FALSE(refused.ok());
   EXPECT_NE(refused.status().message.find("lift phase"), std::string::npos)
     << refused.status().message;
-  EXPECT_NE(refused.status().message.find("issue 042"), std::string::npos)
+  // And the refusal says whose decision the fallback is, rather than taking it:
+  // 4.4's order is enforced in plan_motion and this file only ever refuses.
+  EXPECT_NE(refused.status().message.find("sampling fallback"), std::string::npos)
     << refused.status().message;
 }
 

@@ -79,6 +79,33 @@ crane_planner:
     path_acceleration_span: 4.0
     path_jerk_span: 4.0
 
+    # **The fallback of 4.4, and it is second on purpose.**  It runs only after
+    # the primitive above has been generated, checked and refused — 4.4's own
+    # order, and its `[!important]` is the reason: a sampling planner is
+    # stochastic with an unbounded runtime, so primitive-first is what buys
+    # deterministic latency in the common case and leaves completeness to the
+    # rare one.  RRT-Connect over the five path coordinates of 4.1 and never the
+    # passive pair, cleared by the same collision check the primitive is, then
+    # shortcut, refitted C² and re-checked as 4.5 makes mandatory.
+    #
+    # The seed is a constant and not a clock: two identical requests against one
+    # scene give one answer, and a test gets the answer the deployment would.
+    # The two caps are the bound and both are per call — the wall clock, and the
+    # configurations the search may check, which is the half that does not depend
+    # on how fast the machine running the planner is.  Exhausting either is a
+    # refusal naming it.  The replanning loop's own latency bound is issue 045's
+    # and is not this.
+    sampling_seed: 20420042
+    sampling_time_budget: 5.0
+    sampling_max_validity_checks: 4000
+    sampling_extension_span: 2.0
+    shortcut_attempts: 120
+    # Half a turn either side of what the endpoints ask for, for the rotator,
+    # which is a `continuous` joint and therefore has no range in the description
+    # to sample from.  Every distinct pose it has is in there, because q7 and
+    # q7 + 2π are the same geometry.
+    sampling_unbounded_margin: 3.141592653589793
+
     # The emitted reference: 25 Hz, which is the rate the horizon is consumed at
     # (ROS 2 Interfaces 4), and a floor so that a goal a few millimetres away is
     # still a trajectory rather than a step.

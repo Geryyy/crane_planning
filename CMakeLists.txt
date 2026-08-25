@@ -7,6 +7,23 @@ find_package(crane_model REQUIRED)
 find_package(crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
+# OMPL, for the sampling fallback of trajectory_planning §4.4.
+# `wiki/implementation/libraries.md` §1 lists it for sampling-based path planning
+# against "RRT/PRM and their smoothing", so no RRT is written here.
+#
+# It needs no hint wherever it comes from: Debian's `libompl-dev` puts its config
+# at /usr/share/ompl/cmake and `ros-humble-ompl` puts it at
+# /opt/ros/humble/share/ompl/cmake, CMake's config-mode search covers
+# `<prefix>/share/<name>*/cmake`, and both prefixes are already on the path. Only
+# the OMPL_* variables are used below and never an `ompl::ompl` target: 1.5 exports
+# no target and 1.7 does, and the variables are what both carry.
+#
+# `package.xml` declares `<depend>ompl</depend>`, which rosdep resolves to
+# `ros-humble-ompl`. **The devcontainer image installs neither yet** -- see the
+# build note at the top of README.md -- so a build in a fresh image fails here
+# until that one line lands. REQUIRED is deliberate: a planner that quietly
+# compiled without its fallback is worse than one that does not build.
+find_package(ompl REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(ruckig REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -31,6 +48,7 @@ add_library(planner_core STATIC
   src/inverse_kinematics.cpp
   src/joint_limits.cpp
   src/planner_core.cpp
+  src/sampling_planner.cpp
   src/structured_primitive.cpp
   src/trajectory_timing.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
@@ -51,12 +69,21 @@ target_include_directories(planner_core
 # interpolation and the clamped B-spline fit" against "spline bases,
 # boundary-condition solves", and the C² primitive of trajectory_planning §4.4 is
 # exactly a sequence of boundary-condition solves. No spline basis is written here.
+# OMPL is PRIVATE and stays PRIVATE: `sampling_planner.hpp` names no OMPL type,
+# so the choice of sampling planner is an implementation detail of this library
+# and not something every consumer of the planner has to compile against.
+# omplConfig.cmake's OMPL_INCLUDE_DIRS carries /usr/include and /usr/include/eigen3
+# beside OMPL's own root; handing the compiler its own default system directory
+# reorders the search path, so only the root goes on and Eigen comes from
+# Eigen3::Eigen exactly as it does everywhere else here.
+target_include_directories(planner_core SYSTEM PRIVATE ${OMPL_INCLUDE_DIR})
 target_link_libraries(planner_core
   PUBLIC
     crane_model::crane_model
     Eigen3::Eigen
     ruckig::ruckig
   PRIVATE
+    ${OMPL_LIBRARIES}
     urdfdom::urdfdom_model)
 
 generate_parameter_library(crane_planner_parameters
@@ -183,6 +210,24 @@ if(BUILD_TESTING)
   ament_add_gtest(test_collision test/test_collision.cpp TIMEOUT 900)
   target_link_libraries(test_collision planner_core)
   target_compile_definitions(test_collision PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: the sampling fallback of trajectory_planning §4.4 and the
+  # smoothing §4.5 makes mandatory — that the fallback runs *only* when the
+  # primitive is blocked, that the state space is the five path coordinates of
+  # §4.1 and never the passive pair, that shortcut → C² fit → re-check all three
+  # run in that order, that the seed makes a run repeatable and the budget makes
+  # it bounded. Offline C++ against both machine descriptions; every scene is
+  # built in the test, and nothing here launches, links a simulator or reaches a
+  # ROS graph.
+  #
+  # It is the slowest binary in this package and deliberately so: one state
+  # validity check is one `Model::passive_equilibrium` plus the collision queries
+  # of its sway envelope, and the fallback is judged on the same terms as the
+  # primitive rather than on cheaper ones. The seeded budget is what bounds it.
+  ament_add_gtest(test_sampling_planner test/test_sampling_planner.cpp TIMEOUT 1800)
+  target_link_libraries(test_sampling_planner planner_core)
+  target_compile_definitions(test_sampling_planner PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes
