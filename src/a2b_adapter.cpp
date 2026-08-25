@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 
+#include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/planner_node.hpp"
 #include "geometry_msgs/msg/point.hpp"
 #include "trajectory_msgs/msg/joint_trajectory.hpp"
@@ -52,58 +53,132 @@ bool all_zero(const std::array<double, N> & values)
     [](double value) {return std::abs(value) < std::numeric_limits<double>::epsilon();});
 }
 
-/// An empty gripper as `crane_model` wants one declared.
-/**
- * `crane_model::Payload` is a plain value type and Eigen does not zero a
- * default-constructed matrix, so an inertia that is never written is whatever
- * was on the stack and the model rejects it for not being symmetric.
- */
-crane_model::Payload empty_gripper()
-{
-  crane_model::Payload payload;
-  payload.valid = true;
-  payload.mass_kg = 0.0;
-  payload.center_of_mass_k8_m.setZero();
-  payload.inertia_k8_kg_m2.setZero();
-  return payload;
-}
-
 }  // namespace
 
 namespace crane_planning
 {
 
-bool tip_to_tcp_drop(const crane_model::Model & model, double & drop_m, std::string & why)
+bool translate_a2b_start(
+  const CalcMovement::Request & request, std::optional<MeasuredStart> & start, std::string & why)
 {
-  // The hanging pose of an *empty* gripper, at an arbitrary actuated
-  // configuration: the pendulum comes to rest under gravity, so the drop is a
-  // property of the tool and not of where the arm is pointing. Zero is that
-  // arbitrary configuration and nothing more -- no collision query is made here,
-  // which is the only thing the neutral pose is a bad choice for.
-  auto hanging = model.passive_equilibrium(crane_model::QA::Zero(), empty_gripper());
+  start.reset();
+  if (all_zero(request.q0)) {
+    if (!all_zero(request.q0_dot)) {
+      why = "`q0_dot` is non-zero while `q0` is the all-zero .srv default. That default means "
+        "use the measured start, and combining rates supplied for one state with positions "
+        "measured from another would not describe one initial condition";
+      return false;
+    }
+    return true;
+  }
+
+  if (!std::all_of(
+      request.q0.begin(), request.q0.end(), [](double value) {
+        return std::isfinite(value);
+      }) ||
+    !std::all_of(
+      request.q0_dot.begin(), request.q0_dot.end(), [](double value) {
+        return std::isfinite(value);
+      }))
+  {
+    why = "`q0`/`q0_dot` do not contain sixteen finite numbers, so they are not an initial "
+      "condition the native planner can use";
+    return false;
+  }
+
+  MeasuredStart translated;
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    const std::size_t canonical = kActuatedRows[row];
+    translated.q_a[static_cast<Eigen::Index>(row)] = request.q0[canonical];
+    translated.dq_a[static_cast<Eigen::Index>(row)] = request.q0_dot[canonical];
+  }
+  translated.passive.measured = true;
+  translated.passive.q_u = crane_model::QU(request.q0[4], request.q0[5]);
+  translated.passive.dq_u = crane_model::DQU(request.q0_dot[4], request.q0_dot[5]);
+  translated.passive.note =
+    "the start is the retained CalcMovement request's explicit `q0`/`q0_dot`, mapped from its "
+    "canonical eight rows; it is a supplied feasibility state, not a measurement from the live "
+    "crane";
+  start = std::move(translated);
+  return true;
+}
+
+bool tip_to_tcp_offset(
+  const crane_model::Model & model, const crane_model::Payload & payload, double phi_z, double q8,
+  Eigen::Vector3d & offset_m, std::string & why)
+{
+  if (!std::isfinite(phi_z) || !std::isfinite(q8)) {
+    why = "`phi_tool_n` or the measured tool coordinate q8 is not finite, so the hanging "
+      "tip-to-tool offset cannot be evaluated";
+    return false;
+  }
+
+  // First read the tool description's yaw convention at the canonical pose.
+  // K_tcp has a fixed quarter-turn in today's descriptions, so q1 itself is not
+  // phi_z; measuring the convention is the same rule as measuring the offset.
+  crane_model::QA q_a = crane_model::QA::Zero();
+  q_a[5] = q8;
+  auto canonical_hanging = model.passive_equilibrium(q_a, payload);
+  if (!canonical_hanging.ok()) {
+    why = "the passive subsystem of this description has no hanging equilibrium for the "
+      "request's payload, so the offset from the tip pivot to the tool cannot be read out: " +
+      canonical_hanging.status().message;
+    return false;
+  }
+  crane_model::Q canonical_q = crane_model::Q::Zero();
+  canonical_q[7] = q8;
+  canonical_q.segment<2>(4) = canonical_hanging.value();
+  auto canonical_tcp =
+    model.forward_kinematics(
+    canonical_q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+  if (!canonical_tcp.ok()) {
+    why = "this description does not carry the tool centre point, so a CalcMovement goal "
+      "cannot be placed against it: " + canonical_tcp.status().message;
+    return false;
+  }
+
+  // The passive pair is a universal pendulum: once it is settled, changing the
+  // boom or telescope pose does not change this world-expressed vector. q1
+  // rotates the whole assembly about gravity, while q7 is held at zero. Rotate
+  // q1 by the difference between the requested yaw and the measured canonical
+  // yaw, then settle again so even that symmetry is checked through the model.
+  const double canonical_phi_z = phi_z_of(canonical_tcp.value().orientation);
+  q_a[0] = std::remainder(phi_z - canonical_phi_z, 2.0 * M_PI);
+  auto hanging = model.passive_equilibrium(q_a, payload);
   if (!hanging.ok()) {
-    why = "the passive subsystem of this description has no hanging equilibrium at the neutral "
-      "configuration, so the drop from the tip pivot to the tool cannot be read out of it: " +
+    why = "the passive subsystem of this description has no hanging equilibrium for the "
+      "request's payload, so the offset from the tip pivot to the tool cannot be read out: " +
       hanging.status().message;
     return false;
   }
 
   crane_model::Q q = crane_model::Q::Zero();
+  q[0] = q_a[0];
+  q[7] = q8;
   q.segment<2>(4) = hanging.value();
   auto tip = model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tip);
   auto tcp = model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
   if (!tip.ok() || !tcp.ok()) {
-    why = std::string("this description does not carry both the tip pivot and the tool centre "
+    why = std::string(
+      "this description does not carry both the tip pivot and the tool centre "
       "point, so a CalcMovement goal cannot be placed against it: ") +
       (tip.ok() ? tcp.status().message : tip.status().message);
     return false;
   }
 
-  drop_m = tip.value().position_m.z() - tcp.value().position_m.z();
-  if (!(drop_m > 0.0)) {
-    why = "the tool centre point of this description does not hang below the tip pivot (drop = " +
-      std::to_string(drop_m) +
-      " m), so `y_n` cannot be read as the pivot the way CalcMovement documents it";
+  const double actual_phi_z = phi_z_of(tcp.value().orientation);
+  const double yaw_error = std::remainder(actual_phi_z - phi_z, 2.0 * M_PI);
+  if (!std::isfinite(actual_phi_z) || std::abs(yaw_error) > 1.0e-9) {
+    why = "the canonical settled pose used to translate `y_n` has TCP yaw " +
+      std::to_string(actual_phi_z) + " rad instead of `phi_tool_n` = " +
+      std::to_string(phi_z) +
+      " rad, so its tip-to-tool offset cannot be applied without approximation";
+    return false;
+  }
+  offset_m = tcp.value().position_m - tip.value().position_m;
+  if (!offset_m.allFinite() || !(offset_m.norm() > 0.0)) {
+    why = "the description produced no finite non-zero offset from the tip pivot to the tool "
+      "centre point, so `y_n` cannot be placed on the native tool goal";
     return false;
   }
   return true;
@@ -138,7 +213,8 @@ bool translate_a2b_payload(
     return false;
   }
 
-  const float radius = std::max(request.log_carrying.radius_top, request.log_carrying.radius_bottom);
+  const float radius =
+    std::max(request.log_carrying.radius_top, request.log_carrying.radius_bottom);
   if (!std::isfinite(request.log_carrying.length) || !(request.log_carrying.length > 0.0F) ||
     !std::isfinite(radius) || !(radius > 0.0F))
   {
@@ -200,22 +276,17 @@ bool translate_a2b_payload(
 }
 
 bool translate_a2b_request(
-  const CalcMovement::Request & request, double tip_to_tcp_drop_m,
+  const CalcMovement::Request & request, const Eigen::Vector3d & tip_to_tcp_offset_m,
   crane_msgs::srv::PlanMotion::Request & plan, std::string & why)
 {
   plan = crane_msgs::srv::PlanMotion::Request{};
 
-  // The start state. `wiki/trajectory_planning.md` 7 makes it `(q, dq)` **as
-  // measured**, and `crane_msgs/PlanMotion` has no field for a different one --
-  // so a caller that fills `q0` is asking to plan from a configuration the
-  // machine is not in, and there is nothing to translate that into. The `.srv`
-  // default of all zeros is the legacy server's own "use the measurement", and
-  // it is the one this passes through.
-  if (!all_zero(request.q0) || !all_zero(request.q0_dot)) {
-    why = "`q0`/`q0_dot` carry a start configuration, and /crane/plan_motion plans from (q, dq) as "
-      "measured on /joint_states and /crane/pendulum_state (trajectory_planning 7) with no field "
-      "for a hypothetical one. Leave both at the .srv default of zeros -- which the legacy server "
-      "also reads as \"use the measurement\" -- or publish the state to be probed";
+  // The start mapping is carried beside this PlanMotion request by PlannerNode:
+  // it is not a field the native .srv has, but it enters the same internal
+  // planning call after the ROS boundary. Invoke the one mapping here too so a
+  // caller using this translation function directly gets the same validation.
+  std::optional<MeasuredStart> start;
+  if (!translate_a2b_start(request, start, why)) {
     return false;
   }
   if (!std::isfinite(request.t_end) || request.t_end != 0.0) {
@@ -256,7 +327,8 @@ bool translate_a2b_request(
   // the two have to agree, because there is no way to check one and not the
   // other.
   if (request.carries_log && request.check_log_collision != request.check_gripper_collision) {
-    why = "`check_log_collision` and `check_gripper_collision` disagree while a log is carried, and "
+    why =
+      "`check_log_collision` and `check_gripper_collision` disagree while a log is carried, and "
       "`crane_msgs/PlanMotion` has one `avoid_collisions` covering the crane and the payload it "
       "holds. Checking one and not the other is not something this planner can be asked for";
     return false;
@@ -289,16 +361,16 @@ bool translate_a2b_request(
     why = "`y_n` and `phi_tool_n` are not four finite numbers, so there is no goal to plan to";
     return false;
   }
-  if (!std::isfinite(tip_to_tcp_drop_m) || !(tip_to_tcp_drop_m > 0.0)) {
-    why = "the drop from the tip pivot to the tool centre point has not been read out of the "
+  if (!tip_to_tcp_offset_m.allFinite() || !(tip_to_tcp_offset_m.norm() > 0.0)) {
+    why = "the offset from the tip pivot to the tool centre point has not been read out of the "
       "description, so `y_n` -- which CalcMovement documents as the position of the tip, K5 -- "
       "cannot be placed on the tool pose `crane_msgs/PlanMotion` asks for";
     return false;
   }
   plan.goal.header.frame_id = kPlanningFrame;
-  plan.goal.pose.position.x = request.y_n.x;
-  plan.goal.pose.position.y = request.y_n.y;
-  plan.goal.pose.position.z = request.y_n.z - tip_to_tcp_drop_m;
+  plan.goal.pose.position.x = request.y_n.x + tip_to_tcp_offset_m.x();
+  plan.goal.pose.position.y = request.y_n.y + tip_to_tcp_offset_m.y();
+  plan.goal.pose.position.z = request.y_n.z + tip_to_tcp_offset_m.z();
   // phi_z about K0's z (wiki/nomenclature.md 5), written scalar-last because ROS
   // messages are and Eigen is not.
   plan.goal.pose.orientation.w = std::cos(0.5 * request.phi_tool_n);

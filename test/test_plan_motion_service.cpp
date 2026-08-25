@@ -42,12 +42,15 @@
 #include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "crane_planning/a2b_adapter.hpp"
+#include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/planner_node.hpp"
 #include "crane_planning/sampling_planner.hpp"
 #include "description_fixture.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "timber_crane_planning_interfaces/srv/calc_movement.hpp"
 #include "trajectory_msgs/msg/joint_trajectory.hpp"
 
 namespace
@@ -56,6 +59,7 @@ namespace
 using crane_msgs::srv::PlanGrip;
 using crane_msgs::srv::PlanMotion;
 using sensor_msgs::msg::JointState;
+using timber_crane_planning_interfaces::srv::CalcMovement;
 using trajectory_msgs::msg::JointTrajectory;
 
 /// How long any one wait may take before the test fails, s. Generous, because it
@@ -144,6 +148,7 @@ protected:
     planner_ = std::make_shared<crane_planning::PlannerNode>();
     client_node_ = std::make_shared<rclcpp::Node>("crane_planning_plan_motion_client");
     client_ = client_node_->create_client<PlanMotion>(crane_planning::kPlanMotionService);
+    a2b_client_ = client_node_->create_client<CalcMovement>(crane_planning::kA2bMovementService);
     reference_ = client_node_->create_subscription<JointTrajectory>(
       crane_planning::kReferenceTopic, crane_planning::reference_qos(),
       [this](JointTrajectory::ConstSharedPtr message) {published_.push_back(*message);});
@@ -402,10 +407,71 @@ protected:
     return request;
   }
 
+  /// The retained request for the same reachable goal as `collision_blind_request`.
+  CalcMovement::Request::SharedPtr a2b_collision_blind_request()
+  {
+    const crane_model::QA q_a = goal_configuration();
+    crane_model::Q q = crane_model::Q::Zero();
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
+        q_a[static_cast<Eigen::Index>(row)];
+    }
+    auto equilibrium =
+      model_->passive_equilibrium(q_a, crane_planning_test::empty_gripper());
+    EXPECT_TRUE(equilibrium.ok()) << equilibrium.status().message;
+    q.segment<2>(4) = equilibrium.value();
+    auto tip = model_->forward_kinematics(
+      q, crane_model::Frame::MountingBase, crane_model::Frame::Tip);
+    auto tcp = model_->forward_kinematics(
+      q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+    EXPECT_TRUE(tip.ok() && tcp.ok());
+
+    auto request = std::make_shared<CalcMovement::Request>();
+    request->y_n.x = tip.value().position_m.x();
+    request->y_n.y = tip.value().position_m.y();
+    request->y_n.z = tip.value().position_m.z();
+    request->phi_tool_n = crane_planning::phi_z_of(tcp.value().orientation);
+    request->slow_down = 1.0;
+    request->carries_log = false;
+    request->check_log_collision = false;
+    request->check_gripper_collision = false;
+    request->publish_path = true;
+
+    // The real concrete-block feasibility caller fills q0. Use a settled version
+    // of this fixture's ordinary start so this request likewise needs no live
+    // `/joint_states` or `/crane/pendulum_state` to describe its probe state.
+    crane_model::QA q_a_start;
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      q_a_start[static_cast<Eigen::Index>(row)] =
+        start_positions()[crane_planning::kActuatedRows[row]];
+      request->q0[crane_planning::kActuatedRows[row]] =
+        q_a_start[static_cast<Eigen::Index>(row)];
+    }
+    auto start_equilibrium =
+      model_->passive_equilibrium(q_a_start, crane_planning_test::empty_gripper());
+    EXPECT_TRUE(start_equilibrium.ok()) << start_equilibrium.status().message;
+    request->q0[4] = start_equilibrium.value()[0];
+    request->q0[5] = start_equilibrium.value()[1];
+    return request;
+  }
+
+  CalcMovement::Response::SharedPtr call_a2b(const CalcMovement::Request::SharedPtr & request)
+  {
+    EXPECT_TRUE(spin_until([this]() {return a2b_client_->service_is_ready();}));
+    auto future = a2b_client_->async_send_request(request);
+    const bool answered = spin_until(
+      [&future]() {
+        return future.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+      });
+    EXPECT_TRUE(answered) << "the retained service never answered";
+    return answered ? future.get() : nullptr;
+  }
+
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::shared_ptr<crane_planning::PlannerNode> planner_;
   std::shared_ptr<rclcpp::Node> client_node_;
   rclcpp::Client<PlanMotion>::SharedPtr client_;
+  rclcpp::Client<CalcMovement>::SharedPtr a2b_client_;
   rclcpp::Subscription<JointTrajectory>::SharedPtr reference_;
   rclcpp::Publisher<JointState>::SharedPtr joint_states_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_;
@@ -709,7 +775,8 @@ TEST_F(PlanMotionService, AReachableGoalComesBackAsATimedJointTrajectory)
   // base: it is carried on every point, and it is held.
   const std::size_t tool = crane_planning::kToolRow;
   for (const auto & point : trajectory.points) {
-    EXPECT_NEAR(point.positions[tool], start_positions()[crane_planning::kActuatedRows[tool]],
+    EXPECT_NEAR(
+      point.positions[tool], start_positions()[crane_planning::kActuatedRows[tool]],
       1.0e-12);
     EXPECT_NEAR(point.velocities[tool], 0.0, 1.0e-12);
   }
@@ -801,9 +868,11 @@ TEST_F(PlanMotionService, ARefusedReplanLeavesTheStandingReferenceAloneAndReport
   EXPECT_EQ(refused->trajectory.joint_names, adopted->trajectory.joint_names);
   EXPECT_EQ(
     refused->trajectory.points.back().positions, adopted->trajectory.points.back().positions);
-  EXPECT_EQ(rclcpp::Time(refused->trajectory.header.stamp),
+  EXPECT_EQ(
+    rclcpp::Time(refused->trajectory.header.stamp),
     rclcpp::Time(adopted->trajectory.header.stamp));
-  EXPECT_NE(refused->message.find("is unchanged and is the one still being executed"),
+  EXPECT_NE(
+    refused->message.find("is unchanged and is the one still being executed"),
     std::string::npos) << refused->message;
   // No partial plan travelled with it either: `success` is false, so the
   // trajectory on the response is the standing one and not something new.
@@ -843,6 +912,28 @@ TEST_F(PlanMotionService, TheAnswerNamesWhichOfTheTwoMechanismsProducedTheGeomet
     response->message.find(
       crane_planning::mechanism_name(crane_planning::PathMechanism::SamplingFallback)),
     std::string::npos) << response->message;
+}
+
+TEST_F(PlanMotionService, TheRetainedA2bServiceUsesThisNodesNativePlanningPath)
+{
+  // There is one PlannerNode in this executor. Its retained service receives a
+  // K5 goal built from a real forward-kinematics pose, translates it to K_tcp,
+  // and the adopted answer appears on the same `/crane/reference` publisher the
+  // native service uses. A separate adapter node or a second planner could not
+  // satisfy that ownership assertion in this fixture.
+  const auto response = call_a2b(a2b_collision_blind_request());
+  ASSERT_NE(response, nullptr);
+  ASSERT_TRUE(response->success);
+  ASSERT_FALSE(response->trajectory.points.empty());
+  ASSERT_EQ(response->tcp_path.size(), response->trajectory.points.size());
+
+  ASSERT_TRUE(spin_until([this]() {return !published_.empty();}))
+    << "nothing was published on " << crane_planning::kReferenceTopic;
+  ASSERT_EQ(published_.size(), 1U);
+  EXPECT_EQ(published_.front().joint_names, response->trajectory.joint_names);
+  EXPECT_EQ(
+    published_.front().points.back().positions,
+    response->trajectory.points.back().positions);
 }
 
 namespace

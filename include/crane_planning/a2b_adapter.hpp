@@ -40,18 +40,22 @@
 //     the pivot the pendulum hangs from, `K5_inner_telescope` -- while
 //     `crane_msgs/PlanMotion::goal` is the **tool** pose, `K8_tool_center_point`.
 //     `mp_rviz_panel` says the same thing in code, adding `d_0508 + d_contact` to
-//     the height a user types before it sends it. The two points are one drop
-//     apart and `tip_to_tcp_drop` reads that drop out of the description rather
-//     than writing it down.
+//     the height a user types before it sends it. `tip_to_tcp_offset` reads the
+//     settled 3D offset between them out of the description for the request's
+//     yaw and payload rather than writing it down or assuming it is vertical.
 
 #ifndef CRANE_PLANNING__A2B_ADAPTER_HPP_
 #define CRANE_PLANNING__A2B_ADAPTER_HPP_
 
+#include <optional>
 #include <string>
+
+#include <Eigen/Core>
 
 #include "crane_model/model.hpp"
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
+#include "crane_planning/replanning.hpp"
 #include "timber_crane_planning_interfaces/srv/calc_movement.hpp"
 
 namespace crane_planning
@@ -68,23 +72,24 @@ namespace crane_planning
  */
 inline constexpr char kA2bMovementService[] = "/a2b_movement";
 
-/// How far the TCP hangs below the tip pivot K5 with the tool at rest, m.
+/// Where the TCP hangs relative to the tip pivot K5 for one payload and yaw, m.
 /**
  * `y_n` names the pivot and `PlanMotion::goal` names the tool, so the adapter
- * needs the distance between them. It is a property of the description and the
- * mounted tool and is read out of the model at the hanging equilibrium of an
- * empty gripper -- never written down, because the PZS100's rail gripper and the
- * 7040's jaw do not hang the same distance.
+ * needs the vector between them. It is read out of the model at the hanging
+ * equilibrium for the request's effective payload -- never written down,
+ * because the PZS100's rail gripper and the 7040's jaw do not hang at the same
+ * offset and an off-axis payload changes it again.
  *
- * It is a **vertical drop** and not a vector: `wiki/trajectory_planning.md` 6
- * makes the endpoint a genuine steady state of the passive subsystem, and a tool
- * whose centre of mass is on its own axis comes to rest hanging straight down
- * from the pivot whatever the arm is doing. A payload whose centre of mass is
- * off that axis tilts the pendulum, and then the drop is the vertical part of a
- * hang that also has a horizontal one -- see the note on `translate_a2b_request`.
+ * The two passive joints make the settled offset independent of the boom and
+ * telescope pose: changing the requested yaw rotates the whole hanging assembly
+ * about gravity. The function evaluates that exact settled pose at a canonical
+ * arm configuration and verifies that its TCP yaw is the requested one. Thus a
+ * 7040's measured horizontal hang and a payload whose centre of mass is off the
+ * tool axis are translated rather than approximated.
  */
-[[nodiscard]] bool tip_to_tcp_drop(
-  const crane_model::Model & model, double & drop_m, std::string & why);
+[[nodiscard]] bool tip_to_tcp_offset(
+  const crane_model::Model & model, const crane_model::Payload & payload, double phi_z, double q8,
+  Eigen::Vector3d & offset_m, std::string & why);
 
 /// The payload half of the mapping: `LogShape` and its two centres, or a refusal.
 /**
@@ -100,11 +105,25 @@ inline constexpr char kA2bMovementService[] = "/a2b_movement";
   const timber_crane_planning_interfaces::srv::CalcMovement::Request & request,
   crane_msgs::msg::Payload & payload, std::string & why);
 
+/// `q0`/`q0_dot` as an explicit start, or no override for the all-zero default.
+/**
+ * A real concrete-block feasibility caller fills all eight `q0` entries so it
+ * can probe a pose without moving the crane. Those canonical rows map exactly
+ * onto `MeasuredStart`: `[q1,q2,q3,q4,q5,q6,q7,q8]`, with the passive pair
+ * marked as supplied rather than estimated. The all-zero `.srv` default keeps
+ * the native path's measured start. A non-zero `q0_dot` without a `q0` is
+ * refused because it would combine rates for one state with positions from
+ * another.
+ */
+[[nodiscard]] bool translate_a2b_start(
+  const timber_crane_planning_interfaces::srv::CalcMovement::Request & request,
+  std::optional<MeasuredStart> & start, std::string & why);
+
 /// Every field of `CalcMovement::Request`, mapped or refused by name.
 /**
  * | `CalcMovement` | `crane_msgs/PlanMotion` | rule |
  * |---|---|---|
- * | `y_n` | `goal.pose.position` | the tip pivot, lowered by `tip_to_tcp_drop_m` onto the tool |
+ * | `y_n` | `goal.pose.position` | the tip pivot plus `tip_to_tcp_offset_m` onto the tool |
  * | (no field) | `goal.header.frame_id` | `K0_mounting_base`, asserted and not converted |
  * | `phi_tool_n` | `goal.pose.orientation` | `phi_z` about K0's z, scalar-last on the wire |
  * | `slow_down` | `speed_scale` | `1 / slow_down`; a divider below one is refused |
@@ -113,7 +132,7 @@ inline constexpr char kA2bMovementService[] = "/a2b_movement";
  * | `check_log_collision`, | `avoid_collisions` | one flag for one flag |
  * | `check_gripper_collision` | | below |
  * | `logs_scene` | -- | refused: obstacles arrive on `/crane/collision_scene` |
- * | `q0`, `q0_dot` | -- | refused unless the `.srv` default: the start is measured |
+ * | `q0`, `q0_dot` | internal measured start | `translate_a2b_start`; all-zero `q0` uses topics |
  * | `t_end` | -- | refused unless zero: the OCP derives the duration |
  * | `v_d_tip` | -- | refused unless zero: the move ends at rest |
  * | `publish_path` | -- | carried by the response's `tcp_path`, not by a topic |
@@ -125,15 +144,11 @@ inline constexpr char kA2bMovementService[] = "/a2b_movement";
  * under-covers the wider end. The mass is the caller's own `m_log` and is not
  * recomputed from it.
  *
- * The other is the hang: `tip_to_tcp_drop_m` is the drop of an empty gripper, so
- * a request that carries a payload whose centre of mass is off the tool axis
- * lands the pivot within the pendulum's horizontal hang of `y_n` rather than on
- * it. That is the same convention the legacy interface has always had -- its
- * `d_contact` is a constant too -- and it is stated rather than hidden.
  */
 [[nodiscard]] bool translate_a2b_request(
   const timber_crane_planning_interfaces::srv::CalcMovement::Request & request,
-  double tip_to_tcp_drop_m, crane_msgs::srv::PlanMotion::Request & plan, std::string & why);
+  const Eigen::Vector3d & tip_to_tcp_offset_m, crane_msgs::srv::PlanMotion::Request & plan,
+  std::string & why);
 
 /// The answer, back. Three fields, and the third of them is why this is a table.
 /**

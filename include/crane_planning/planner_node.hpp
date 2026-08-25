@@ -159,13 +159,14 @@ public:
     const crane_msgs::srv::PlanGrip::Request & request,
     crane_msgs::srv::PlanGrip::Response & response);
 
-  /// One `a2b_movement` request, answered as an adapter over `plan` above.
+  /// One `a2b_movement` request, answered through the native planning path.
   /**
    * The compatibility row of `wiki/implementation/ros2_interfaces.md` 9. It
-   * translates, calls `plan` -- the very call `/crane/plan_motion` is answered
-   * by, so there is no second planner, no second set of limits and no second
-   * collision configuration -- and translates back. What it maps and what it
-   * refuses is `crane_planning/a2b_adapter.hpp`.
+   * translates, calls `plan_with_start` -- the private call
+   * `/crane/plan_motion` reaches through `plan`, with the retained service's
+   * optional explicit start -- and translates back. There is no second planner,
+   * no second set of limits and no second collision configuration. What it maps
+   * and what it refuses is `crane_planning/a2b_adapter.hpp`.
    *
    * Public for the same reason `plan` and `grip` are: the offline suite reads a
    * refusal without a round trip. And it has to log its own refusals, because
@@ -191,6 +192,12 @@ public:
     PayloadShape & shape, std::string & why);
 
 private:
+  /// The native planning path with an optional retained-interface start override.
+  void plan_with_start(
+    const crane_msgs::srv::PlanMotion::Request & request,
+    const MeasuredStart * start_override,
+    crane_msgs::srv::PlanMotion::Response & response);
+
   void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
 
   /// The six actuated rows of one trajectory as `trajectory_msgs`, with 1's stamp.
@@ -266,18 +273,6 @@ private:
 
   std::optional<crane_model::Model> model_;
   std::optional<PlannerContext> context_;
-
-  /// How far the tool hangs below the tip pivot K5, m, out of the description.
-  /**
-   * The one number the `a2b_movement` adapter needs and `CalcMovement` does not
-   * carry: `y_n` names the pivot and `crane_msgs/PlanMotion::goal` names the
-   * tool. Read once when the model is built, because it is a property of the
-   * description and the mounted tool; absent when the description does not carry
-   * both frames, and then the adapter refuses rather than placing the goal on
-   * the pivot.
-   */
-  std::optional<double> tip_to_tcp_drop_m_;
-  std::string tip_to_tcp_note_;  ///< where the drop came from, or why there is none
 
   sensor_msgs::msg::JointState::ConstSharedPtr joint_states_;
   crane_msgs::msg::PendulumState::ConstSharedPtr pendulum_state_;

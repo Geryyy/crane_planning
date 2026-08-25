@@ -390,9 +390,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "response carries no message to put it on. Its payload fields are wood_log_msgs/LogShape, so "
     "a log on this path becomes a crane_msgs/Payload cylinder and the LogShape stops here: a "
     "block declared natively stays a box. `y_n` is the tip pivot K5 and the native goal is the "
-    "tool, so the goal is lowered onto the tool by the drop read out of the description, and "
-    "`q0`, `t_end`, `v_d_tip` and `logs_scene` have no native equivalent and are refused rather "
-    "than dropped.",
+    "tool, so the full settled 3D offset is read from the description for the request's payload "
+    "and yaw rather than approximated as a vertical drop. An explicit `q0`/`q0_dot` is mapped "
+    "onto the same internal start boundary used by the native service; `t_end`, non-zero "
+    "`v_d_tip` and `logs_scene` have no native equivalent and are refused rather than dropped.",
     kA2bMovementService, kPlanMotionService);
 }
 
@@ -433,26 +434,6 @@ void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr mes
     return;
   }
   context_.emplace(std::move(context).value());
-
-  // The one number the `a2b_movement` adapter needs beyond what this planner
-  // already reads: how far the tool hangs below the tip pivot `y_n` names. Read
-  // here rather than per request, because it is a property of this description
-  // and this tool -- and a failure to read it is the adapter's alone, so it is
-  // recorded and does not stop the two native services from being answered.
-  double drop = 0.0;
-  std::string why;
-  if (tip_to_tcp_drop(*model_, drop, why)) {
-    tip_to_tcp_drop_m_ = drop;
-    tip_to_tcp_note_ = "the tool hangs " + std::to_string(drop) +
-      " m below the tip pivot in this description, which is what an " +
-      std::string(kA2bMovementService) + " goal is lowered by";
-    RCLCPP_INFO(get_logger(), "%s", tip_to_tcp_note_.c_str());
-  } else {
-    tip_to_tcp_drop_m_.reset();
-    tip_to_tcp_note_ = why;
-    RCLCPP_WARN(
-      get_logger(), "%s will refuse every request: %s", kA2bMovementService, why.c_str());
-  }
 
   RCLCPP_INFO(
     get_logger(),
@@ -737,16 +718,16 @@ std::string PlannerNode::describe_standing() const
 {
   if (!standing_.has_value()) {
     return std::string("Nothing has been published on ") + kReferenceTopic +
-      " by this planner yet, so no trajectory is standing and this refusal displaced nothing";
+           " by this planner yet, so no trajectory is standing and this refusal displaced nothing";
   }
   const double duration = standing_->points.empty() ?
     0.0 : rclcpp::Duration(standing_->points.back().time_from_start).seconds();
   return std::string("The trajectory standing on ") + kReferenceTopic +
-    " is unchanged and is the one still being executed: " +
-    std::to_string(standing_->points.size()) + " points over " + std::to_string(duration) +
-    " s, stamped " + std::to_string(rclcpp::Time(standing_->header.stamp).seconds()) +
-    ". It is carried on this response so a caller can tell 'I kept planning' from 'here is "
-    "something new'; success is false, so it is not something new";
+         " is unchanged and is the one still being executed: " +
+         std::to_string(standing_->points.size()) + " points over " + std::to_string(duration) +
+         " s, stamped " + std::to_string(rclcpp::Time(standing_->header.stamp).seconds()) +
+         ". It is carried on this response so a caller can tell 'I kept planning' from 'here is "
+         "something new'; success is false, so it is not something new";
 }
 
 bool PlannerNode::read_payload(
@@ -832,6 +813,14 @@ void PlannerNode::plan(
   const crane_msgs::srv::PlanMotion::Request & request,
   crane_msgs::srv::PlanMotion::Response & response)
 {
+  plan_with_start(request, nullptr, response);
+}
+
+void PlannerNode::plan_with_start(
+  const crane_msgs::srv::PlanMotion::Request & request,
+  const MeasuredStart * start_override,
+  crane_msgs::srv::PlanMotion::Response & response)
+{
   response.success = false;
   response.trajectory = trajectory_msgs::msg::JointTrajectory{};
   response.tcp_path.clear();
@@ -859,8 +848,8 @@ void PlannerNode::plan(
     refuse(
       "the goal is in frame '" + request.goal.header.frame_id +
       "', and this planner plans in '" + std::string(kPlanningFrame) +
-      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into "
-      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
+      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into " +
+      kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
     return;
   }
   if (!ready()) {
@@ -872,16 +861,20 @@ void PlannerNode::plan(
 
   MeasuredStart start;
   std::string why;
-  if (!read_start(start, why)) {
-    refuse("no start state: " + why);
-    return;
-  }
-  // The passive half, and this deployment's answer to its absence. Refused here
-  // rather than deeper down, because whether an unusable estimate is a refusal at
-  // all is a *deployment's* decision and not the algorithm's.
-  if (!read_passive(start.passive, why)) {
-    refuse("no passive start state: " + why);
-    return;
+  if (start_override != nullptr) {
+    start = *start_override;
+  } else {
+    if (!read_start(start, why)) {
+      refuse("no start state: " + why);
+      return;
+    }
+    // The passive half, and this deployment's answer to its absence. Refused
+    // here rather than deeper down, because whether an unusable estimate is a
+    // refusal at all is a deployment's decision and not the algorithm's.
+    if (!read_passive(start.passive, why)) {
+      refuse("no passive start state: " + why);
+      return;
+    }
   }
 
   MotionRequest motion;
@@ -941,7 +934,11 @@ void PlannerNode::plan(
   }
   const MotionPlan & motion_plan = solved.value();
 
-  const rclcpp::Time origin(joint_states_->header.stamp);
+  // The native row starts at a measurement and inherits that measurement's
+  // stamp. CalcMovement's explicit `q0` is a hypothetical feasibility state and
+  // carries no stamp, so its trajectory becomes valid when the answer is built.
+  const rclcpp::Time origin =
+    start_override == nullptr ? rclcpp::Time(joint_states_->header.stamp) : now();
   response.trajectory = as_message(motion_plan.trajectory, origin);
   const trajectory_msgs::msg::JointTrajectory & trajectory = response.trajectory;
 
@@ -1064,8 +1061,8 @@ void PlannerNode::grip(
       "the goal of this " + std::string(grip_phase_name(grip_request.phase)) +
       " phase is in frame '" + request.goal.header.frame_id + "', and this planner plans in '" +
       std::string(kPlanningFrame) +
-      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into "
-      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
+      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into " +
+      kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
     return;
   }
   if (!ready()) {
@@ -1170,8 +1167,9 @@ void PlannerNode::grip(
       response.message += ". As for the scene: " + scene_note_;
     }
   }
-  response.message += ". " + describe(ledger) + ", and this trajectory is now the one standing on "
-    + kReferenceTopic;
+  response.message += ". " + describe(ledger) +
+    ", and this trajectory is now the one standing on " +
+    kReferenceTopic;
   if (!payload_note.empty()) {
     response.message += ". As for the payload: " + payload_note;
   }
@@ -1195,28 +1193,74 @@ void PlannerNode::a2b(
       RCLCPP_WARN(get_logger(), "%s refused: %s", kA2bMovementService, why.c_str());
     };
 
-  if (!tip_to_tcp_drop_m_.has_value()) {
+  if (!ready()) {
     refuse(
-      tip_to_tcp_note_.empty() ?
       std::string("no usable robot description has arrived on ") + kRobotDescriptionTopic +
-      " yet, so the drop from the tip pivot to the tool is unknown and `y_n` cannot be placed" :
-      tip_to_tcp_note_);
+      " yet, so the offset from the tip pivot to the tool is unknown and `y_n` cannot be placed");
+    return;
+  }
+
+  std::optional<MeasuredStart> start_override;
+  std::string why;
+  if (!translate_a2b_start(request, start_override, why)) {
+    refuse(why);
+    return;
+  }
+
+  // Translate the payload first so the hanging K5-to-TCP vector is evaluated
+  // for the same body the native planning path will use. A valid fresh payload
+  // estimate replaces the declaration here on exactly the same terms it does in
+  // `plan`; this is geometry preparation for the request, not a second planning
+  // path.
+  crane_msgs::msg::Payload payload_message;
+  if (!translate_a2b_payload(request, payload_message, why)) {
+    refuse(why);
+    return;
+  }
+  crane_model::Payload payload;
+  PayloadShape payload_shape;
+  if (!read_payload(payload_message, payload, payload_shape, why)) {
+    refuse(why);
+    return;
+  }
+  std::string payload_note;
+  read_payload_estimate(payload, payload_note);
+
+  double q8 = 0.0;
+  if (start_override.has_value()) {
+    q8 = start_override->q_a[static_cast<Eigen::Index>(kToolRow)];
+  } else {
+    MeasuredStart measured;
+    if (!read_start(measured, why)) {
+      refuse("no measured tool coordinate for the goal conversion: " + why);
+      return;
+    }
+    q8 = measured.q_a[static_cast<Eigen::Index>(kToolRow)];
+  }
+
+  Eigen::Vector3d tip_to_tcp_offset_m;
+  if (!tip_to_tcp_offset(
+      *model_, payload, request.phi_tool_n, q8,
+      tip_to_tcp_offset_m, why))
+  {
+    refuse(why);
     return;
   }
 
   crane_msgs::srv::PlanMotion::Request translated;
-  std::string why;
-  if (!translate_a2b_request(request, *tip_to_tcp_drop_m_, translated, why)) {
+  if (!translate_a2b_request(request, tip_to_tcp_offset_m, translated, why)) {
     refuse(why);
     return;
   }
 
   // The same call `/crane/plan_motion` is answered by, and not a copy of it: the
-  // start state, the passive estimate, the payload estimate, the scene, the
-  // latency budget, kappa, the standing reference and its republication are all
-  // that call's and are reached exactly once.
+  // start state, payload, scene, latency budget, kappa, standing reference and
+  // republication all keep that call as their single planning owner. The
+  // payload/start reads above only provide the retained interface's geometry
+  // and optional explicit-start inputs to this call.
   crane_msgs::srv::PlanMotion::Response planned;
-  plan(translated, planned);
+  plan_with_start(
+    translated, start_override.has_value() ? &start_override.value() : nullptr, planned);
   translate_a2b_response(planned, response);
 
   if (!response.success) {

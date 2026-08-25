@@ -4,9 +4,9 @@
 // Offline. Nothing here constructs a node, initialises rclcpp, opens a domain or
 // plans: the two translations are message in, message out, and the far side of
 // the boundary -- `PlannerNode::read_payload` -- is a static function. The one
-// thing that is read off the machine is the drop from the tip pivot K5 to the
-// tool, and it comes out of the two checked-in descriptions. The served row is
-// `test_plan_motion_service.cpp`.
+// thing that is read off the machine is the settled offset from the tip pivot K5
+// to the tool, and it comes out of the two checked-in descriptions. The served
+// row is `test_plan_motion_service.cpp`.
 //
 // The requests below are not invented. `timber_request` is what
 // `epsilon_crane_behavior_tree`'s `CalcA2BMovementService::on_tick` builds for
@@ -40,8 +40,8 @@ namespace
 using crane_msgs::srv::PlanMotion;
 using timber_crane_planning_interfaces::srv::CalcMovement;
 
-/// A drop that is not any machine's, so a case that forgets it is not silent.
-constexpr double kDrop = 1.25;
+/// An offset that is not any machine's, so a case that drops an axis is not silent.
+const Eigen::Vector3d kOffset{0.20, -0.30, -1.25};
 
 /// What `CalcA2BMovementService::on_tick` builds for a leg that carries nothing.
 /**
@@ -132,34 +132,57 @@ TEST(A2bAdapter, TheServiceNameIsTheOneTheRetainedCallersResolve)
   EXPECT_EQ(std::string(crane_planning::kA2bMovementService), "/a2b_movement");
 }
 
-TEST(A2bAdapter, TheDropFromTheTipPivotToTheToolIsReadOutOfEachDescription)
+TEST(A2bAdapter, TheSettledOffsetFromTheTipPivotToTheToolIsReadOutOfEachDescription)
 {
   // `y_n` is the tip pivot K5 and `crane_msgs/PlanMotion::goal` is the tool, so
-  // the adapter needs the distance between them -- and the PZS100's rail gripper
-  // and the 7040's jaw do not hang the same one, which is why it is read rather
-  // than written down.
+  // the adapter needs the vector between them. The 7040's asymmetric mass makes
+  // that vector measurably horizontal even with an empty gripper, which is why
+  // it is read in 3D rather than reduced to a vertical drop.
   for (const auto & machine : crane_planning_test::machines()) {
     const crane_model::Model model = crane_planning_test::build_model(machine);
-    double drop = 0.0;
-    std::string why;
-    ASSERT_TRUE(crane_planning::tip_to_tcp_drop(model, drop, why)) << machine.name << ": " << why;
-    EXPECT_GT(drop, 0.0) << machine.name;
-    EXPECT_LT(drop, 5.0) << machine.name << ": " << drop << " m is not a tool, it is an arm";
+    for (const double phi_z : {0.0, 0.7, -1.1}) {
+      Eigen::Vector3d offset;
+      std::string why;
+      ASSERT_TRUE(
+        crane_planning::tip_to_tcp_offset(
+          model, crane_planning_test::empty_gripper(), phi_z, machine.q8, offset, why))
+        << machine.name << ": " << why;
+      EXPECT_GT(offset.norm(), 0.0) << machine.name;
+      EXPECT_LT(offset.norm(), 5.0) << machine.name << ": " << offset.norm()
+                                    << " m is not a tool, it is an arm";
 
-    // And the drop really is a *drop*: at rest the tool hangs under the pivot, so
-    // reducing the offset to its vertical part is exact rather than convenient.
-    // A payload whose centre of mass is off the tool axis tilts the pendulum and
-    // this stops holding -- which is the limitation `a2b_adapter.hpp` states.
-    const crane_model::Q q = crane_planning_test::settled(model, crane_model::QA::Zero());
-    auto tip =
-      model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tip);
-    auto tcp =
-      model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
-    ASSERT_TRUE(tip.ok() && tcp.ok()) << machine.name;
-    const Eigen::Vector3d offset = tcp.value().position_m - tip.value().position_m;
-    EXPECT_LT(offset.head<2>().norm(), 1.0e-6) << machine.name << ": the empty tool hangs "
-                                               << offset.head<2>().norm() << " m off vertical";
-    EXPECT_NEAR(-offset.z(), drop, 1.0e-12) << machine.name;
+      crane_model::QA canonical_q_a = crane_model::QA::Zero();
+      canonical_q_a[5] = machine.q8;
+      auto canonical_equilibrium =
+        model.passive_equilibrium(canonical_q_a, crane_planning_test::empty_gripper());
+      ASSERT_TRUE(canonical_equilibrium.ok()) << machine.name;
+      crane_model::Q canonical_q = crane_model::Q::Zero();
+      canonical_q[7] = machine.q8;
+      canonical_q.segment<2>(4) = canonical_equilibrium.value();
+      auto canonical_tcp = model.forward_kinematics(
+        canonical_q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+      ASSERT_TRUE(canonical_tcp.ok()) << machine.name;
+
+      crane_model::QA q_a = crane_model::QA::Zero();
+      q_a[5] = machine.q8;
+      q_a[0] = std::remainder(
+        phi_z - crane_planning::phi_z_of(canonical_tcp.value().orientation), 2.0 * M_PI);
+      auto equilibrium = model.passive_equilibrium(q_a, crane_planning_test::empty_gripper());
+      ASSERT_TRUE(equilibrium.ok()) << machine.name << ": " << equilibrium.status().message;
+      crane_model::Q q = crane_model::Q::Zero();
+      q[0] = q_a[0];
+      q[7] = machine.q8;
+      q.segment<2>(4) = equilibrium.value();
+      auto tip =
+        model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tip);
+      auto tcp =
+        model.forward_kinematics(q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+      ASSERT_TRUE(tip.ok() && tcp.ok()) << machine.name;
+      EXPECT_TRUE(offset.isApprox(tcp.value().position_m - tip.value().position_m, 1.0e-12))
+        << machine.name << ": " << offset.transpose();
+      EXPECT_NEAR(crane_planning::phi_z_of(tcp.value().orientation), phi_z, 1.0e-12)
+        << machine.name;
+    }
   }
 }
 
@@ -167,16 +190,16 @@ TEST(A2bAdapter, TheTimberBehaviourTreesRequestTranslatesFieldForField)
 {
   PlanMotion::Request plan;
   std::string why;
-  ASSERT_TRUE(crane_planning::translate_a2b_request(timber_request(), kDrop, plan, why)) << why;
+  ASSERT_TRUE(crane_planning::translate_a2b_request(timber_request(), kOffset, plan, why)) << why;
 
   // The frame `CalcMovement` has no field for, asserted and not converted:
   // ROS 2 Interfaces 4's two conversion sites stay two.
   EXPECT_EQ(plan.goal.header.frame_id, std::string(crane_planning::kPlanningFrame));
 
-  // `y_n` is the tip pivot; the goal is the tool, one drop below it.
-  EXPECT_DOUBLE_EQ(plan.goal.pose.position.x, 4.2);
-  EXPECT_DOUBLE_EQ(plan.goal.pose.position.y, 1.1);
-  EXPECT_DOUBLE_EQ(plan.goal.pose.position.z, 3.4 - kDrop);
+  // `y_n` is the tip pivot; the goal is the tool at the full settled 3D offset.
+  EXPECT_DOUBLE_EQ(plan.goal.pose.position.x, 4.2 + kOffset.x());
+  EXPECT_DOUBLE_EQ(plan.goal.pose.position.y, 1.1 + kOffset.y());
+  EXPECT_DOUBLE_EQ(plan.goal.pose.position.z, 3.4 + kOffset.z());
 
   // phi_z about K0's z, scalar-last on the wire and scalar-first in Eigen.
   const Eigen::Quaterniond orientation(
@@ -199,14 +222,14 @@ TEST(A2bAdapter, TheDividerBecomesAFactorAndABelowOneDividerIsRefused)
   request.slow_down = 4.0;
   PlanMotion::Request plan;
   std::string why;
-  ASSERT_TRUE(crane_planning::translate_a2b_request(request, kDrop, plan, why)) << why;
+  ASSERT_TRUE(crane_planning::translate_a2b_request(request, kOffset, plan, why)) << why;
   EXPECT_DOUBLE_EQ(plan.speed_scale, 0.25);
 
   // kappa is the deployment's reservation (trajectory_planning 5.5) and a
   // divider below one asks to spend it.
   for (const double slow_down : {0.5, 0.0, -1.0}) {
     request.slow_down = slow_down;
-    EXPECT_FALSE(crane_planning::translate_a2b_request(request, kDrop, plan, why)) << slow_down;
+    EXPECT_FALSE(crane_planning::translate_a2b_request(request, kOffset, plan, why)) << slow_down;
     EXPECT_NE(why.find("slow_down"), std::string::npos) << why;
   }
 }
@@ -221,7 +244,7 @@ TEST(A2bAdapter, ACylinderOnTheAdapterPathStaysACylinderAndABlockOnTheNativePath
   PlanMotion::Request plan;
   std::string why;
   ASSERT_TRUE(
-    crane_planning::translate_a2b_request(timber_carrying_request(), kDrop, plan, why)) << why;
+    crane_planning::translate_a2b_request(timber_carrying_request(), kOffset, plan, why)) << why;
   EXPECT_EQ(plan.payload.shape, crane_msgs::msg::Payload::SHAPE_CYLINDER);
   // `dimensions` is the extent per axis of the primitive's own frame
   // (ROS 2 Interfaces 6): (2r, 2r, length), never a radius in the first entry.
@@ -270,7 +293,7 @@ TEST(A2bAdapter, ATaperedLogBecomesTheEnclosingCylinderAndNotTheLegacyMean)
 
   PlanMotion::Request plan;
   std::string why;
-  ASSERT_TRUE(crane_planning::translate_a2b_request(request, kDrop, plan, why)) << why;
+  ASSERT_TRUE(crane_planning::translate_a2b_request(request, kOffset, plan, why)) << why;
   EXPECT_NEAR(plan.payload.dimensions.x, 0.4, 1.0e-6);
   EXPECT_NEAR(plan.payload.dimensions.y, 0.4, 1.0e-6);
   EXPECT_NEAR(plan.payload.mass, timber_carrying_request().m_log, 1.0e-9);
@@ -285,14 +308,14 @@ TEST(A2bAdapter, TwoDifferentBodiesAreRefusedNamingBothFields)
   // and there is one `crane_msgs/Payload` for both.
   CalcMovement::Request shapes = timber_carrying_request();
   shapes.coll_shape.length = 2.0F;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(shapes, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(shapes, kOffset, plan, why));
   EXPECT_NE(why.find("log_carrying"), std::string::npos) << why;
   EXPECT_NE(why.find("coll_shape"), std::string::npos) << why;
 
   // ...and one `com` for the centre of mass and the collision body's centre.
   CalcMovement::Request centres = timber_carrying_request();
   centres.p_cyl_8.x = centres.s_log_8.x + 0.2;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(centres, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(centres, kOffset, plan, why));
   EXPECT_NE(why.find("s_log_8"), std::string::npos) << why;
   EXPECT_NE(why.find("p_cyl_8"), std::string::npos) << why;
 }
@@ -304,13 +327,13 @@ TEST(A2bAdapter, ACarriedLogWithNoShapeOrNoMassIsRefusedRatherThanGuessed)
 
   CalcMovement::Request massless = timber_carrying_request();
   massless.m_log = 0.0;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(massless, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(massless, kOffset, plan, why));
   EXPECT_NE(why.find("m_log"), std::string::npos) << why;
 
   CalcMovement::Request shapeless = timber_carrying_request();
   shapeless.log_carrying.length = 0.0F;
   shapeless.coll_shape = shapeless.log_carrying;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(shapeless, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(shapeless, kOffset, plan, why));
   EXPECT_NE(why.find("log_carrying"), std::string::npos) << why;
 }
 
@@ -323,71 +346,83 @@ TEST(A2bAdapter, AFieldWithNoNativeEquivalentIsRefusedNamingIt)
   // own, and dropping the ones it carries would plan through them.
   CalcMovement::Request scene = timber_request();
   scene.logs_scene.emplace_back();
-  EXPECT_FALSE(crane_planning::translate_a2b_request(scene, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(scene, kOffset, plan, why));
   EXPECT_NE(why.find("logs_scene"), std::string::npos) << why;
 
   // The OCP of trajectory_planning 5.2 derives the duration.
   CalcMovement::Request fixed_time = timber_request();
   fixed_time.t_end = 12.0;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(fixed_time, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(fixed_time, kOffset, plan, why));
   EXPECT_NE(why.find("t_end"), std::string::npos) << why;
 
   // 5.4's terminal condition brings the tool to rest hanging still.
   CalcMovement::Request moving_end = timber_request();
   moving_end.v_d_tip = {0.0, 0.0, 0.4};
-  EXPECT_FALSE(crane_planning::translate_a2b_request(moving_end, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(moving_end, kOffset, plan, why));
   EXPECT_NE(why.find("v_d_tip"), std::string::npos) << why;
 
   // Checking the gripper but not the log it holds is not a question this
   // planner's one `avoid_collisions` can be asked.
   CalcMovement::Request mixed = timber_carrying_request();
   mixed.check_log_collision = false;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(mixed, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(mixed, kOffset, plan, why));
   EXPECT_NE(why.find("check_log_collision"), std::string::npos) << why;
   EXPECT_NE(why.find("check_gripper_collision"), std::string::npos) << why;
 
   // And a goal that is not four finite numbers is not a goal.
   CalcMovement::Request nowhere = timber_request();
   nowhere.y_n.z = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_FALSE(crane_planning::translate_a2b_request(nowhere, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(nowhere, kOffset, plan, why));
   EXPECT_NE(why.find("y_n"), std::string::npos) << why;
 }
 
-TEST(A2bAdapter, TheFeasibilityCheckersPinnedStartIsRefusedNamingQ0)
+TEST(A2bAdapter, TheFeasibilityCheckersPinnedStartMapsAllEightCanonicalRows)
 {
   // `check_pose_feasibility.py` probes reachability from a canned configuration
-  // rather than from where the machine is. `wiki/trajectory_planning.md` 7 makes
-  // the start `(q, dq)` **as measured** and `crane_msgs/PlanMotion` has no field
-  // for a hypothetical one, so this is refused naming the field rather than
-  // answered for a crane that is somewhere else.
+  // rather than from where the machine is. The retained field maps onto the same
+  // internal MeasuredStart the native service fills from topics, so the checker
+  // keeps working without weakening the native service's measured-start rule.
+  const CalcMovement::Request pinned = feasibility_request();
+  std::optional<crane_planning::MeasuredStart> start;
   PlanMotion::Request plan;
   std::string why;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(feasibility_request(), kDrop, plan, why));
-  EXPECT_NE(why.find("q0"), std::string::npos) << why;
-  EXPECT_NE(why.find("/joint_states"), std::string::npos) << why;
+  ASSERT_TRUE(crane_planning::translate_a2b_start(pinned, start, why)) << why;
+  ASSERT_TRUE(start.has_value());
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    EXPECT_DOUBLE_EQ(
+      start->q_a[static_cast<Eigen::Index>(row)], pinned.q0[crane_planning::kActuatedRows[row]]);
+    EXPECT_DOUBLE_EQ(start->dq_a[static_cast<Eigen::Index>(row)], 0.0);
+  }
+  EXPECT_TRUE(start->passive.measured);
+  EXPECT_DOUBLE_EQ(start->passive.q_u[0], pinned.q0[4]);
+  EXPECT_DOUBLE_EQ(start->passive.q_u[1], pinned.q0[5]);
+  ASSERT_TRUE(crane_planning::translate_a2b_request(pinned, kOffset, plan, why)) << why;
 
-  // With the pin removed it is a well-formed request, and the mixed collision
-  // flags it also sends are *not* a refusal: with an open gripper there is no log
-  // to check, so `check_log_collision` says nothing and the gripper's flag is the
-  // one that decides.
+  // With the pin removed, the all-zero default selects the live measured start.
+  // The mixed collision flags are not a refusal either: with an open gripper
+  // there is no log to check, so the gripper's flag is the one that decides.
   CalcMovement::Request measured = feasibility_request();
   measured.q0 = {};
-  ASSERT_TRUE(crane_planning::translate_a2b_request(measured, kDrop, plan, why)) << why;
+  ASSERT_TRUE(crane_planning::translate_a2b_start(measured, start, why)) << why;
+  EXPECT_FALSE(start.has_value());
+  ASSERT_TRUE(crane_planning::translate_a2b_request(measured, kOffset, plan, why)) << why;
   EXPECT_TRUE(plan.avoid_collisions);
   EXPECT_EQ(plan.payload.shape, crane_msgs::msg::Payload::SHAPE_NONE);
 
   CalcMovement::Request rates = feasibility_request();
   rates.q0 = {};
   rates.q0_dot[2] = 0.1;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(rates, kDrop, plan, why));
+  EXPECT_FALSE(crane_planning::translate_a2b_request(rates, kOffset, plan, why));
   EXPECT_NE(why.find("q0_dot"), std::string::npos) << why;
 }
 
-TEST(A2bAdapter, ADropThatWasNeverReadIsARefusalAndNotAGoalOnThePivot)
+TEST(A2bAdapter, AnOffsetThatWasNeverReadIsARefusalAndNotAGoalOnThePivot)
 {
   PlanMotion::Request plan;
   std::string why;
-  EXPECT_FALSE(crane_planning::translate_a2b_request(timber_request(), 0.0, plan, why));
+  EXPECT_FALSE(
+    crane_planning::translate_a2b_request(
+      timber_request(), Eigen::Vector3d::Zero(), plan, why));
   EXPECT_NE(why.find("y_n"), std::string::npos) << why;
 }
 

@@ -358,10 +358,10 @@ if(BUILD_TESTING)
   # S5 as well, and offline: the `a2b_movement` adapter of ROS 2 Interfaces §9,
   # field by field in both directions. No node, no clock, no graph -- the two
   # translations are message in, message out, and the one thing they read off the
-  # machine is the drop from the tip pivot to the tool, which comes out of the two
-  # checked-in descriptions. Cheap: nothing here plans, because what is under test
-  # is what the planner is *asked*, and `test_plan_motion_service.cpp` is where
-  # the served row is.
+  # machine is the settled 3D offset from the tip pivot to the tool, which comes
+  # out of the two checked-in descriptions. Cheap: nothing here plans, because
+  # what is under test is what the planner is *asked*, and
+  # `test_plan_motion_service.cpp` is where the served row is.
   ament_add_gtest(test_a2b_adapter test/test_a2b_adapter.cpp TIMEOUT 300)
   target_link_libraries(test_a2b_adapter
     planner_node

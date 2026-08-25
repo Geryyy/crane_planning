@@ -1,9 +1,11 @@
 # crane_planning
 
 The `crane_planner` node of `wiki/implementation/ros2_interfaces.md` §2: it
-serves `/crane/plan_motion` and `/crane/plan_grip` and publishes the trajectory
-it answered with on `/crane/reference`. §10 keeps the two services separate while
-the tested task layer migrates, and they are one node, one model and one clock.
+serves `/crane/plan_motion`, `/crane/plan_grip` and the retained
+`/a2b_movement` compatibility service, and publishes the trajectory it answered
+with on `/crane/reference`. They are one node, one model and one clock;
+`/a2b_movement` translates into the same internal planning path rather than
+owning another planner.
 
 It grew out of the **slice-5 tracer bullet** of `docs/features/cbs-arch/prd.md`
 §2 — one goal pose in, one timed joint trajectory out, through a real node and a
@@ -45,6 +47,7 @@ package is that every remaining absence is *refused or named*, never approximate
 | an unmeasured sway | `passive_estimate_policy`: refused by name, or planned inside a reduced box with the reserve stated |
 | latency | §7's bound, `latency_budget`, charged stage by stage **inside** the planner and not in a caller's timeout |
 | an overrun | the previous trajectory keeps standing on `/crane/reference`, and the answer says which one it is |
+| retained timber motion | `/a2b_movement`: `CalcMovement` translated into the same native planning call and translated back |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
 parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
@@ -341,7 +344,8 @@ pair blocked and where.
 - **Deciding *when* to re-plan is not this node's.** Replanning *from* a moving
   and swinging start is, and it is below; the trigger — a stall, a tracking
   fault, a new goal — belongs to `crane_supervisor` and the task layer, and this
-  service answers requests. The `a2b_movement` adapter is **issue 046**.
+  service answers requests. The retained `/a2b_movement` row below is another
+  way to ask that same planning path, not another trigger or owner.
 
 ## κ is not `speed_scale`
 
@@ -526,6 +530,50 @@ actually runs and it is the one the tests spend their assertions on.
 `crane_supervisor` — which owns `FAULT_TRACKING` since issue 024 — and to the task
 layer. This node answers requests.
 
+## `/a2b_movement`: retained wire, native planner
+
+`timber_crane_planning_interfaces/CalcMovement` remains at the absolute
+`/a2b_movement` name used by the timber behaviour tree, RViz panel and
+concrete-block feasibility checker. It is a service on this node, not a new
+executable: the callback translates into `crane_msgs/PlanMotion`, enters the
+same private planning call as `/crane/plan_motion`, and translates the answer.
+The model, limits, scene, timing, latency ledger and `/crane/reference`
+publication consequently still have one owner.
+
+The full field table lives at ROS 2 Interfaces §9 and beside
+`translate_a2b_request()`. The boundary rules that matter operationally are:
+
+- Callers already supply `y_n`, the K5 tip pivot, in `K0_mounting_base`.
+  `CalcMovement` has no frame field, so the adapter asserts K0 and adds the full
+  settled K5-to-TCP vector read from the active description for the requested
+  payload, yaw and `q8`. This is a three-dimensional vector on the 7040, not a
+  configured vertical drop.
+- A carried `wood_log_msgs/LogShape` becomes an enclosing
+  `crane_msgs/Payload` cylinder. The native path never sees `LogShape`, so a
+  native box remains `SHAPE_BOX`. Two different retained mass/collision shapes
+  or centres are refused because one native payload cannot express them.
+- `slow_down` becomes `1 / speed_scale`; the two collision flags become the one
+  native flag when they agree. A filled canonical `q0`/`q0_dot` becomes an
+  explicit internal start for the feasibility caller, while the all-zero
+  service default keeps the measured-start path.
+- Non-zero `t_end` or terminal `v_d_tip`, a non-empty `logs_scene`, rates without
+  positions, and every non-finite or otherwise unexpressible value are refused
+  with the field named in the node log. The retained response has no message
+  field, so failed calls return `success=false` with an empty trajectory rather
+  than disguising the standing native trajectory as a new answer.
+
+Both response `success` fields used here are `bool`; the retained service whose
+field is `int64` is `CalcGripMovement`, which this adapter does not serve. The
+dependencies on `timber_crane_planning_interfaces` and `wood_log_msgs` are
+retained-tree message packages, not another planning or runtime library.
+
+Do not run this adapter and the legacy `timber_crane_motion_planning` server on
+the same DDS graph under the same name. ROS 2 permits duplicate service servers
+and distributes requests between them, so callers can alternate between two
+implementations. CBS profiles own this server; a graph joined to a retained
+timber profile must omit or remap one of them until issue 047 retires the legacy
+server.
+
 ## `/crane/plan_grip`: four phases, one clock
 
 `crane_msgs/PlanGrip` is frozen at four phases — `PHASE_DESCEND`, `PHASE_CLOSE`,
@@ -614,7 +662,9 @@ reading these sources.
     include/crane_planning/tool_axis.hpp           §8's retained grip cosine, on the arm's clock
     include/crane_planning/plan_grip.hpp           the four phases of crane_msgs/PlanGrip
     include/crane_planning/replanning.hpp          §7's measured start, and its latency ledger
+    include/crane_planning/a2b_adapter.hpp          retained CalcMovement mapped field by field
     src/acados_casadi_bridge.hpp                   where acados meets CasADi; not installed
+    src/a2b_adapter.cpp                            the compatibility translation, no planning
     config/hydraulic_limits.yaml                   Q_P^max and the relief setting, with their evidence
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free
     include/crane_planning/planner_node.hpp        the adapter
