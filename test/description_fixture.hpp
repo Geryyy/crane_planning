@@ -16,7 +16,10 @@
 #include <utility>
 #include <vector>
 
+#include <algorithm>
+
 #include "crane_model/model.hpp"
+#include "crane_planning/joint_limits.hpp"
 #include "crane_planning/planner_core.hpp"
 
 namespace crane_planning_test
@@ -81,6 +84,60 @@ inline crane_model::Payload empty_gripper()
   payload.center_of_mass_k8_m.setZero();
   payload.inertia_k8_kg_m2.setZero();
   return payload;
+}
+
+/// The middle of every bounded actuated range, which both descriptions allow.
+/**
+ * The configuration offline tests start from, and deliberately **not** every
+ * joint at zero. At zero the PZS100's rail gripper lies against the arm and the
+ * inner telescope -- 034 measured 25 mm at the neutral pose and the primitives
+ * are single enclosing boxes -- so a path from there is refused by a working
+ * self-collision check. That refusal is the check doing its job; a test that is
+ * about something else should not start where it fires.
+ */
+inline crane_model::QA centred(const crane_planning::JointLimits & limits, const Machine & machine)
+{
+  crane_model::QA q_a = crane_model::QA::Zero();
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    q_a[static_cast<Eigen::Index>(row)] =
+      limits.axis[row].bounded ? limits.axis[row].centre() : 0.0;
+  }
+  q_a[static_cast<Eigen::Index>(crane_planning::kToolRow)] = machine.q8;
+  return q_a;
+}
+
+/// A move worth checking: slew across, drop the boom, extend a little.
+inline crane_model::QA moved(
+  const crane_model::QA & start, const crane_planning::JointLimits & limits)
+{
+  crane_model::QA goal = start;
+  const auto shift = [&limits](crane_model::QA & q_a, std::size_t row, double by) {
+      const Eigen::Index axis = static_cast<Eigen::Index>(row);
+      q_a[axis] += by;
+      if (limits.axis[row].bounded) {
+        q_a[axis] = std::min(limits.axis[row].upper, std::max(limits.axis[row].lower, q_a[axis]));
+      }
+    };
+  shift(goal, 0, 0.7);
+  shift(goal, 1, -0.15);
+  shift(goal, 3, 0.2);
+  return goal;
+}
+
+/// The canonical eight of one actuated configuration, with the tool hanging.
+inline crane_model::Q settled(const crane_model::Model & model, const crane_model::QA & q_a)
+{
+  auto equilibrium = model.passive_equilibrium(q_a, empty_gripper());
+  if (!equilibrium.ok()) {
+    throw std::runtime_error(equilibrium.status().message);
+  }
+  crane_model::Q q = crane_model::Q::Zero();
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
+      q_a[static_cast<Eigen::Index>(row)];
+  }
+  q.segment<2>(4) = equilibrium.value();
+  return q;
 }
 
 inline crane_planning::PlannerContext build_context(

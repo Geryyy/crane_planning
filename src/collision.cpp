@@ -148,6 +148,21 @@ struct Worst
   bool colliding{false};
 };
 
+/// The worst of the first `limit` answers -- `collision_queries` puts the scene
+/// primitives first, in order, and the checked self pairs after them.
+Worst worst_of(const std::vector<CollisionResult> & results, std::size_t limit)
+{
+  Worst worst;
+  for (std::size_t index = 0; index < std::min(limit, results.size()); ++index) {
+    if (results[index].minimum_distance_m < worst.distance) {
+      worst.distance = results[index].minimum_distance_m;
+      worst.index = index;
+    }
+    worst.colliding = worst.colliding || results[index].collision;
+  }
+  return worst;
+}
+
 Worst worst_of(const std::vector<CollisionResult> & results)
 {
   Worst worst;
@@ -405,10 +420,27 @@ crane_model::Result<ConfigurationCheck> check_configuration(
     return Result<ConfigurationCheck>::success(std::move(check));
   }
 
-  // 4.3's envelope, used as the sufficient condition it is: nothing can be
-  // reached by a tool that moves at most `Delta_sway` from where it hangs if
-  // everything is already further away than that.
-  if (worst.distance > check.sway_clearance_m) {
+  // **The envelope covers the scene. The crane's own link pairs are judged at
+  // the pose the tool hangs at, and only there.**
+  //
+  // This is a decision and not an oversight. The tool hangs on the two passive
+  // joints and swings *relative to the crane*, so a swung self query is a real
+  // one -- but on the PZS100 the rail gripper sits 25 mm from the inner
+  // telescope at rest (034, measured) and 0.2 rad of sway closes that gap at
+  // every configuration with the boom up. Refusing on it refuses every path,
+  // which is the failure 4.3's own warning describes, and refusing on a
+  // -0.4 mm result between a curved rail and a telescope is refusing on the
+  // error of a single enclosing box (034's *left undone*).
+  //
+  // It is also a refusal that says nothing actionable: how close the tool comes
+  // to the telescope when it swings is a property of `q_a` and the sway bound
+  // alone, so no reachable path improves it and there is nothing for a caller or
+  // an operator to do with the answer. What that clearance really constrains is
+  // `q_u^+` itself, which is `mpc` 3's to impose and the virtual working cell's
+  // to bound -- and the sway envelope's whole purpose here is that the *scene*
+  // be cleared for a tool that swings.
+  const Worst scene_worst = worst_of(results, nominal_scene.primitives.size());
+  if (scene_worst.distance > check.sway_clearance_m) {
     return Result<ConfigurationCheck>::success(std::move(check));
   }
   if (!(check.sway_clearance_m > 0.0)) {
@@ -474,7 +506,7 @@ crane_model::Result<ConfigurationCheck> check_configuration(
       }
       ++check.sway_samples;
 
-      const Worst swung_worst = worst_of(answer.value());
+      const Worst swung_worst = worst_of(answer.value(), at_pose.primitives.size());
       if (swung_worst.colliding) {
         check.clear = false;
         check.blocker =

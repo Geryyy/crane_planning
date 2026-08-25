@@ -157,15 +157,37 @@ protected:
   }
 
   /// Publish one `/joint_states` and let the planner take delivery of it.
-  void publish_start()
+  void publish_start() {publish_start(start_positions());}
+
+  void publish_start(const std::vector<double> & positions)
   {
     JointState joints;
     joints.header.stamp = client_node_->now();
     joints.name.assign(
       model_->urdf_joint_names().begin(), model_->urdf_joint_names().end());
-    joints.position = start_positions();
+    joints.position = positions;
     start_stamp_ = joints.header.stamp;
     joint_states_->publish(joints);
+  }
+
+  /// The description's own limits, which the planner reads from the same XML.
+  crane_planning::JointLimits fixture_limits() const
+  {
+    auto limits = crane_planning::read_joint_limits(
+      fixture_description(), model_->urdf_joint_names());
+    EXPECT_TRUE(limits.ok()) << limits.status().message;
+    return std::move(limits).value();
+  }
+
+  /// One actuated configuration as the eight positions `/joint_states` carries.
+  static std::vector<double> positions_of(const crane_model::QA & q_a)
+  {
+    std::vector<double> positions(
+      crane_model::kActuatedDof + crane_model::kPassiveDof, 0.0);
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      positions[crane_planning::kActuatedRows[row]] = q_a[static_cast<Eigen::Index>(row)];
+    }
+    return positions;
   }
 
   /// A pose the arm certainly reaches, produced by forward kinematics.
@@ -318,9 +340,19 @@ TEST_F(PlanMotionService, ASubscribedSceneBecomesTheTruckOfTrajectoryPlanningFou
   truck.dimensions.z = 1.2;
   scene.primitives.push_back(truck);
   collision_scene_->publish(scene);
-  publish_start();
+
+  // A start and a goal in the middle of the machine's own ranges. The
+  // collision-blind fixture the other tests use starts with the boom low and the
+  // arm folded well in, where the rail gripper is close enough to the inner
+  // telescope that 0.2 rad of sway lays one against the other -- a refusal the
+  // self check is right to make and this test is not about.
+  const crane_planning::JointLimits limits = fixture_limits();
+  const crane_model::QA start =
+    crane_planning_test::centred(limits, crane_planning_test::machines().front());
+  publish_start(positions_of(start));
 
   auto request = collision_blind_request();
+  request->goal = reachable_goal(crane_planning_test::moved(start, limits));
   request->avoid_collisions = true;
   const auto response = call(request);
   ASSERT_NE(response, nullptr);

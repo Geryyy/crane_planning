@@ -36,49 +36,9 @@ using crane_planning::PayloadShape;
 using crane_planning::TruckModel;
 using crane_planning_test::Machine;
 
-/// The middle of every bounded actuated range, which both descriptions allow.
-crane_model::QA centred(const JointLimits & limits, const Machine & machine)
-{
-  crane_model::QA q_a = crane_model::QA::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] =
-      limits.axis[row].bounded ? limits.axis[row].centre() : 0.0;
-  }
-  q_a[static_cast<Eigen::Index>(crane_planning::kToolRow)] = machine.q8;
-  return q_a;
-}
-
-crane_model::Q settled(const crane_model::Model & model, const crane_model::QA & q_a)
-{
-  auto equilibrium = model.passive_equilibrium(q_a, crane_planning_test::empty_gripper());
-  if (!equilibrium.ok()) {
-    throw std::runtime_error(equilibrium.status().message);
-  }
-  crane_model::Q q = crane_model::Q::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-      q_a[static_cast<Eigen::Index>(row)];
-  }
-  q.segment<2>(4) = equilibrium.value();
-  return q;
-}
-
-/// A move worth checking: slew across, drop the boom, extend a little.
-crane_model::QA moved(const crane_model::QA & start, const JointLimits & limits)
-{
-  crane_model::QA goal = start;
-  const auto shift = [&limits](crane_model::QA & q_a, std::size_t row, double by) {
-      const Eigen::Index axis = static_cast<Eigen::Index>(row);
-      q_a[axis] += by;
-      if (limits.axis[row].bounded) {
-        q_a[axis] = std::min(limits.axis[row].upper, std::max(limits.axis[row].lower, q_a[axis]));
-      }
-    };
-  shift(goal, 0, 0.7);
-  shift(goal, 1, -0.15);
-  shift(goal, 3, 0.2);
-  return goal;
-}
+using crane_planning_test::centred;
+using crane_planning_test::moved;
+using crane_planning_test::settled;
 
 /// One machine, its context, and one collision-blind path over it.
 /**
@@ -378,30 +338,78 @@ TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
     const Machine & machine = crane_planning_test::machines()[index];
     const Scenario & fixture = scenario(index);
 
-    // A junction is checked whatever the uniform grid lands on, so the obstacle
-    // is placed at one: where the tool reaches when it swings to the corner of
-    // the envelope, and nowhere near where it hangs.
-    const double sigma = fixture.primitive.path.junction_sigmas().front();
-    const crane_model::Q hanging = configuration_at(fixture.model, fixture.primitive.path, sigma);
-
     CollisionSettings swinging = quick_settings();
     swinging.sway.q_sway_max = Eigen::Vector2d(0.2, 0.2);
 
+    // A junction is checked whatever the uniform grid lands on, so the obstacle
+    // goes at one -- but at a junction where the tool may actually swing, which
+    // is the machine's answer and not a coordinate written down here. The tool
+    // is on the crane's own allowed-collision list too, and a junction where
+    // 0.2 rad of sway lays the rail against the telescope would be refused by
+    // the self check before any obstacle was reached.
+    double sigma = -1.0;
+    for (const double candidate : fixture.primitive.path.junction_sigmas()) {
+      const crane_model::Q pose =
+        configuration_at(fixture.model, fixture.primitive.path, candidate);
+      auto unobstructed = crane_planning::check_configuration(
+        fixture.model, crane_model::CollisionScene{}, PayloadShape{}, swinging, pose, 0.1);
+      ASSERT_TRUE(unobstructed.ok()) << machine.name << ": " << unobstructed.status().message;
+      if (unobstructed.value().clear) {
+        sigma = candidate;
+        break;
+      }
+    }
+    ASSERT_GE(sigma, 0.0) << machine.name <<
+      ": no junction on this path where the tool may swing to the corner of the envelope "
+      "without meeting the crane itself";
+
+    const crane_model::Q hanging = configuration_at(fixture.model, fixture.primitive.path, sigma);
     crane_model::Q swung = hanging;
     swung.segment<2>(4) += swinging.sway.q_sway_max;
-    const Eigen::Vector3d reached = tcp_of(fixture.model, swung);
-    ASSERT_GT((reached - tcp_of(fixture.model, hanging)).norm(), 0.05) << machine.name;
+    const Eigen::Vector3d still_tcp = tcp_of(fixture.model, hanging);
+    const Eigen::Vector3d travel = tcp_of(fixture.model, swung) - still_tcp;
+    ASSERT_GT(travel.norm(), 0.05) << machine.name;
 
-    const crane_model::CollisionScene scene = scene_of({box_at("swing_target", reached, 0.20)});
+    // The tool's own primitive reaches well past the TCP, so a box *at* the
+    // swung TCP is not by itself outside the hanging tool. Push it along the ray
+    // the tool swings on until the hanging tool clears it, and let the geometry
+    // say where that is. The window between "the still tool clears it" and "the
+    // swung tool does not" is exactly the tool's travel wide, so a step finer
+    // than the travel lands inside it.
+    crane_model::CollisionScene scene;
+    bool placed = false;
+    std::size_t path_checks = 0;
+    for (double reach = 0.2 * travel.norm(); reach < 12.0 * travel.norm();
+      reach += 0.2 * travel.norm())
+    {
+      crane_model::CollisionScene candidate = scene_of(
+        {box_at("swing_target", still_tcp + travel.normalized() * reach, 0.20)});
 
-    // Still: the tool hangs, the box is where the tool is not, and the path is
-    // accepted.
-    auto still = crane_planning::check_path(
-      fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
-      PayloadShape{}, quick_settings());
-    ASSERT_TRUE(still.ok()) << machine.name << ": " << still.status().message;
-    EXPECT_TRUE(still.value().clear) << machine.name << ": " <<
-      crane_planning::describe(still.value());
+      // The cheap half first. A whole path costs seconds and the junction is
+      // where the box was placed, so a placement the tool does not clear *there*
+      // is not worth a path check.
+      auto here = crane_planning::check_configuration(
+        fixture.model, candidate, PayloadShape{}, quick_settings(), hanging, 0.1);
+      ASSERT_TRUE(here.ok()) << machine.name << ": " << here.status().message;
+      if (!here.value().clear) {
+        continue;
+      }
+      ASSERT_LT(path_checks, 4U) << machine.name <<
+        ": the junction clears this box but the rest of the path does not, four times over";
+      ++path_checks;
+
+      auto still = crane_planning::check_path(
+        fixture.model, fixture.primitive.path, candidate, crane_planning_test::empty_gripper(),
+        PayloadShape{}, quick_settings());
+      ASSERT_TRUE(still.ok()) << machine.name << ": " << still.status().message;
+      if (still.value().clear) {
+        scene = std::move(candidate);
+        placed = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(placed) << machine.name <<
+      ": no placement on the swing ray that the hanging tool clears";
 
     // Swinging, at the same q_u^+ the MPC is given: the same path is refused,
     // and the refusal says which sway pose found it.
@@ -436,7 +444,23 @@ TEST(SelfCollision, TheArmFoldedBackOverTheBoomIsRefusedAgainstAnEmptyScene)
     crane_model::QA folded = centred(fixture.context.limits, machine);
     ASSERT_TRUE(fixture.context.limits.axis[2].bounded) << machine.name;
     folded[2] = fixture.context.limits.axis[2].upper;
-    const crane_model::Q q = settled(fixture.model, folded);
+
+    // At the arm's own stop the description has **no hanging pose**: the passive
+    // pair reaches no equilibrium from inside the range it is given, which is
+    // one more measure of how far past the working range that stop is. The
+    // collision is between actuated links, so the passive pair does not enter
+    // it and the configuration is checked with the tool at its zero rather than
+    // at an equilibrium that does not exist.
+    crane_model::Q q = crane_model::Q::Zero();
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
+        folded[static_cast<Eigen::Index>(row)];
+    }
+    auto equilibrium =
+      fixture.model.passive_equilibrium(folded, crane_planning_test::empty_gripper());
+    if (equilibrium.ok()) {
+      q.segment<2>(4) = equilibrium.value();
+    }
 
     auto checked = crane_planning::check_configuration(
       fixture.model, crane_model::CollisionScene{}, PayloadShape{}, quick_settings(), q, 0.1);
@@ -453,9 +477,10 @@ TEST(SelfCollision, TheArmFoldedBackOverTheBoomIsRefusedAgainstAnEmptyScene)
 TEST(SelfCollision, TheNeutralConfigurationIsNotRefusedByTheSwayEnvelope)
 {
   // 034 measured 25 mm between the rail gripper and the inner telescope at the
-  // neutral configuration. A check that demanded Delta_sway of the crane's own
-  // link pairs would refuse that, which is why the envelope is resolved by
-  // querying at the sway poses and not by a margin on the self distance.
+  // neutral configuration. Neither demanding Delta_sway of that distance nor
+  // re-querying the crane against itself at every sway pose leaves the machine
+  // anywhere to move: the envelope covers the scene and the crane covers itself
+  // at the pose the tool hangs at. See `collision.hpp`.
   for (std::size_t index = 0; index < crane_planning_test::machines().size(); ++index) {
     const Machine & machine = crane_planning_test::machines()[index];
     const Scenario & fixture = scenario(index);
@@ -481,32 +506,50 @@ TEST(CarriedPayload, ItIsCheckedAsTheScenePrimitiveWithTheReservedId)
     const Scenario & fixture = scenario(index);
     const crane_model::Q q = settled(fixture.model, centred(fixture.context.limits, machine));
 
-    // Two metres under K8 is below anything the description hangs there, so an
-    // empty gripper clears a small box placed at it and a payload reaching that
-    // far does not.
+    // Two metres under K8 is below anything the description hangs there.
     PayloadShape shape;
     shape.declared = true;
     shape.shape = crane_model::CollisionShape::Box;
     shape.dimensions_m = Eigen::Vector3d(0.4, 0.4, 0.4);
     shape.center_k8_m = Eigen::Vector3d(0.0, 0.0, -2.0);
 
+    // Placed where the caller says it is: at the K8 pose read out of
+    // `forward_kinematics`, offset by the payload's own centre in K8. That
+    // placement is this package's half of 034's split and the assertion is
+    // against the model's own answer, not against a coordinate written here.
     auto placed = crane_planning::payload_primitive(fixture.model, q, shape);
     ASSERT_TRUE(placed.ok()) << machine.name << ": " << placed.status().message;
     EXPECT_EQ(placed.value().id, std::string(crane_planning::kPayloadId));
+    auto k8 = fixture.model.forward_kinematics(
+      q, crane_model::Frame::MountingBase, crane_model::Frame::RotatorLowerPart);
+    ASSERT_TRUE(k8.ok()) << machine.name << ": " << k8.status().message;
+    const Eigen::Vector3d expected =
+      k8.value().position_m + k8.value().orientation * shape.center_k8_m;
+    EXPECT_LT(
+      (placed.value().pose_in_mounting_base.translation() - expected).norm(), 1.0e-9)
+      << machine.name;
 
-    const crane_model::CollisionScene scene = scene_of(
-      {box_at("stack", placed.value().pose_in_mounting_base.translation(), 0.30)});
+    // And it is **checked**: a payload big enough to reach back up around the
+    // rotator meets the crane above the tool, where the empty gripper at the
+    // same configuration meets nothing. The bodies the rotator joint carries are
+    // excluded by the model, so what this finds is the arm and the telescope and
+    // never the tool the payload hangs from.
+    PayloadShape swollen = shape;
+    swollen.dimensions_m = Eigen::Vector3d::Constant(3.0);
+    swollen.center_k8_m = Eigen::Vector3d::Zero();
 
     auto empty = crane_planning::check_configuration(
-      fixture.model, scene, PayloadShape{}, quick_settings(), q, 0.1);
+      fixture.model, crane_model::CollisionScene{}, PayloadShape{}, quick_settings(), q, 0.1);
     ASSERT_TRUE(empty.ok()) << machine.name << ": " << empty.status().message;
     EXPECT_TRUE(empty.value().clear) << machine.name << ": " << empty.value().blocker.other_id;
 
     auto carried = crane_planning::check_configuration(
-      fixture.model, scene, shape, quick_settings(), q, 0.1);
+      fixture.model, crane_model::CollisionScene{}, swollen, quick_settings(), q, 0.1);
     ASSERT_TRUE(carried.ok()) << machine.name << ": " << carried.status().message;
     EXPECT_FALSE(carried.value().clear) << machine.name;
-    EXPECT_EQ(carried.value().blocker.other_id, "stack") << machine.name;
+    EXPECT_EQ(carried.value().blocker.other_id, std::string(crane_planning::kPayloadId))
+      << machine.name;
+    EXPECT_FALSE(carried.value().blocker.self) << machine.name;
 
     // And the payload lengthens the pendulum, so the envelope it is cleared over
     // is its own rather than the empty tool's.

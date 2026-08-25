@@ -59,6 +59,17 @@ bool shape_from_message(std::uint8_t shape, crane_model::CollisionShape & out)
   }
 }
 
+/// Every axis of a primitive's own frame carries a finite, positive extent.
+/**
+ * `dimensions` is the extent per axis and never a half-extent or a radius
+ * (`ros2_interfaces` 6), so a zero anywhere is a primitive with no thickness in
+ * that direction rather than a shorthand for something else.
+ */
+bool has_positive_extent(const Eigen::Vector3d & dimensions)
+{
+  return dimensions.allFinite() && (dimensions.array() > 0.0).all();
+}
+
 /// A `geometry_msgs/Pose` as the isometry the model's scene is expressed in.
 bool pose_from_message(const geometry_msgs::msg::Pose & pose, Eigen::Isometry3d & out)
 {
@@ -298,9 +309,7 @@ void PlannerNode::on_collision_scene(crane_msgs::msg::CollisionScene::ConstShare
         std::to_string(static_cast<int>(incoming.shape)) + ", which is none of the three";
     } else if (!pose_from_message(incoming.pose, primitive.pose_in_mounting_base)) {
       why = "primitive '" + incoming.id + "' does not carry a usable pose";
-    } else if (!primitive.dimensions_m.allFinite() ||
-      (primitive.dimensions_m.array() <= 0.0).any())
-    {
+    } else if (!has_positive_extent(primitive.dimensions_m)) {
       why = "primitive '" + incoming.id +
         "' has no positive extent along every axis of its own frame; dimensions are the extent "
         "per axis, so a box carries its three side lengths and a cylinder (2r, 2r, length)";
@@ -479,9 +488,7 @@ void PlannerNode::plan(
       RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
       return;
     }
-    if (!motion.payload_shape.dimensions_m.allFinite() ||
-      (motion.payload_shape.dimensions_m.array() <= 0.0).any())
-    {
+    if (!has_positive_extent(motion.payload_shape.dimensions_m)) {
       response.message = "a payload shape was declared with no positive extent along every axis; "
         "dimensions are the extent per axis, so a box carries its three side lengths and a "
         "cylinder (2r, 2r, length)";

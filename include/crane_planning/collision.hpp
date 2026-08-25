@@ -50,12 +50,34 @@
 //     every checked configuration along the path.
 //
 // So both ship, and each does the half it is good at. At every checked
-// configuration the nominal (hanging) pose is queried first. If the smallest
-// distance found anywhere exceeds `Delta_sway`, **no admissible sway can bring
-// anything into contact** -- that is 4.3's inflate-by-`Delta_sway` test, used as
-// a sufficient condition, and it settles the free-space majority in one query.
+// configuration the nominal (hanging) pose is queried first, against the scene
+// and the crane's own link pairs alike. If the smallest distance to the *scene*
+// then exceeds `Delta_sway`, **no admissible sway can bring the tool into
+// contact with it** -- that is 4.3's inflate-by-`Delta_sway` test, used as a
+// sufficient condition, and it settles the free-space majority in one query.
 // Only where it fails is the envelope gridded and queried exactly, at the
 // resolution below. The wiki page carries this and the reason for it; see 4.3.
+//
+// # The envelope covers the scene; the crane covers itself at the hanging pose
+//
+// Self-collision is checked at every configuration, and at the pose the tool
+// really hangs at. It is deliberately **not** re-checked at each sway pose, for
+// three reasons that all point the same way:
+//
+//   * The machine has no room for it. The PZS100's rail gripper sits 25 mm from
+//     the inner telescope at rest, and 0.2 rad of sway closes that at every
+//     configuration with the boom up. A planner that refuses on it refuses
+//     everything, which is the failure 4.3's own warning describes.
+//   * The geometry does not support it. One enclosing box per link is 034's
+//     *left undone*; a -0.4 mm result between a curved rail and a telescope is
+//     inside the fit's own error, not a collision anyone measured.
+//   * There is nothing to do with the answer. How close the tool comes to the
+//     crane when it swings is a property of `q_a` and the sway bound alone, so
+//     no reachable path improves it. What it really constrains is `q_u^+`, which
+//     is `mpc` 3's to impose and the virtual working cell's to bound.
+//
+// The sway envelope's purpose in 4.3 is that the *scene* be cleared for a tool
+// that swings, and that is exactly what it does here.
 //
 // # A stated resolution, and its relation to the smallest checked primitive
 //

@@ -141,10 +141,20 @@ TEST(PlanMotion, CollisionAvoidanceIsHonouredAndItsAbsenceIsSaidOutLoud)
   const crane_planning::PlannerContext context =
     crane_planning_test::build_context(model, machine);
 
+  // Start and goal in the middle of the machine's own ranges. This test used to
+  // start at every joint zero, where the PZS100's rail gripper lies against the
+  // arm: with a real self-collision check that path is refused, correctly, and
+  // this test is not about that.
+  const crane_model::QA start = crane_planning_test::centred(context.limits, machine);
+  const crane_model::Q goal =
+    crane_planning_test::settled(model, crane_planning_test::moved(start, context.limits));
+  auto goal_pose = model.forward_kinematics(
+    goal, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
+  ASSERT_TRUE(goal_pose.ok()) << goal_pose.status().message;
+
   crane_planning::MotionRequest request;
-  request.p_tcp_0 = Eigen::Vector3d(6.0, 0.0, 2.0);
-  request.q_a_start = crane_model::QA::Zero();
-  request.q_a_start[static_cast<Eigen::Index>(crane_planning::kToolRow)] = machine.q8;
+  request.p_tcp_0 = goal_pose.value().position_m;
+  request.q_a_start = start;
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = true;  // which is what the .srv defaults to
 

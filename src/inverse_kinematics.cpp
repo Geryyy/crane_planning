@@ -2,9 +2,6 @@
 
 #include <Eigen/Dense>
 
-#include "crane_planning/collision.hpp"
-#include "crane_planning/redundancy.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -12,6 +9,9 @@
 #include <limits>
 #include <string>
 #include <utility>
+
+#include "crane_planning/collision.hpp"
+#include "crane_planning/redundancy.hpp"
 
 namespace crane_planning
 {

@@ -51,34 +51,11 @@ JointLimits machine_limits(const crane_model::Model & model, const Machine & mac
   return std::move(limits).value();
 }
 
-/// A configuration in the middle of every axis' range, so it is in range by construction.
-crane_model::QA centred(const JointLimits & limits, const Machine & machine)
-{
-  crane_model::QA q_a = crane_model::QA::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] =
-      limits.axis[row].bounded ? limits.axis[row].centre() : 0.0;
-  }
-  q_a[static_cast<Eigen::Index>(crane_planning::kToolRow)] = machine.q8;
-  return q_a;
-}
-
-/// The same configuration as all eight coordinates, with the tool hanging where it hangs.
-crane_model::Q settled(const crane_model::Model & model, const crane_model::QA & q_a)
-{
-  auto equilibrium = model.passive_equilibrium(q_a, crane_planning_test::empty_gripper());
-  if (!equilibrium.ok()) {
-    throw std::runtime_error(equilibrium.status().message);
-  }
-  crane_model::Q q = crane_model::Q::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-      q_a[static_cast<Eigen::Index>(row)];
-  }
-  q[4] = equilibrium.value()[0];
-  q[5] = equilibrium.value()[1];
-  return q;
-}
+// The centred configuration, the move away from it and the hanging pose all live
+// in `description_fixture.hpp`, because every offline suite starts from the same
+// three and a second copy would be a second machine to keep current.
+using crane_planning_test::centred;
+using crane_planning_test::settled;
 
 PathVector path_of(const crane_model::Q & q)
 {
@@ -90,22 +67,7 @@ PathVector path_of(const crane_model::Q & q)
   return q_a;
 }
 
-/// A move the primitive should be able to cover: slew across and drop the boom a little.
-crane_model::QA moved(const crane_model::QA & start, const JointLimits & limits)
-{
-  crane_model::QA goal = start;
-  const auto shift = [&limits](crane_model::QA & q_a, std::size_t row, double by) {
-      const Eigen::Index axis = static_cast<Eigen::Index>(row);
-      q_a[axis] += by;
-      if (limits.axis[row].bounded) {
-        q_a[axis] = std::min(limits.axis[row].upper, std::max(limits.axis[row].lower, q_a[axis]));
-      }
-    };
-  shift(goal, 0, 0.7);   // slew
-  shift(goal, 1, -0.15);  // boom down a little, so the descend has something to descend
-  shift(goal, 3, 0.2);   // telescope out
-  return goal;
-}
+using crane_planning_test::moved;
 
 /// The primitive for one machine, from the centred configuration to `moved` of it.
 StructuredPrimitive primitive_for(
