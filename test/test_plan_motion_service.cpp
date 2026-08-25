@@ -33,6 +33,7 @@
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "crane_planning/planner_node.hpp"
+#include "crane_planning/sampling_planner.hpp"
 #include "description_fixture.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
@@ -485,4 +486,35 @@ TEST_F(PlanMotionService, TheSameTrajectoryArrivesOnTheReferenceTopic)
   EXPECT_EQ(
     published_.front().points.back().positions, response->trajectory.points.back().positions);
   EXPECT_TRUE(published_.front().header.frame_id.empty());
+}
+
+TEST_F(PlanMotionService, TheAnswerNamesWhichOfTheTwoMechanismsProducedTheGeometry)
+{
+  // trajectory_planning 4.4's ordering argument is that its two mechanisms are
+  // not one product: the primitive's latency is bounded by construction and its
+  // shape is the lift/traverse/descend an operator expects, while a sampled path
+  // spent a budget to be found and rounds whatever was in the way. A caller that
+  // cannot tell which it got cannot act on that difference.
+  //
+  // The service response is the only surface an out-of-process caller has -- the
+  // in-process `MotionPlan::mechanism` the sampling suite asserts on is not on
+  // the wire, because `crane_msgs/PlanMotion` has no row for it -- so the
+  // sentence carrying it is a contract and not a log line.
+  publish_start();
+  const auto response = call(collision_blind_request());
+  ASSERT_NE(response, nullptr);
+  ASSERT_TRUE(response->success) << response->message;
+
+  // Nothing is in the way here, so 4.4's first mechanism is what answered.
+  EXPECT_NE(
+    response->message.find(
+      crane_planning::mechanism_name(crane_planning::PathMechanism::StructuredPrimitive)),
+    std::string::npos) << response->message;
+
+  // And the sentence has to discriminate: one that named both, or hedged, would
+  // leave the caller exactly where it started.
+  EXPECT_EQ(
+    response->message.find(
+      crane_planning::mechanism_name(crane_planning::PathMechanism::SamplingFallback)),
+    std::string::npos) << response->message;
 }
