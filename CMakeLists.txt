@@ -67,6 +67,7 @@ add_library(planner_core STATIC
   src/joint_limits.cpp
   src/plan_grip.cpp
   src/planner_core.cpp
+  src/replanning.cpp
   src/sampling_planner.cpp
   src/structured_primitive.cpp
   src/timing_ocp.cpp
@@ -294,6 +295,21 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plan_grip test/test_plan_grip.cpp TIMEOUT 2400)
   target_link_libraries(test_plan_grip planner_core)
   target_compile_definitions(test_plan_grip PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S4 as well: replanning from a moving, swinging state and the latency bound of
+  # trajectory_planning §7 — the measured start as a boundary condition on the
+  # geometry and on the OCP, continuity at the seam in position *and* velocity,
+  # the unmeasured sway bounded or refused but never assumed zero, and the budget
+  # firing in the planner rather than in a caller's timeout. Offline C++ and
+  # deterministic: the budget reads an injected clock that steps a fixed amount
+  # per reading, so no case here sleeps and none races a real clock.
+  #
+  # It solves five OCPs of §5.2 at some seconds each and is priced accordingly.
+  # One machine only, and the header says why.
+  ament_add_gtest(test_replanning test/test_replanning.cpp TIMEOUT 1200)
+  target_link_libraries(test_replanning planner_core)
+  target_compile_definitions(test_replanning PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract of both rows the planner has in ROS 2 Interfaces §5 —

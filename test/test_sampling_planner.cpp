@@ -264,7 +264,7 @@ crane_planning::MotionRequest motion_request(
 {
   crane_planning::MotionRequest request;
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    request.q_a_start[static_cast<Eigen::Index>(row)] =
+    request.start.q_a[static_cast<Eigen::Index>(row)] =
       scenario.q_start[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])];
   }
   auto goal_pose = scenario.model.forward_kinematics(

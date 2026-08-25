@@ -34,6 +34,7 @@
 #ifndef CRANE_PLANNING__PLANNER_NODE_HPP_
 #define CRANE_PLANNING__PLANNER_NODE_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -41,6 +42,8 @@
 #include "crane_model/model.hpp"
 #include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
+#include "crane_msgs/msg/payload_estimate.hpp"
+#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "crane_planning/plan_grip.hpp"
@@ -65,6 +68,12 @@ inline constexpr char kPlanGripService[] = "/crane/plan_grip";
 inline constexpr char kReferenceTopic[] = "/crane/reference";
 inline constexpr char kJointStatesTopic[] = "/joint_states";
 inline constexpr char kCollisionSceneTopic[] = "/crane/collision_scene";
+
+/// The passive half of the start state `wiki/trajectory_planning.md` 7 asks for.
+inline constexpr char kPendulumStateTopic[] = "/crane/pendulum_state";
+
+/// What is in the gripper, when the estimator says it knows (4).
+inline constexpr char kPayloadEstimateTopic[] = "/crane/payload_estimate";
 
 /// The one name that is not a contract, and that the profile remaps.
 inline constexpr char kRobotDescriptionTopic[] = "/robot_description";
@@ -91,8 +100,36 @@ inline constexpr char kPlanningFrame[] = "K0_mounting_base";
  */
 [[nodiscard]] rclcpp::QoS collision_scene_qos();
 
+/// Reliable, depth 1, **transient-local** -- the `/crane/payload_estimate` row of 4.
+/**
+ * Transient-local because the estimate is published at 10 Hz but is only
+ * *re-estimated* at rest, so a planner that started after the last estimate would
+ * otherwise have to plan without one until the machine next stood still.
+ */
+[[nodiscard]] rclcpp::QoS payload_estimate_qos();
+
 /// The description, latched by `robot_state_publisher`.
 [[nodiscard]] rclcpp::QoS robot_description_qos();
+
+/// What this deployment does when `/crane/pendulum_state` is not usable.
+/**
+ * The acceptance criterion offers exactly two, and `control_architecture` 5.3 is
+ * why there is no third: an input that stops arriving must end in a **defined**
+ * consequence, and silently reading the sway as zero is the stopped-start
+ * convention `trajectory_planning` 7 exists to remove.
+ */
+enum class PassiveEstimatePolicy : std::uint8_t
+{
+  /// Refuse the request, naming which of "never connected", "died", "says it is
+  /// not valid" it was. This is 5.3's row for a state the planner closes on.
+  Refuse,
+
+  /// Plan anyway, from the hanging pose, with a **stated** sway allowance held
+  /// back so that the sway that may be there still fits what the MPC permits.
+  Conservative
+};
+
+[[nodiscard]] const char * passive_policy_name(PassiveEstimatePolicy policy) noexcept;
 
 /// The `crane_planner` node of ROS 2 Interfaces 2.
 class PlannerNode : public rclcpp::Node
@@ -149,24 +186,77 @@ private:
    */
   void on_collision_scene(crane_msgs::msg::CollisionScene::ConstSharedPtr message);
 
-  /// The six actuated coordinates out of the newest `/joint_states`, by name.
+  /// The six actuated coordinates **and their rates**, out of the newest `/joint_states`.
   /**
    * By name and never by position: `sensor_msgs/JointState` fixes no order and
    * the eighth canonical joint is a different string per tool. A joint the
    * message does not carry refuses the whole read -- a start configuration with
    * an invented telescope extension is a plan for a crane that is somewhere
    * else.
+   *
+   * The `velocity` array is read on the same terms and its **absence is a
+   * refusal**, not a zero. `wiki/trajectory_planning.md` 7 asks for `(q, dq)` as
+   * measured, and a message that carries no rates is a measurement that does not
+   * say whether the machine is moving; taking that as a standstill is precisely
+   * the *"we deactivated qDot0, because we now always start in a stopped state"*
+   * the page names. `joint_state_broadcaster` publishes the velocity interface.
    */
-  [[nodiscard]] bool read_start(crane_model::QA & q_a_start, std::string & why) const;
+  [[nodiscard]] bool read_start(MeasuredStart & start, std::string & why) const;
+
+  /// The passive half of the start, or the policy's answer to its absence.
+  /**
+   * Returns false only when the policy is `Refuse` and the estimate is not
+   * usable; `why` then names which of the three absences it was. Under
+   * `Conservative` it always returns true and fills `start.note` with what was
+   * assumed and what was reserved for it.
+   */
+  [[nodiscard]] bool read_passive(PassiveStart & passive, std::string & why) const;
+
+  /// `/crane/payload_estimate` where it is valid, and a stated absence where not.
+  /**
+   * The estimate carries `m_L`, `m_L r_x`, `m_L r_y` and an assumed `r_z`, which
+   * is exactly the point mass `wiki/robot_model.md` 5.3 says a gravity moment
+   * takes -- so where it is valid it *replaces* the mass and centre the caller
+   * declared, because the estimator measured the machine and the caller declared
+   * a model of it. Where it is not valid, or absent, the declaration stands and
+   * `note` says so. Both CBS profiles publish `valid == false` today, so the
+   * second branch is the one that runs.
+   */
+  void read_payload_estimate(crane_model::Payload & payload, std::string & note) const;
+
+  /// The trajectory that is still standing on `/crane/reference`, in one sentence.
+  [[nodiscard]] std::string describe_standing() const;
 
   crane_model::Tool tool_{crane_model::Tool::Pzs100};
   PlannerSettings settings_{};
   TruckModel truck_{};  ///< the vehicle's own geometry, keyed to the measured pose
   double max_input_age_{0.5};
 
+  /// `/crane/pendulum_state`'s own freshness deadline, s -- 5.3's table gives 150 ms.
+  double pendulum_deadline_{0.15};
+
+  /// `/crane/payload_estimate`'s, s. Not in 5.3's table, because the supervisor
+  /// does not watch this row; it is ten periods of a 10 Hz publication.
+  double payload_deadline_{1.0};
+
+  PassiveEstimatePolicy passive_policy_{PassiveEstimatePolicy::Refuse};
+  double conservative_sway_rad_{0.05};
+  double conservative_sway_rate_{0.10};
+
   std::optional<crane_model::Model> model_;
   std::optional<PlannerContext> context_;
   sensor_msgs::msg::JointState::ConstSharedPtr joint_states_;
+  crane_msgs::msg::PendulumState::ConstSharedPtr pendulum_state_;
+  crane_msgs::msg::PayloadEstimate::ConstSharedPtr payload_estimate_;
+
+  /// The last trajectory this node actually adopted, and its stamp.
+  /**
+   * 7's fallback, held here because the node is what publishes: a plan that
+   * overran its budget keeps the previous trajectory and reports it, and
+   * `/crane/reference` is transient-local, so a refused re-plan that republished
+   * would leave a late subscriber latching onto a plan nobody is executing.
+   */
+  std::optional<trajectory_msgs::msg::JointTrajectory> standing_;
 
   /// The newest usable scene, expanded. Absent until one arrives and converts.
   std::optional<crane_model::CollisionScene> scene_;
@@ -175,6 +265,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_states_subscription_;
   rclcpp::Subscription<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_subscription_;
+  rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
+  rclcpp::Subscription<crane_msgs::msg::PayloadEstimate>::SharedPtr payload_estimate_subscription_;
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
   rclcpp::Service<crane_msgs::srv::PlanMotion>::SharedPtr plan_motion_;
   rclcpp::Service<crane_msgs::srv::PlanGrip>::SharedPtr plan_grip_;

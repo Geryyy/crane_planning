@@ -96,7 +96,7 @@ GripRequest phase_request(GripPhase phase, const crane_model::QA & q_a_start)
 {
   GripRequest request;
   request.phase = phase;
-  request.q_a_start = q_a_start;
+  request.start.q_a = q_a_start;
   request.payload = crane_planning_test::empty_gripper();
   request.speed_scale = 1.0;
   // The offline cases are about the phases and not about a scene; the served

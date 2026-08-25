@@ -20,13 +20,15 @@
 // `equilibrium_ik.hpp`. The fast route still runs, as that solve's initial
 // guess. There is no parameter for it, because a caller who picked the fast one
 // would be choosing to have the tool arrive swinging without being told that is
-// what the choice meant. What is
-// **absent** is named rather than approximated, and every absence is refused at
-// the boundary instead of stubbed:
+// what the choice meant.
 //
-//   replanning from a moving, swinging state           issue 045
+// Replanning from a moving, swinging state is no longer among what is absent.
+// `MotionRequest::start` is `(q, dq)` **as measured** over all eight coordinates,
+// it becomes a boundary condition on the geometry and on the OCP rather than a
+// correction after either, and the latency bound of 7 is charged over every stage
+// of this call -- see `replanning.hpp`.
 //
-// Collision is no longer among them: the scene of `/crane/collision_scene`, the
+// Collision is not among them either: the scene of `/crane/collision_scene`, the
 // truck model of `trajectory_planning` 4.2 and the sway envelope of 4.3 arrive
 // through `collision.hpp`, and `avoid_collisions` is honoured rather than
 // refused.
@@ -66,6 +68,7 @@
 #include "crane_planning/geometric_path.hpp"
 #include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/joint_limits.hpp"
+#include "crane_planning/replanning.hpp"
 #include "crane_planning/sampling_planner.hpp"
 #include "crane_planning/structured_primitive.hpp"
 #include "crane_planning/timing_ocp.hpp"
@@ -113,6 +116,17 @@ struct PlannerSettings
   double system_pressure_pa{2.5e7};
 
   std::size_t geometry_samples{9};  ///< telescope extensions the structure check runs over
+
+  /// When a measured rate is a motion rather than a standstill (7).
+  StartStateSettings start{};
+
+  /// 7's bounded latency, over the whole of one `plan_motion` call.
+  /**
+   * The bound lives here and not in a caller's timeout, which is the difference 7
+   * draws: a timeout bounds how long the caller waits and leaves a slow solve
+   * running under a request nobody is waiting on any more.
+   */
+  LatencyBudgetSettings latency{};
 };
 
 /// What is derived once from the description, and reused for every request.
@@ -144,7 +158,16 @@ struct MotionRequest
 {
   Eigen::Vector3d p_tcp_0{Eigen::Vector3d::Zero()};  ///< goal position in K0_mounting_base
   double phi_z_d{};                                   ///< goal yaw, rad
-  crane_model::QA q_a_start{crane_model::QA::Zero()};  ///< where the machine is now
+
+  /// Where the machine is **and what it is doing** -- `wiki/trajectory_planning.md` 7.
+  /**
+   * All eight coordinates and their rates. Default-constructed it is a machine
+   * standing still with its passive pair unmeasured, which is the stopped start
+   * this package planned from before issue 045 and is still the right answer for
+   * a machine that really is stopped. What it is no longer is the *only* answer.
+   */
+  MeasuredStart start{};
+
   crane_model::Payload payload{};                      ///< what is in the gripper
   PayloadShape payload_shape{};                        ///< and what shape it is
   /// `crane_msgs/PlanMotion.speed_scale`, in (0, 1]. **Not** kappa.
@@ -191,6 +214,21 @@ struct MotionPlan
   /// The sampled path, when the primitive was not. Same condition, other branch.
   SamplingPlan sampled{};
 
+  /// 7's initial condition, as it was actually posed to the OCP.
+  /**
+   * Carried out rather than left to be inferred: "this plan started from a
+   * measurement" and "this plan started from the hanging pose because nothing
+   * measured it" are different answers to the same request, and only one of them
+   * is the stopped start 7 warns about.
+   */
+  TimingOcpStart start{};
+
+  /// The start in one sentence -- what was measured, what was not, and why.
+  std::string start_note{};
+
+  /// What each stage of this plan cost, against 7's budget. See `replanning.hpp`.
+  std::vector<StageTiming> stages{};
+
   /// Why the primitive was refused, when it was. Empty when it was accepted.
   /**
    * Kept rather than dropped because it is half of what a caller needs: a
@@ -201,10 +239,18 @@ struct MotionPlan
   std::string primitive_refusal{};
 };
 
-/// Plan one move, or refuse it and say which of the six absences above applies.
+/// Plan one move, or refuse it and say what could not be done.
+/**
+ * `ledger` is 7's latency bound, and it is an argument rather than a member for
+ * one reason: a caller that has to tell "the budget refused this" from "the
+ * machine refused this" -- which is exactly what decides whether the previous
+ * trajectory stays standing -- needs to read `LatencyLedger::overrun()` after the
+ * call. Passing null makes one from `context.settings.latency` and throws it away,
+ * which is what every caller that only wants the answer does.
+ */
 [[nodiscard]] crane_model::Result<MotionPlan> plan_motion(
   const crane_model::Model & model, const PlannerContext & context,
-  const MotionRequest & request);
+  const MotionRequest & request, LatencyLedger * ledger = nullptr);
 
 }  // namespace crane_planning
 

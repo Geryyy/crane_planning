@@ -92,6 +92,52 @@ struct PathFitRequest
   std::vector<std::string> segment_names{};  ///< one per segment
   double q8_start{};
   double q8_goal{};
+
+  /// The **measured** actuated rate at the start, rad/s or m/s. Zero is at rest.
+  /**
+   * `wiki/trajectory_planning.md` 7 and the whole of issue 045: a path whose
+   * start is met at rest can carry no start velocity at all, because stage 2
+   * writes `dq_a = q_a'(sigma) sigma_dot` and a zero `q_a'(0)` makes that zero
+   * whatever the path rate is. So a re-plan from a moving machine has to arrive
+   * as a **boundary condition on the geometry** and not as a correction after it.
+   *
+   * It is passed in the machine's own units and used as ruckig's `current_velocity`
+   * for the first segment, which is dimensionally the unit that segment's shape
+   * bounds are already in -- the reference span is `max_i |chord_i| / dq_i^max`,
+   * so the mean rate the bounds are built from is itself of the scale of
+   * `dq^max`. What comes back is `q_a'(0) = reference_span() * start_rate`, and
+   * the one path rate that reproduces the measurement is then
+   * `sigma_dot(0) = 1 / reference_span()`. `start_path_rate` is that number,
+   * computed from the fitted path rather than from this argument, so a caller
+   * pins the OCP's initial condition on what the fit actually produced.
+   *
+   * Leaving it zero is the stopped start this package had before, and every path
+   * built that way meets both ends with `q_a' = q_a'' = 0` exactly as before.
+   */
+  PathVector start_rate{PathVector::Zero()};
+};
+
+/// The path rate at which a fitted path's own start slope reproduces a measured rate.
+/**
+ * `dq_a = q_a'(0) sigma_dot`, solved for `sigma_dot` in the least-squares sense
+ * over the five path coordinates. It is exact rather than approximate whenever
+ * the fit was given `start_rate` -- the two vectors are then parallel by
+ * construction -- and `residual` is what says so: it is the norm of
+ * `q_a'(0) sigma_dot - dq_a`, and a caller that finds it above its own tolerance
+ * has a path whose start direction does not carry the measurement, which is a
+ * refusal and not a rounding.
+ *
+ * `defined` is false when the path meets its start at rest, i.e. when
+ * `|q_a'(0)|` is below `floor`. There is then no rate that reproduces anything
+ * but a zero velocity, which is the right answer for a machine standing still and
+ * a refusal for one that is not.
+ */
+struct StartPathRate
+{
+  bool defined{false};
+  double sigma_rate{};
+  double residual{};
+  double slope_norm{};
 };
 
 /// How sigma is distributed along the path, and how rounded the profile is.
@@ -209,6 +255,10 @@ private:
 [[nodiscard]] crane_model::Result<GeometricPath> fit_c2_path(
   const PathFitRequest & request, const JointLimits & limits,
   const PathFitSettings & settings);
+
+/// See `StartPathRate`. `floor` is the `|q_a'(0)|` below which the start is at rest.
+[[nodiscard]] StartPathRate start_path_rate(
+  const GeometricPath & path, const PathVector & dq_a_start, double floor = 1.0e-9);
 
 }  // namespace crane_planning
 

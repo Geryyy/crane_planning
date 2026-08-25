@@ -454,6 +454,9 @@ crane_model::Result<StructuredPrimitive> build_structured_primitive(
     phase_name(PrimitivePhase::Descend)};
   fit.q8_start = q8_start;
   fit.q8_goal = q8_goal;
+  // 7's measured start, as the lift phase's own boundary condition. Zero is the
+  // stopped start and leaves the fit exactly where it was.
+  fit.start_rate = request.dq_start;
 
   auto fitted = fit_c2_path(fit, limits, settings.fit);
   if (!fitted.ok()) {

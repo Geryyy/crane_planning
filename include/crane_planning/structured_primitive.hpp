@@ -227,8 +227,18 @@ struct PrimitiveCheck
 /// One move the primitive is asked to cover.
 struct PrimitiveRequest
 {
-  crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair at its equilibrium
+  crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair as measured
   crane_model::Q q_goal{crane_model::Q::Zero()};   ///< the endpoint issue 039 solved
+
+  /// The measured rate at the start, over the five path coordinates of 4.1.
+  /**
+   * Carried straight to `PathFitRequest::start_rate`, which is where the reason
+   * for it is. Zero is the stopped start of `wiki/trajectory_planning.md` 7 and
+   * is what a machine standing still gives; anything else makes the lift phase
+   * leave its first waypoint at the velocity the machine already has.
+   */
+  PathVector dq_start{PathVector::Zero()};
+
   crane_model::Payload payload{};
   PayloadShape payload_shape{};  ///< the other half of `crane_msgs/Payload`
 

@@ -154,7 +154,7 @@ TEST(PlanMotion, CollisionAvoidanceIsHonouredAndItsAbsenceIsSaidOutLoud)
 
   crane_planning::MotionRequest request;
   request.p_tcp_0 = goal_pose.value().position_m;
-  request.q_a_start = start;
+  request.start.q_a = start;
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = true;  // which is what the .srv defaults to
 
@@ -197,7 +197,7 @@ TEST(PlanMotion, TheScaleIsRefusedBeforeTheSolveRatherThanAfterIt)
   // A goal no arm reaches, so a refusal that mentions the scale can only have
   // come from before the inverse kinematics ran.
   request.p_tcp_0 = Eigen::Vector3d(500.0, 0.0, 0.0);
-  request.q_a_start = crane_model::QA::Zero();
+  request.start.q_a = crane_model::QA::Zero();
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = false;
   request.speed_scale = 1.5;
@@ -217,7 +217,7 @@ TEST(PlanMotion, AGoalOutsideTheWorkspaceIsRefusedRatherThanApproximated)
 
   crane_planning::MotionRequest request;
   request.p_tcp_0 = Eigen::Vector3d(500.0, 0.0, 0.0);
-  request.q_a_start = crane_model::QA::Zero();
+  request.start.q_a = crane_model::QA::Zero();
   request.payload = crane_planning_test::empty_gripper();
   request.avoid_collisions = false;
 

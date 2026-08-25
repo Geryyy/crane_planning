@@ -54,11 +54,19 @@ bool phase_moves_the_arm(GripPhase phase) noexcept
 }
 
 crane_model::Result<GripPlan> plan_grip(
-  const crane_model::Model & model, const PlannerContext & context, const GripRequest & request)
+  const crane_model::Model & model, const PlannerContext & context, const GripRequest & request,
+  LatencyLedger * ledger)
 {
-  if (!request.q_a_start.allFinite()) {
+  // 7's latency bound. One phase is one plan, so one phase gets one budget --
+  // the four of a grip are four separate requests from the task layer and
+  // charging them against a shared total would make the last one refuse for what
+  // the first three spent.
+  LatencyLedger owned(context.settings.latency);
+  LatencyLedger & clock = (ledger == nullptr) ? owned : *ledger;
+
+  if (!request.start.q_a.allFinite() || !request.start.dq_a.allFinite()) {
     return Result<GripPlan>::failure(
-      refuse(request.phase, ErrorCode::NonFiniteInput, "the start configuration is not finite"));
+      refuse(request.phase, ErrorCode::NonFiniteInput, "the start state is not finite"));
   }
 
   GripPlan plan;
@@ -66,6 +74,19 @@ crane_model::Result<GripPlan> plan_grip(
   plan.arm_phase = phase_moves_the_arm(request.phase);
 
   if (!plan.arm_phase) {
+    // A tool phase emits the five path coordinates **held** (4.1's one clock), so
+    // its first point commands the arm to a standstill. From a moving arm that is
+    // a step, which is the sway excitation the whole architecture exists to
+    // avoid, so it is refused rather than emitted.
+    if (request.start.arm_is_moving(context.settings.start)) {
+      return Result<GripPlan>::failure(
+        refuse(
+          request.phase, ErrorCode::NotReady,
+          "the arm is still moving, and a tool phase emits the five path coordinates of 4.1 held: "
+          "its first point would step the arm's velocity to zero, which is the excitation "
+          "trajectory_planning 7 and mpc 6 both exist to avoid. Let the arm phase finish, or "
+          "re-plan it, before closing or opening the gripper"));
+    }
     // The tool, alone, on the arm's own clock. `tool_axis.hpp` is the whole of
     // it; what is decided here is only which end of the description's range this
     // phase drives to.
@@ -77,7 +98,7 @@ crane_model::Result<GripPlan> plan_grip(
     }
 
     ToolAxisRequest tool;
-    tool.q_a_start = request.q_a_start;
+    tool.q_a_start = request.start.q_a;
     tool.q8_goal = target.value();
     tool.payload = request.payload;
     tool.speed_scale = request.speed_scale;
@@ -96,6 +117,12 @@ crane_model::Result<GripPlan> plan_grip(
     }
     plan.tool = std::move(driven).value();
     plan.trajectory = plan.tool.trajectory;
+    Status charged = clock.charge("the tool-axis primitive of trajectory_planning 8");
+    if (!charged.ok()) {
+      return Result<GripPlan>::failure(
+        refuse(request.phase, charged.code, std::move(charged.message)));
+    }
+    plan.stages = clock.stages();
     return Result<GripPlan>::success(std::move(plan));
   }
 
@@ -103,7 +130,7 @@ crane_model::Result<GripPlan> plan_grip(
   // The arm phases: `plan_motion` and nothing else, except that a **descend**
   // lowers the transfer altitude's ceiling to its own two endpoints.
   // ------------------------------------------------------------------
-  auto settled_start = model.passive_equilibrium(request.q_a_start, request.payload);
+  auto settled_start = model.passive_equilibrium(request.start.q_a, request.payload);
   if (!settled_start.ok()) {
     return Result<GripPlan>::failure(
       refuse(request.phase, settled_start.status().code, settled_start.status().message));
@@ -111,7 +138,7 @@ crane_model::Result<GripPlan> plan_grip(
   Q q_start = Q::Zero();
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
     q_start[static_cast<Eigen::Index>(kActuatedRows[row])] =
-      request.q_a_start[static_cast<Eigen::Index>(row)];
+      request.start.q_a[static_cast<Eigen::Index>(row)];
   }
   q_start.segment<2>(4) = settled_start.value();
   auto start_pose = model.forward_kinematics(q_start, Frame::MountingBase, Frame::Tcp);
@@ -163,20 +190,21 @@ crane_model::Result<GripPlan> plan_grip(
   MotionRequest motion;
   motion.p_tcp_0 = request.p_tcp_0;
   motion.phi_z_d = request.phi_z_d;
-  motion.q_a_start = request.q_a_start;
+  motion.start = request.start;
   motion.payload = request.payload;
   motion.payload_shape = request.payload_shape;
   motion.speed_scale = request.speed_scale;
   motion.avoid_collisions = request.avoid_collisions;
   motion.scene = request.scene;
 
-  auto solved = plan_motion(model, phase_context, motion);
+  auto solved = plan_motion(model, phase_context, motion, &clock);
   if (!solved.ok()) {
     return Result<GripPlan>::failure(
       refuse(request.phase, solved.status().code, solved.status().message));
   }
   plan.motion = std::move(solved).value();
   plan.trajectory = plan.motion.trajectory;
+  plan.stages = clock.stages();
   return Result<GripPlan>::success(std::move(plan));
 }
 

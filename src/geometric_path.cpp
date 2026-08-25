@@ -130,6 +130,12 @@ crane_model::Result<GeometricPath> fit_c2_path(
     return Result<GeometricPath>::failure(
       failure(ErrorCode::NonFiniteInput, "the carried tool coordinate is not finite"));
   }
+  if (!request.start_rate.allFinite()) {
+    return Result<GeometricPath>::failure(
+      failure(
+        ErrorCode::NonFiniteInput,
+        "the measured start rate the path is asked to leave its first waypoint at is not finite"));
+  }
   if (!(settings.rate_headroom > 1.0) || !(settings.acceleration_span > 0.0) ||
     !(settings.jerk_span > 0.0) || !(settings.min_span > 0.0) ||
     !(settings.overshoot_tolerance >= 0.0))
@@ -178,7 +184,15 @@ crane_model::Result<GeometricPath> fit_c2_path(
   // Carlson's monotone-interpolation rule at its most conservative. Anything
   // faster than the slower chord obliges one side to overshoot the waypoint and
   // come back, which is the non-monotone path the acceptance criteria rule out.
+  //
+  // The **start** is the one end that is not always at rest, and issue 045 is
+  // why: `wiki/trajectory_planning.md` 7 asks for a re-plan from a moving,
+  // swinging machine, and stage 2 writes `dq_a = q_a' sigma_dot`, so a start met
+  // with `q_a'(0) = 0` can carry no measured velocity at any path rate. The
+  // measurement therefore enters here, as the first segment's own boundary
+  // condition, and the goal end stays at rest because 5.4 puts it there.
   std::vector<PathVector> junction_rate(count, PathVector::Zero());
+  junction_rate.front() = request.start_rate;
   for (std::size_t waypoint = 1U; waypoint + 1U < count; ++waypoint) {
     for (std::size_t row = 0; row < kPathDof; ++row) {
       const Eigen::Index axis = static_cast<Eigen::Index>(row);
@@ -259,8 +273,19 @@ crane_model::Result<GeometricPath> fit_c2_path(
       const Eigen::Index axis = static_cast<Eigen::Index>(row);
       const double from = request.waypoints[segment][axis];
       const double to = request.waypoints[segment + 1U][axis];
-      const double lower = std::min(from, to) - settings.overshoot_tolerance;
-      const double upper = std::max(from, to) + settings.overshoot_tolerance;
+      // A start that is already moving may have to leave the box its two
+      // waypoints span and come back, and that is not the non-monotone path the
+      // criterion rules out -- it is the machine's own braking distance,
+      // `v^2 / 2a`, which no boundary-value solve can be shorter than. It is
+      // allowed on the **first** segment only and only in the direction the
+      // measurement was moving; every other segment is judged exactly as before.
+      double allowance = 0.0;
+      if (segment == 0U && std::abs(request.start_rate[axis]) > 0.0) {
+        allowance = request.start_rate[axis] * request.start_rate[axis] /
+          (2.0 * input.max_acceleration[row]);
+      }
+      const double lower = std::min(from, to) - settings.overshoot_tolerance - allowance;
+      const double upper = std::max(from, to) + settings.overshoot_tolerance + allowance;
       if (extrema[row].min < lower || extrema[row].max > upper) {
         return Result<GeometricPath>::failure(
           failure(
@@ -297,6 +322,28 @@ crane_model::Result<GeometricPath> fit_c2_path(
   }
 
   return Result<GeometricPath>::success(std::move(path));
+}
+
+StartPathRate start_path_rate(
+  const GeometricPath & path, const PathVector & dq_a_start, double floor)
+{
+  StartPathRate answer;
+  const PathSample start = path.at(0.0);
+  answer.slope_norm = start.dq_a.norm();
+  if (!(answer.slope_norm > floor) || !start.dq_a.allFinite() || !dq_a_start.allFinite()) {
+    // The path meets its start at rest, so no path rate reproduces anything but a
+    // zero velocity. That is the right answer for a machine standing still and a
+    // refusal for one that is not -- and telling the two apart is the caller's,
+    // because only the caller knows what was measured.
+    answer.defined = false;
+    answer.sigma_rate = 0.0;
+    answer.residual = dq_a_start.norm();
+    return answer;
+  }
+  answer.defined = true;
+  answer.sigma_rate = start.dq_a.dot(dq_a_start) / start.dq_a.squaredNorm();
+  answer.residual = (start.dq_a * answer.sigma_rate - dq_a_start).norm();
+  return answer;
 }
 
 }  // namespace crane_planning

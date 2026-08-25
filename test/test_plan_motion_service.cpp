@@ -37,6 +37,8 @@
 #include "crane_msgs/msg/collision_primitive.hpp"
 #include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
+#include "crane_msgs/msg/payload_estimate.hpp"
+#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -149,6 +151,10 @@ protected:
       crane_planning::kRobotDescriptionTopic, crane_planning::robot_description_qos());
     collision_scene_ = client_node_->create_publisher<crane_msgs::msg::CollisionScene>(
       crane_planning::kCollisionSceneTopic, crane_planning::collision_scene_qos());
+    pendulum_state_ = client_node_->create_publisher<crane_msgs::msg::PendulumState>(
+      crane_planning::kPendulumStateTopic, crane_planning::input_qos());
+    payload_estimate_ = client_node_->create_publisher<crane_msgs::msg::PayloadEstimate>(
+      crane_planning::kPayloadEstimateTopic, crane_planning::payload_estimate_qos());
 
     executor_.add_node(planner_);
     executor_.add_node(client_node_);
@@ -186,18 +192,80 @@ protected:
     return done();
   }
 
-  /// Publish one `/joint_states` and let the planner take delivery of it.
+  /// Publish one `/joint_states` and one `/crane/pendulum_state`, at rest.
+  /**
+   * Both, because both are the start state `wiki/trajectory_planning.md` 7 asks
+   * for and the node refuses a request that is missing either. The velocities are
+   * zero rather than absent: a message with no `velocity` array is a measurement
+   * that does not say whether the machine is moving, and reading that as a
+   * standstill is the stopped-start convention 7 removes -- so the node refuses
+   * it, and `AJointStateWithoutVelocitiesIsRefusedRatherThanReadAsAStandstill`
+   * asserts as much.
+   */
   void publish_start() {publish_start(start_positions());}
 
   void publish_start(const std::vector<double> & positions)
+  {
+    publish_start(positions, std::vector<double>(positions.size(), 0.0));
+  }
+
+  void publish_start(
+    const std::vector<double> & positions, const std::vector<double> & velocities)
+  {
+    publish_joints(positions, velocities);
+
+    // The sway the tool really has at that configuration, measured off the model
+    // rather than written as zero: the tool hangs where gravity puts it, and a
+    // fixture that published `q_u = 0` would be posing a swinging start to every
+    // case that meant to pose a settled one.
+    crane_model::QA q_a = crane_model::QA::Zero();
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      q_a[static_cast<Eigen::Index>(row)] = positions[crane_planning::kActuatedRows[row]];
+    }
+    auto settled = model_->passive_equilibrium(q_a, crane_planning_test::empty_gripper());
+    EXPECT_TRUE(settled.ok()) << settled.status().message;
+    publish_pendulum(settled.value(), crane_model::DQU::Zero());
+  }
+
+  /// `/joint_states` alone -- the half of the start state the encoders carry.
+  void publish_joints(
+    const std::vector<double> & positions, const std::vector<double> & velocities)
   {
     JointState joints;
     joints.header.stamp = client_node_->now();
     joints.name.assign(
       model_->urdf_joint_names().begin(), model_->urdf_joint_names().end());
     joints.position = positions;
+    joints.velocity = velocities;
     start_stamp_ = joints.header.stamp;
     joint_states_->publish(joints);
+  }
+
+  /// One `/crane/pendulum_state`, at the sway and the rate the caller asks for.
+  void publish_pendulum(
+    const crane_model::QU & q_u, const crane_model::DQU & dq_u, bool valid = true,
+    double age_s = 0.0)
+  {
+    crane_msgs::msg::PendulumState pendulum;
+    pendulum.header.stamp = client_node_->now() - rclcpp::Duration::from_seconds(age_s);
+    pendulum.position = {q_u[0], q_u[1]};
+    pendulum.velocity = {dq_u[0], dq_u[1]};
+    pendulum.valid = valid;
+    pendulum.status = valid ? "all IMUs healthy and refreshing" : "IMU1x is degraded";
+    pendulum_state_->publish(pendulum);
+  }
+
+  /// Spin a bounded number of times, to let anything that was going to arrive arrive.
+  /**
+   * Not a sleep and not a timeout: it is what makes "and nothing else was
+   * published" a statement rather than a hope, in the one direction `spin_until`
+   * cannot express.
+   */
+  void settle()
+  {
+    for (int turn = 0; turn < 25; ++turn) {
+      executor_.spin_once(std::chrono::milliseconds(10));
+    }
   }
 
   /// The description's own limits, which the planner reads from the same XML.
@@ -298,6 +366,8 @@ protected:
   rclcpp::Publisher<JointState>::SharedPtr joint_states_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_;
   rclcpp::Publisher<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_;
+  rclcpp::Publisher<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_;
+  rclcpp::Publisher<crane_msgs::msg::PayloadEstimate>::SharedPtr payload_estimate_;
   std::vector<JointTrajectory> published_;
   std::optional<crane_model::Model> model_;
   rclcpp::Time start_stamp_;

@@ -98,6 +98,34 @@ struct ActuationLimits
   double pump_flow_planning_factor{0.95};
 };
 
+/// How precisely the measured initial passive state is known.
+/**
+ * The window the OCP holds `q_u(0)` and `dq_u(0)` inside, and it is a
+ * **measurement** number rather than a solver tuning one: the sway angle comes
+ * off a complementary filter and the rate off a differenced gyro pair, so
+ * pinning either to machine epsilon claims a precision the sensor does not have.
+ *
+ * It also happens to be what makes the problem solvable. Pinning all four passive
+ * rows exactly at stage 0 turns converging solves into `ACADOS_QP_FAILURE` on the
+ * first QP -- HPIPM is an interior-point method and a bound with zero slack is
+ * where its barrier breaks down, which this file already documents for the warm
+ * start. Declaring them equalities through acados' `idxbxe` does not help, so the
+ * trouble is the step the QP has left and not how the bound is written. A window
+ * the width of the estimate's own noise gives that step back and gives up nothing
+ * the estimate actually said.
+ */
+struct StartResolution
+{
+  /// Sway angle, rad. **A design value** -- no recording measures the filter's
+  /// angle resolution, and `PendulumState::position_covariance` is the per-request
+  /// number a later issue could read instead of this constant.
+  double q_u{1.0e-3};
+
+  /// Sway rate, rad/s. **Measured**: the gyro quantiser is `2^-9` rad/s, from the
+  /// 7040 recordings, and a differenced pair cannot resolve below it.
+  double dq_u{1.953125e-3};
+};
+
 /// Everything about the solve that a deployment chooses.
 struct TimingOcpSettings
 {
@@ -146,6 +174,9 @@ struct TimingOcpSettings
   /// The physical limits kappa is applied to.
   ActuationLimits actuation{};
 
+  /// How precisely `q_u(0)` and `dq_u(0)` are held to the measurement.
+  StartResolution start_resolution{};
+
   /// Sample period of the emitted reference, seconds.
   double sample_period{0.04};
 
@@ -155,8 +186,11 @@ struct TimingOcpSettings
    * structured lift/traverse/descend primitive converges in some 44 SQP
    * iterations and 4.1 s here, and a bound is only a bound if the ordinary case
    * clears it on a slower machine too. This is the piece of 7's latency that
-   * lives in the OCP; the end-to-end budget is issue 045's, and it is the larger
-   * number -- one plan is 14 s of which the solve is under a third.
+   * lives in the OCP; the end-to-end budget is `LatencyBudgetSettings::total_s`
+   * in `replanning.hpp`, and it is the larger number -- one plan is 14 s of which
+   * the solve is under a third. `plan_motion` lowers this to whatever the total
+   * has left when the solve opens, so the two bounds cannot disagree about which
+   * of them fired.
    */
   double max_wall_clock{12.0};
 
@@ -245,6 +279,37 @@ struct TimingSolution
   std::string solver_status;  ///< acados' own status word, success or not
 };
 
+/// 7's initial condition: where the machine is, and what it is already doing.
+/**
+ * Absent -- `measured == false` -- is the **stopped start** of 7's `[!warning]`:
+ * the passive pair pinned at the equilibrium of the start configuration and not
+ * moving, and the path rate left free because the path meets its own start with
+ * `q_a' = 0`. That is the convention 7 calls a defect, and it is kept as the
+ * answer for a machine that really is standing still.
+ *
+ * Present, it is the measurement: `q_u` and `dq_u` off `/crane/pendulum_state`
+ * and a `sigma_rate` that reproduces the measured actuated velocity through the
+ * path's own start slope (`start_path_rate` in `geometric_path.hpp`). The three
+ * together are what make a plan issued mid-motion start where the machine is
+ * rather than where it would be at rest -- and 5.4's terminal conditions are
+ * untouched, because the end of a placement move is still a tool hanging still.
+ */
+struct TimingOcpStart
+{
+  bool measured{false};
+  crane_model::QU q_u{crane_model::QU::Zero()};
+  crane_model::DQU dq_u{crane_model::DQU::Zero()};
+
+  /// Whether `sigma_rate` pins `sigma_dot(0)` rather than leaving it to the box.
+  /**
+   * Separate from `measured` because the two are separately absent: a machine
+   * whose tool is swinging while its arm stands still has a measured passive pair
+   * and no path rate to pin, and the sway still has to be carried.
+   */
+  bool sigma_rate_pinned{false};
+  double sigma_rate{};
+};
+
 /// What one solve is asked about, beyond the path itself.
 struct TimingOcpRequest
 {
@@ -252,6 +317,9 @@ struct TimingOcpRequest
 
   /// `crane_msgs/PlanMotion.speed_scale`, in (0, 1]. Scales the velocity bound only.
   double speed_scale{1.0};
+
+  /// 7's measured initial state. Default-constructed is the stopped start.
+  TimingOcpStart start{};
 };
 
 /// `F_i^max` from the model's own chamber areas and the relief pressure.

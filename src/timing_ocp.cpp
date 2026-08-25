@@ -528,8 +528,62 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     }
     q_u_equilibrium.push_back(equilibrium.value());
   }
-  const crane_model::QU q_u_start = q_u_equilibrium.front();
   const crane_model::QU q_u_goal = q_u_equilibrium.back();
+
+  // 7's initial condition. The stopped start is the passive pair hanging at the
+  // start configuration's own equilibrium and not moving; a measured start
+  // replaces both halves with what `/crane/pendulum_state` says. Neither is
+  // *assumed*: which one this is arrived on the request.
+  const crane_model::QU q_u_start =
+    request.start.measured ? request.start.q_u : q_u_equilibrium.front();
+  const crane_model::DQU dq_u_start =
+    request.start.measured ? request.start.dq_u : crane_model::DQU::Zero();
+  if (!q_u_start.allFinite() || !dq_u_start.allFinite()) {
+    return Result<TimingSolution>::failure(
+      failure(ErrorCode::NonFiniteInput, "the measured passive start state is not finite"));
+  }
+
+  // A start outside the box the rest of the horizon is solved in is not a harder
+  // problem, it is an infeasible one: `mpc.md` 3 constraint 3 draws the sway box
+  // around the node's own equilibrium and stage 1 is one interval away, so a
+  // measurement further out than the whole allowance cannot be steered back
+  // inside it. Said here, by name, rather than left to come back as a QP failure.
+  for (std::size_t row = 0; row < crane_model::kPassiveDof; ++row) {
+    const Eigen::Index axis = static_cast<Eigen::Index>(row);
+    const double offset = std::abs(q_u_start[axis] - q_u_equilibrium.front()[axis]);
+    if (offset > settings.q_u_max[row]) {
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::InvalidArgument,
+          "the tool is measured " + std::to_string(offset) +
+          " rad off its hanging pose on passive row " + std::to_string(row) +
+          ", past the " + std::to_string(settings.q_u_max[row]) +
+          " rad sway box mpc 3 constraint 3 permits and trajectory_planning 4.3 cleared the path "
+          "over. There is no timing of this path that starts there, so the re-plan is refused "
+          "rather than solved from a state the rest of the horizon may not enter"));
+    }
+    if (std::abs(dq_u_start[axis]) > settings.dq_u_max[row]) {
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::InvalidArgument,
+          "the tool is measured swinging at " + std::to_string(dq_u_start[axis]) +
+          " rad/s on passive row " + std::to_string(row) + ", past the " +
+          std::to_string(settings.dq_u_max[row]) +
+          " rad/s of mpc 3 constraint 4. A plan cannot begin at a sway rate the controller "
+          "tracking it is not allowed to hold"));
+    }
+  }
+  if (request.start.sigma_rate_pinned &&
+    (!std::isfinite(request.start.sigma_rate) || !(request.start.sigma_rate > 0.0)))
+  {
+    return Result<TimingSolution>::failure(
+      failure(
+        ErrorCode::InvalidArgument,
+        "the path rate that reproduces the measured actuated velocity is " +
+        std::to_string(request.start.sigma_rate) +
+        ", which is not a positive number; the objective divides by sigma_dot, and a rate at or "
+        "below zero is the path being run backwards"));
+  }
 
   // The **static** force, before any timing is chosen, at every node.
   /*
@@ -657,21 +711,43 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "ns", ns.data());
   ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "np", np.data());
 
-  // Stage 0 pins everything but the path rate: 5.4 fixes the *terminal* state,
-  // and the start is where the machine already is. `sigma_dot(0)` is left free
-  // because the path meets its own start with `q_a' = 0`, so no joint moves
-  // there whatever the rate is.
-  const int bounded_x0 = kOcpStateDof - 1;
+  // **Every** state row is boxed at every stage, stage 0 included. It carried
+  // `kOcpStateDof - 1` here while the comment above it said "stage 0 pins
+  // everything but the path rate", and the two stopped agreeing when the rate was
+  // given a box of its own further down: acados copies `nbx` entries out of
+  // `idxbx`, so a six-entry index list read as five silently dropped the **last**
+  // row, `dq_u[1]`, and the second passive rate was unconstrained at the start.
+  // That was invisible while the start was the stopped one -- the guess put it at
+  // zero and nothing pushed it away -- and it is exactly the row 7's measured
+  // start has to pin, so it is fixed rather than worked around.
+  //
+  // ...and the stage-0 rows that are *pinned* are declared to acados as
+  // **equalities** (`nbxe`/`idxbxe`) rather than left as two-sided bounds that
+  // happen to coincide. That is not bookkeeping. HPIPM is an interior-point
+  // method and a bound with zero slack is where its barrier terms and its Riccati
+  // factorisation break down -- the same failure this file already documents for
+  // the warm start, which is why that one targets 0.9 of the allowance rather
+  // than 1.0. Four coincident bounds at stage 0 survived it; the fifth, `dq_u[1]`,
+  // did not, and turned three converging solves into `ACADOS_QP_FAILURE` on the
+  // first QP. Declared as equalities they are eliminated before the barrier ever
+  // sees them, which is both faster and what they actually are.
   const int nonlinear_rows = kOcpConstraints;
+  // Every stage-0 row but the path rate is an equality; the rate joins them when
+  // a measured start pins it, and stays a range when it does not.
+  const int equality_rows = request.start.sigma_rate_pinned ? kOcpStateDof : kOcpStateDof - 1;
   for (int stage = 0; stage <= intervals; ++stage) {
     const int constraints = stage < intervals ? nonlinear_rows : 0;
     const int residual_rows = stage < intervals ? kResidualDof : kTerminalResidualDof;
-    const int bounded_x = stage == 0 ? bounded_x0 : kOcpStateDof;
+    const int bounded_x = kOcpStateDof;
     const int bounded_u = stage < intervals ? kOcpInputDof : 0;
     ocp_nlp_dims_set_cost(ocp.config_, ocp.dims_, stage, "ny", &residual_rows);
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbx", &bounded_x);
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbu", &bounded_u);
     ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nh", &constraints);
+    if (stage == 0) {
+      ocp_nlp_dims_set_constraints(
+        ocp.config_, ocp.dims_, stage, "nbxe", const_cast<int *>(&equality_rows));
+    }
   }
 
   ocp.in_ = ocp_nlp_in_create(ocp.config_, ocp.dims_);
@@ -815,6 +891,39 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       std::max(ceiling, 2.0 * settings.sigma_rate_min);
   }
 
+  // The measured start rate against the same ceiling, before the solver sees it.
+  // Because `q_a'(0) sigma_dot(0)` **is** the measured joint velocity, this row
+  // says one thing in the machine's own terms: the arm is already moving faster
+  // than kappa and speed_scale leave a plan allowed to move it. No timing of this
+  // path begins there, and a QP failure is a worse way to be told so.
+  if (request.start.sigma_rate_pinned && request.start.sigma_rate > rate_ceilings.front()) {
+    const crane_model::QA slope = actuated(nodes.front(), 1);
+    std::string worst;
+    for (int row = 0; row < dof; ++row) {
+      const double speed = std::abs(slope[row]) * request.start.sigma_rate;
+      if (speed > scaled.dq_a_max[row]) {
+        worst += worst.empty() ? "" : ", ";
+        worst += "actuated row " + std::to_string(row) + " at " + std::to_string(speed) +
+          " against " + std::to_string(scaled.dq_a_max[row]);
+      }
+    }
+    return Result<TimingSolution>::failure(
+      failure(
+        ErrorCode::InvalidArgument,
+        "the machine is measured moving faster than this plan is allowed to move it, so there is "
+        "no timing that starts where it is: " + worst +
+        " rad/s or m/s, which is kappa = " + std::to_string(settings.kappa) +
+        " times speed_scale = " + std::to_string(request.speed_scale) +
+        " of the description's own limit. trajectory_planning 5.5 reserves that margin for the "
+        "MPC and a plan may not spend it merely by having been asked for late"));
+  }
+
+  // The stage-0 rows declared equal above: 0, 2, 3, 4, 5, and 1 when it is pinned.
+  std::vector<int> equality_index{0, 2, 3, 4, 5};
+  if (request.start.sigma_rate_pinned) {
+    equality_index.push_back(1);
+  }
+
   std::vector<std::vector<int>> state_index;
   std::vector<std::vector<double>> state_lower;
   std::vector<std::vector<double>> state_upper;
@@ -828,16 +937,51 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     std::vector<double> lower;
     std::vector<double> upper;
     if (stage == 0) {
-      // `sigma_dot(0)` carries the same box as every running stage and for the
-      // same reason the terminal stage does: the objective divides by it, so a
-      // rate the QP is free to take through zero -- or negative, which is the
-      // path run backwards -- makes `1/sigma_dot` singular on the first step.
-      // The machine still starts at rest whatever the box says, because the path
-      // meets its start with `q_a'(0) = 0`; what is pinned here is the tool's
-      // state, not the coordinate's.
+      // The initial condition of 7, in full. The passive pair and its rate are
+      // pinned at what was measured -- or, for a stopped start, at the hanging
+      // pose and zero, which is the convention 7 names and this is where it is
+      // now a *choice* rather than the only option.
+      //
+      // `sigma_dot(0)` is pinned exactly when the measurement asked for it. A
+      // stopped start leaves it in the same box every running stage carries, for
+      // the same reason the terminal stage does: the objective divides by it, so
+      // a rate the QP may take through zero -- or negative, which is the path run
+      // backwards -- makes `1/sigma_dot` singular on the first step, and the
+      // machine still starts at rest whatever the box says because the path meets
+      // its start with `q_a'(0) = 0`. A **measured** start is the case where that
+      // last sentence is false: `q_a'(0)` is the measured direction, so the rate
+      // is what carries `dq_a = q_a'(0) sigma_dot` to the measurement and it is
+      // one number rather than a range.
+      const double lower_rate = request.start.sigma_rate_pinned ?
+        request.start.sigma_rate : settings.sigma_rate_min;
+      const double upper_rate = request.start.sigma_rate_pinned ?
+        request.start.sigma_rate : rate_ceiling;
+      // The passive rows carry the estimate's own resolution and are not pinned
+      // to machine epsilon. That is a measurement statement first and a numerical
+      // one second: the sway angle comes off a complementary filter and the rate
+      // off a differenced gyro pair whose quantiser is `2^-9` rad/s, so a hard
+      // equality on either claims a precision the sensor does not have.
+      //
+      // It is also what the solver needs. Four coincident bounds at stage 0 --
+      // sigma, the two angles and one rate -- survived HPIPM's barrier; the fifth
+      // did not, and turned converging solves into `ACADOS_QP_FAILURE` on the
+      // first QP. Declaring them equalities through `idxbxe` did not help, which
+      // says the trouble is the *step* the QP has left rather than how the bound
+      // is written. A window the width of the measurement's own noise gives it
+      // one back without giving up a single thing the measurement said.
       index = {0, 1, 2, 3, 4, 5};
-      lower = {0.0, settings.sigma_rate_min, q_u_start[0], q_u_start[1], 0.0, 0.0};
-      upper = {0.0, rate_ceiling, q_u_start[0], q_u_start[1], 0.0, 0.0};
+      lower = {
+        0.0, lower_rate,
+        q_u_start[0] - settings.start_resolution.q_u,
+        q_u_start[1] - settings.start_resolution.q_u,
+        dq_u_start[0] - settings.start_resolution.dq_u,
+        -settings.dq_u_max[1]};  // EXPERIMENT: loosest possible box on row 5
+      upper = {
+        0.0, upper_rate,
+        q_u_start[0] + settings.start_resolution.q_u,
+        q_u_start[1] + settings.start_resolution.q_u,
+        dq_u_start[0] + settings.start_resolution.dq_u,
+        settings.dq_u_max[1]};  // EXPERIMENT
     } else if (stage == intervals) {
       // 5.4, in full: the path is finished, the tool hangs at its equilibrium and
       // it is not moving. `sigma_dot(T)` is the one row 5.4 asks for that this
@@ -867,6 +1011,15 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       ocp.config_, ocp.dims_, ocp.in_, stage, "lbx", state_lower.back().data());
     ocp_nlp_constraints_model_set(
       ocp.config_, ocp.dims_, ocp.in_, stage, "ubx", state_upper.back().data());
+    if (stage == 0) {
+      // Which of the six they are, in the order `equality_rows` counted them: the
+      // path parameter, the passive pair and its rate always, and the path rate
+      // only when a measured start pinned it. `lbx == ubx` holds on every row
+      // named here and on no other, which is what makes this a declaration and
+      // not a second constraint.
+      ocp_nlp_constraints_model_set(
+        ocp.config_, ocp.dims_, ocp.in_, stage, "idxbxe", equality_index.data());
+    }
   }
 
   int stages = 1;
@@ -1057,12 +1210,29 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   for (double & rate : rate_guesses) {
     rate = std::max(rate, floor_rate);
   }
+  // The one rate the sweeps above may not lower, because it is not a guess: a
+  // measured start pins `sigma_dot(0)` to the number that reproduces the measured
+  // joint velocity, and a warm start that opens somewhere else opens outside its
+  // own box. The backward sweep is what would have moved it -- it asks whether
+  // stage 0 can decelerate into stage 1, which is a question about the input and
+  // is the solver's to answer, not the guess's.
+  if (request.start.sigma_rate_pinned) {
+    rate_guesses.front() = request.start.sigma_rate;
+  }
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);
     guess[0] = static_cast<double>(stage) * d_sigma;
     guess[1] = rate_guesses[static_cast<std::size_t>(stage)];
     guess[2] = q_u_equilibrium[static_cast<std::size_t>(stage)][0];
     guess[3] = q_u_equilibrium[static_cast<std::size_t>(stage)][1];
+    if (stage == 0) {
+      // ...and the passive half of the same boundary condition, so the first
+      // shooting gap is the dynamics' and not the guess's.
+      guess[2] = q_u_start[0];
+      guess[3] = q_u_start[1];
+      guess[4] = dq_u_start[0];
+      guess[5] = dq_u_start[1];
+    }
     ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "x", guess.data());
     if (stage < intervals) {
       double input = 0.0;

@@ -74,6 +74,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "crane_model/model.hpp"
 #include "crane_planning/collision.hpp"
@@ -114,7 +115,16 @@ struct GripRequest
   Eigen::Vector3d p_tcp_0{Eigen::Vector3d::Zero()};
   double phi_z_d{};
 
-  crane_model::QA q_a_start{crane_model::QA::Zero()};
+  /// Where the machine is and what it is doing -- the same start `plan_motion` takes.
+  /**
+   * An arm phase carries it straight into `MotionRequest::start`, so a descend or
+   * a lift re-planned mid-motion is the re-plan of `wiki/trajectory_planning.md`
+   * 7 and not a second, looser one. A **tool** phase emits the five path
+   * coordinates held, so it is refused from a moving arm rather than answered
+   * with a first point that steps the arm's velocity to zero.
+   */
+  MeasuredStart start{};
+
   crane_model::Payload payload{};
   PayloadShape payload_shape{};
 
@@ -150,11 +160,20 @@ struct GripPlan
    */
   bool altitude_ceiling_applied{false};
   double altitude_ceiling_m{};
+
+  /// What this phase cost, against 7's budget. See `replanning.hpp`.
+  std::vector<StageTiming> stages{};
 };
 
 /// Plan one grip phase, or refuse it and say which phase and why.
+/**
+ * `ledger` is 7's latency bound, on the same terms `plan_motion` takes it: one
+ * phase is one plan and gets one budget, and a caller that has to tell an overrun
+ * from a refusal reads it back afterwards.
+ */
 [[nodiscard]] crane_model::Result<GripPlan> plan_grip(
-  const crane_model::Model & model, const PlannerContext & context, const GripRequest & request);
+  const crane_model::Model & model, const PlannerContext & context, const GripRequest & request,
+  LatencyLedger * ledger = nullptr);
 
 /// The phase in one sentence, for the service response.
 [[nodiscard]] std::string describe(const GripPlan & plan);

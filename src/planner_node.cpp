@@ -36,6 +36,21 @@ bool tool_from_string(const std::string & name, crane_model::Tool & tool)
   return false;
 }
 
+/// What a deployment says to do when `/crane/pendulum_state` is not usable.
+bool passive_policy_from_string(
+  const std::string & name, crane_planning::PassiveEstimatePolicy & policy)
+{
+  if (name == "refuse") {
+    policy = crane_planning::PassiveEstimatePolicy::Refuse;
+    return true;
+  }
+  if (name == "conservative") {
+    policy = crane_planning::PassiveEstimatePolicy::Conservative;
+    return true;
+  }
+  return false;
+}
+
 /// Which end of the tool axis's range a deployment says is a closed gripper.
 bool tool_end_from_string(const std::string & name, crane_planning::ToolEnd & end)
 {
@@ -120,9 +135,23 @@ rclcpp::QoS collision_scene_qos()
   return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
 }
 
+rclcpp::QoS payload_estimate_qos()
+{
+  return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+}
+
 rclcpp::QoS robot_description_qos()
 {
   return rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+}
+
+const char * passive_policy_name(PassiveEstimatePolicy policy) noexcept
+{
+  switch (policy) {
+    case PassiveEstimatePolicy::Refuse: return "refuse";
+    case PassiveEstimatePolicy::Conservative: return "conservative";
+  }
+  return "unknown";
 }
 
 PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
@@ -219,6 +248,27 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
   max_input_age_ = parameters.max_input_age;
 
+  // trajectory_planning 7, and the whole of issue 045. The rest thresholds decide
+  // whether a request is a re-plan from a moving machine at all; the deadlines are
+  // the freshness of the two state topics this planner closes on; the policy is
+  // what control_architecture 5.3 asks for -- a defined consequence when an input
+  // stops arriving -- and the budget is the latency bound, enforced here rather
+  // than in whatever timeout the caller happened to set.
+  settings_.start.at_rest_dq_a = parameters.at_rest.dq_a;
+  settings_.start.at_rest_dq_u = parameters.at_rest.dq_u;
+  settings_.latency.total_s = parameters.latency_budget;
+  pendulum_deadline_ = parameters.pendulum_state_deadline;
+  payload_deadline_ = parameters.payload_estimate_deadline;
+  conservative_sway_rad_ = parameters.conservative_sway.q_u;
+  conservative_sway_rate_ = parameters.conservative_sway.dq_u;
+  if (!passive_policy_from_string(parameters.passive_estimate_policy, passive_policy_)) {
+    // `one_of<>` on the parameter already refuses anything else, so reaching here
+    // means the two lists have drifted apart.
+    throw std::runtime_error(
+            "crane_planner: unknown passive_estimate_policy '" +
+            parameters.passive_estimate_policy + "'");
+  }
+
   // The one fact about the mounted tool the description does not carry: which
   // end of the range it gives the tool axis is a closed gripper. `one_of<>` on
   // the parameter already refuses anything else, so reaching the throw means the
@@ -247,6 +297,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     kCollisionSceneTopic, collision_scene_qos(),
     [this](crane_msgs::msg::CollisionScene::ConstSharedPtr message) {
       on_collision_scene(message);
+    });
+  // The passive half of 7's start state, and what is in the gripper. Both are
+  // kept as they arrive and judged at the request rather than in the callback:
+  // a freshness check evaluated in a subscription callback cannot fire, because
+  // the case it exists for is the one where no callback runs again
+  // (control_architecture 5.3).
+  pendulum_state_subscription_ = create_subscription<crane_msgs::msg::PendulumState>(
+    kPendulumStateTopic, input_qos(),
+    [this](crane_msgs::msg::PendulumState::ConstSharedPtr message) {
+      pendulum_state_ = std::move(message);
+    });
+  payload_estimate_subscription_ = create_subscription<crane_msgs::msg::PayloadEstimate>(
+    kPayloadEstimateTopic, payload_estimate_qos(),
+    [this](crane_msgs::msg::PayloadEstimate::ConstSharedPtr message) {
+      payload_estimate_ = std::move(message);
     });
   plan_motion_ = create_service<crane_msgs::srv::PlanMotion>(
     kPlanMotionService,
@@ -437,7 +502,7 @@ void PlannerNode::on_collision_scene(crane_msgs::msg::CollisionScene::ConstShare
   RCLCPP_INFO(get_logger(), "%s", scene_note_.c_str());
 }
 
-bool PlannerNode::read_start(crane_model::QA & q_a_start, std::string & why) const
+bool PlannerNode::read_start(MeasuredStart & start, std::string & why) const
 {
   if (joint_states_ == nullptr) {
     why = std::string("nothing has been received on ") + kJointStatesTopic +
@@ -470,9 +535,171 @@ bool PlannerNode::read_start(crane_model::QA & q_a_start, std::string & why) con
       why = joint + " carries no finite position in " + kJointStatesTopic;
       return false;
     }
-    q_a_start[static_cast<Eigen::Index>(row)] = joint_states_->position[index];
+    start.q_a[static_cast<Eigen::Index>(row)] = joint_states_->position[index];
+
+    // The rate, on the same terms, and its absence is a refusal rather than a
+    // zero: trajectory_planning 7 asks for `(q, dq)` **as measured**, and reading
+    // a message with no velocities as a machine standing still is the
+    // stopped-start convention the page removes -- the one that makes a re-plan
+    // issued while the tool is still moving mis-predict the sway from the first
+    // step.
+    if (index >= joint_states_->velocity.size() ||
+      !std::isfinite(joint_states_->velocity[index]))
+    {
+      why = joint + " carries no finite velocity in " + kJointStatesTopic +
+        ". trajectory_planning 7 asks for (q, dq) as measured, and a measurement with no rate in "
+        "it does not say whether the machine is moving; taking that as a standstill is the "
+        "stopped-start convention 7 exists to remove, so it is refused instead. "
+        "joint_state_broadcaster publishes the velocity state interface";
+      return false;
+    }
+    start.dq_a[static_cast<Eigen::Index>(row)] = joint_states_->velocity[index];
   }
   return true;
+}
+
+bool PlannerNode::read_passive(PassiveStart & passive, std::string & why) const
+{
+  passive = PassiveStart{};
+
+  // The three absences control_architecture 5.3 asks to be told apart. "Never
+  // connected" and "died" are different things for an operator to chase, and a
+  // producer that says `valid == false` is a third thing again -- it is running,
+  // it is talking, and it is telling the truth about itself.
+  std::string absence;
+  if (pendulum_state_ == nullptr) {
+    absence = std::string("nothing has ever been received on ") + kPendulumStateTopic +
+      " -- this is 'never connected' and not 'died': no producer has been seen at all";
+  } else {
+    const double age = (now() - rclcpp::Time(pendulum_state_->header.stamp)).seconds();
+    if (!(age <= pendulum_deadline_)) {
+      absence = std::string("the newest ") + kPendulumStateTopic + " is " + std::to_string(age) +
+        " s old against its own " + std::to_string(pendulum_deadline_) +
+        " s deadline (control_architecture 5.3) -- this is 'died' and not 'never connected': the "
+        "estimate arrived and then stopped";
+    } else if (!pendulum_state_->valid) {
+      absence = std::string("the newest ") + kPendulumStateTopic +
+        " is fresh and reports valid == false, which is the producer's own verdict on itself and "
+        "is carried rather than restated: \"" + pendulum_state_->status + "\"";
+    } else if (!std::isfinite(pendulum_state_->position[0]) ||
+      !std::isfinite(pendulum_state_->position[1]) ||
+      !std::isfinite(pendulum_state_->velocity[0]) ||
+      !std::isfinite(pendulum_state_->velocity[1]))
+    {
+      absence = std::string("the newest ") + kPendulumStateTopic +
+        " is fresh and valid but does not carry four finite numbers";
+    }
+  }
+
+  if (absence.empty()) {
+    passive.measured = true;
+    passive.q_u = crane_model::QU(
+      pendulum_state_->position[0], pendulum_state_->position[1]);
+    passive.dq_u = crane_model::DQU(
+      pendulum_state_->velocity[0], pendulum_state_->velocity[1]);
+    passive.note = std::string("the passive pair came off ") + kPendulumStateTopic +
+      ", valid, inside its " + std::to_string(pendulum_deadline_) + " s deadline: \"" +
+      pendulum_state_->status + "\"";
+    return true;
+  }
+
+  if (passive_policy_ == PassiveEstimatePolicy::Refuse) {
+    why = absence +
+      ". This deployment's passive_estimate_policy is 'refuse', so the request is refused rather "
+      "than planned from an assumed still tool -- trajectory_planning 7 is explicit that a "
+      "re-plan whose sway is assumed mis-predicts the first step, and control_architecture 5.3 "
+      "asks an absent input to end in a defined consequence rather than in a silent zero";
+    return false;
+  }
+
+  passive.measured = false;
+  passive.sway_reserve_rad = conservative_sway_rad_;
+  passive.sway_rate_reserve = conservative_sway_rate_;
+  passive.note = absence +
+    ". This deployment's passive_estimate_policy is 'conservative', so the plan is built from the "
+    "hanging pose of the measured actuated configuration with " +
+    std::to_string(conservative_sway_rad_) + " rad and " +
+    std::to_string(conservative_sway_rate_) +
+    " rad/s of the sway allowance held back for the sway that may be there anyway. That is a "
+    "stated bound and not a measurement: it says the plan leaves room for sway it cannot see, not "
+    "that there is none";
+  return true;
+}
+
+void PlannerNode::read_payload_estimate(crane_model::Payload & payload, std::string & note) const
+{
+  if (payload_estimate_ == nullptr) {
+    note = std::string("nothing has ever been received on ") + kPayloadEstimateTopic +
+      " -- 'never connected' -- so the payload is the one the request declared and no estimate "
+      "entered this plan";
+    return;
+  }
+  const double age = (now() - rclcpp::Time(payload_estimate_->header.stamp)).seconds();
+  if (!(age <= payload_deadline_)) {
+    note = std::string("the newest ") + kPayloadEstimateTopic + " is " + std::to_string(age) +
+      " s old against a " + std::to_string(payload_deadline_) +
+      " s deadline -- 'died' -- so the payload is the one the request declared";
+    return;
+  }
+  if (!payload_estimate_->valid) {
+    // The branch that actually runs: both CBS profiles publish `valid == false`
+    // today, so this is the tested path and not the exceptional one. `valid` on
+    // this message means "estimated at rest", and an estimate taken while the
+    // machine was moving is not one this planner may substitute for a caller's
+    // own declaration.
+    note = std::string("the newest ") + kPayloadEstimateTopic +
+      " is fresh and reports valid == false -- the estimator says it has no estimate taken at "
+      "rest -- so the payload is the one the request declared and not this message's numbers";
+    return;
+  }
+  if (!std::isfinite(payload_estimate_->mass) || payload_estimate_->mass < 0.0 ||
+    !std::isfinite(payload_estimate_->m_r_x) || !std::isfinite(payload_estimate_->m_r_y) ||
+    !std::isfinite(payload_estimate_->r_z))
+  {
+    note = std::string("the newest ") + kPayloadEstimateTopic +
+      " is fresh and valid but does not carry finite numbers, so the payload is the one the "
+      "request declared";
+    return;
+  }
+
+  // `wiki/robot_model.md` 5.3: for a gravity moment the payload is a point mass,
+  // so the estimate's first moment divided by its mass *is* the centre of mass in
+  // K8 and nothing else about the shape enters. A zero mass carries no first
+  // moment either, and the centre is then meaningless rather than at the origin.
+  payload.valid = true;
+  payload.mass_kg = payload_estimate_->mass;
+  payload.inertia_k8_kg_m2.setZero();
+  if (payload_estimate_->mass > 0.0) {
+    payload.center_of_mass_k8_m = Eigen::Vector3d(
+      payload_estimate_->m_r_x / payload_estimate_->mass,
+      payload_estimate_->m_r_y / payload_estimate_->mass,
+      payload_estimate_->r_z);
+  } else {
+    payload.center_of_mass_k8_m.setZero();
+  }
+  note = std::string("the payload is ") + kPayloadEstimateTopic + "'s, valid and " +
+    std::to_string(age) + " s old: " + std::to_string(payload.mass_kg) + " kg at (" +
+    std::to_string(payload.center_of_mass_k8_m.x()) + ", " +
+    std::to_string(payload.center_of_mass_k8_m.y()) + ", " +
+    std::to_string(payload.center_of_mass_k8_m.z()) +
+    ") m in K8. It replaces what the request declared, because the estimator measured the machine "
+    "and the request described it";
+}
+
+std::string PlannerNode::describe_standing() const
+{
+  if (!standing_.has_value()) {
+    return std::string("Nothing has been published on ") + kReferenceTopic +
+      " by this planner yet, so no trajectory is standing and this refusal displaced nothing";
+  }
+  const double duration = standing_->points.empty() ?
+    0.0 : rclcpp::Duration(standing_->points.back().time_from_start).seconds();
+  return std::string("The trajectory standing on ") + kReferenceTopic +
+    " is unchanged and is the one still being executed: " +
+    std::to_string(standing_->points.size()) + " points over " + std::to_string(duration) +
+    " s, stamped " + std::to_string(rclcpp::Time(standing_->header.stamp).seconds()) +
+    ". It is carried on this response so a caller can tell 'I kept planning' from 'here is "
+    "something new'; success is false, so it is not something new";
 }
 
 bool PlannerNode::read_payload(
@@ -568,26 +795,45 @@ void PlannerNode::plan(
   // call converts, so a goal in any other frame -- `world` included -- is a goal
   // this planner cannot place, and silently treating it as K0 would put the tool
   // wherever the truck happens to be parked.
+  // Every refusal below leaves `/crane/reference` alone and says what is still
+  // standing on it. The topic is transient-local, so a refused re-plan that
+  // republished anything would leave a late subscriber latching onto a plan
+  // nobody is executing -- and a caller has to be able to tell "I kept planning"
+  // from "here is something new" (trajectory_planning 7's fallback).
+  const auto refuse = [this, &response](std::string message) {
+      response.success = false;
+      response.trajectory = standing_.value_or(trajectory_msgs::msg::JointTrajectory{});
+      response.tcp_path.clear();
+      response.message = std::move(message) + ". " + describe_standing();
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    };
+
   if (request.goal.header.frame_id != kPlanningFrame) {
-    response.message = "the goal is in frame '" + request.goal.header.frame_id +
+    refuse(
+      "the goal is in frame '" + request.goal.header.frame_id +
       "', and this planner plans in '" + std::string(kPlanningFrame) +
       "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into "
-      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
     return;
   }
   if (!ready()) {
-    response.message = std::string("no usable robot description has arrived on ") +
-      kRobotDescriptionTopic + " yet, so there is no model to plan against";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    refuse(
+      std::string("no usable robot description has arrived on ") + kRobotDescriptionTopic +
+      " yet, so there is no model to plan against");
     return;
   }
 
-  crane_model::QA q_a_start;
+  MeasuredStart start;
   std::string why;
-  if (!read_start(q_a_start, why)) {
-    response.message = "no start configuration: " + why;
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+  if (!read_start(start, why)) {
+    refuse("no start state: " + why);
+    return;
+  }
+  // The passive half, and this deployment's answer to its absence. Refused here
+  // rather than deeper down, because whether an unusable estimate is a refusal at
+  // all is a *deployment's* decision and not the algorithm's.
+  if (!read_passive(start.passive, why)) {
+    refuse("no passive start state: " + why);
     return;
   }
 
@@ -600,12 +846,11 @@ void PlannerNode::plan(
     request.goal.pose.orientation.w, request.goal.pose.orientation.x,
     request.goal.pose.orientation.y, request.goal.pose.orientation.z);
   if (!(orientation.norm() > 0.0)) {
-    response.message = "the goal orientation is a zero quaternion";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    refuse("the goal orientation is a zero quaternion");
     return;
   }
   motion.phi_z_d = phi_z_of(orientation);
-  motion.q_a_start = q_a_start;
+  motion.start = start;
   motion.speed_scale = request.speed_scale;
   motion.avoid_collisions = request.avoid_collisions;
 
@@ -613,25 +858,38 @@ void PlannerNode::plan(
   // it. The first issue that evaluates a *dynamics* call for a carried payload
   // owes a real inertia tensor there; issue 043 is that issue.
   if (!read_payload(request.payload, motion.payload, motion.payload_shape, why)) {
-    response.message = why;
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    refuse(why);
     return;
   }
+  // ...and then `/crane/payload_estimate` where it is valid, on the same terms
+  // the pendulum's estimate is read: stated, never assumed.
+  std::string payload_note;
+  read_payload_estimate(motion.payload, payload_note);
 
   // The scene, if one has arrived. Whether its absence is fatal is the core's
   // decision and depends on `avoid_collisions`, so the note travels either way.
   motion.scene = scene_.has_value() ? &scene_.value() : nullptr;
 
-  auto solved = plan_motion(*model_, *context_, motion);
+  LatencyLedger ledger(settings_.latency);
+  auto solved = plan_motion(*model_, *context_, motion, &ledger);
   if (!solved.ok()) {
-    response.message = solved.status().message;
+    std::string message = solved.status().message;
+    if (!ledger.overrun().empty()) {
+      // 7's fallback, in as many words: the budget fired, no partial plan was
+      // built, and the previous trajectory is what is still standing.
+      message += ". This is the latency bound of trajectory_planning 7 firing and not the machine "
+        "refusing: nothing about the goal has been shown to be wrong";
+    }
+    if (!payload_note.empty()) {
+      message += ". As for the payload: " + payload_note;
+    }
     if (!scene_note_.empty()) {
       // What the planner knows about the world it just refused to plan in. A
       // refusal that says "blocked" without saying which scene it was blocked
       // against leaves an operator nothing to act on.
-      response.message += ". As for the scene: " + scene_note_;
+      message += ". As for the scene: " + scene_note_;
     }
-    RCLCPP_WARN(get_logger(), "planning refused: %s", response.message.c_str());
+    refuse(std::move(message));
     return;
   }
   const MotionPlan & motion_plan = solved.value();
@@ -656,6 +914,9 @@ void PlannerNode::plan(
     response.tcp_path.push_back(std::move(pose));
   }
 
+  // The one place `/crane/reference` is written, and it is reached only by a plan
+  // that was adopted: a refusal returns above without touching it.
+  standing_ = trajectory;
   reference_->publish(trajectory);
 
   response.success = true;
@@ -704,6 +965,15 @@ void PlannerNode::plan(
     "reservation; speed_scale = " + std::to_string(timing.speed_scale) +
     " is this caller's own request and scales the velocity bound alone, so no value of it "
     "reaches into the margin";
+  // What this plan started from, and what it cost. Both belong on the wire:
+  // `crane_msgs/PlanMotion` is frozen, so `message` is the only surface a caller
+  // has, and "planned from a measurement" against "planned from the hanging pose"
+  // is the difference trajectory_planning 7 is about.
+  response.message += ". " + motion_plan.start_note + describe(ledger) +
+    ", and this trajectory is now the one standing on " + kReferenceTopic;
+  if (!payload_note.empty()) {
+    response.message += ". As for the payload: " + payload_note;
+  }
   if (!scene_note_.empty()) {
     response.message += ". As for the scene: " + scene_note_;
   }
@@ -717,13 +987,22 @@ void PlannerNode::grip(
   response.success = false;
   response.trajectory = trajectory_msgs::msg::JointTrajectory{};
 
+  // The same fallback `/crane/plan_motion` uses, for the same reason: a refused
+  // phase leaves the standing reference alone and says which one it is.
+  const auto refuse = [this, &response](std::string message) {
+      response.success = false;
+      response.trajectory = standing_.value_or(trajectory_msgs::msg::JointTrajectory{});
+      response.message = std::move(message) + ". " + describe_standing();
+      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    };
+
   GripRequest grip_request;
   if (!grip_phase_from_message(request.phase, grip_request.phase)) {
-    response.message = "phase " + std::to_string(static_cast<int>(request.phase)) +
+    refuse(
+      "phase " + std::to_string(static_cast<int>(request.phase)) +
       " is none of the four crane_msgs/PlanGrip defines -- PHASE_DESCEND, PHASE_CLOSE, "
       "PHASE_OPEN, PHASE_LIFT. The .srv is frozen (PRD 15) and a fifth phase is a slice of its "
-      "own, so this is refused rather than mapped onto whichever of the four is nearest";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      "own, so this is refused rather than mapped onto whichever of the four is nearest");
     return;
   }
   const bool arm_phase = phase_moves_the_arm(grip_request.phase);
@@ -734,29 +1013,32 @@ void PlannerNode::grip(
   // goal at all, so demanding a frame of a field the phase does not use would
   // refuse a well-formed request for a field it was right to leave empty.
   if (arm_phase && request.goal.header.frame_id != kPlanningFrame) {
-    response.message = "the goal of this " + std::string(grip_phase_name(grip_request.phase)) +
+    refuse(
+      "the goal of this " + std::string(grip_phase_name(grip_request.phase)) +
       " phase is in frame '" + request.goal.header.frame_id + "', and this planner plans in '" +
       std::string(kPlanningFrame) +
       "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into "
-      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      + kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
     return;
   }
   if (!ready()) {
-    response.message = std::string("no usable robot description has arrived on ") +
-      kRobotDescriptionTopic + " yet, so there is no model to plan against";
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    refuse(
+      std::string("no usable robot description has arrived on ") + kRobotDescriptionTopic +
+      " yet, so there is no model to plan against");
     return;
   }
 
-  crane_model::QA q_a_start;
+  MeasuredStart start;
   std::string why;
-  if (!read_start(q_a_start, why)) {
-    response.message = "no start configuration: " + why;
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+  if (!read_start(start, why)) {
+    refuse("no start state: " + why);
     return;
   }
-  grip_request.q_a_start = q_a_start;
+  if (!read_passive(start.passive, why)) {
+    refuse("no passive start state: " + why);
+    return;
+  }
+  grip_request.start = start;
   grip_request.speed_scale = request.speed_scale;
 
   if (arm_phase) {
@@ -768,8 +1050,7 @@ void PlannerNode::grip(
       request.goal.pose.orientation.w, request.goal.pose.orientation.x,
       request.goal.pose.orientation.y, request.goal.pose.orientation.z);
     if (!(orientation.norm() > 0.0)) {
-      response.message = "the goal orientation is a zero quaternion";
-      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+      refuse("the goal orientation is a zero quaternion");
       return;
     }
     grip_request.phi_z_d = phi_z_of(orientation);
@@ -784,18 +1065,27 @@ void PlannerNode::grip(
   }
 
   if (!read_payload(request.payload, grip_request.payload, grip_request.payload_shape, why)) {
-    response.message = why;
-    RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
+    refuse(why);
     return;
   }
+  std::string payload_note;
+  read_payload_estimate(grip_request.payload, payload_note);
 
-  auto solved = plan_grip(*model_, *context_, grip_request);
+  LatencyLedger ledger(settings_.latency);
+  auto solved = plan_grip(*model_, *context_, grip_request, &ledger);
   if (!solved.ok()) {
-    response.message = solved.status().message;
-    if (arm_phase && !scene_note_.empty()) {
-      response.message += ". As for the scene: " + scene_note_;
+    std::string message = solved.status().message;
+    if (!ledger.overrun().empty()) {
+      message += ". This is the latency bound of trajectory_planning 7 firing and not the machine "
+        "refusing: nothing about the goal has been shown to be wrong";
     }
-    RCLCPP_WARN(get_logger(), "planning refused: %s", response.message.c_str());
+    if (!payload_note.empty()) {
+      message += ". As for the payload: " + payload_note;
+    }
+    if (arm_phase && !scene_note_.empty()) {
+      message += ". As for the scene: " + scene_note_;
+    }
+    refuse(std::move(message));
     return;
   }
   const GripPlan & grip_plan = solved.value();
@@ -806,7 +1096,9 @@ void PlannerNode::grip(
   // The reference the planner answered with, on the row ROS 2 Interfaces 4 gives
   // it. A grip phase belongs on it for the reason trajectory_planning 4.1 gives:
   // the MPC tracks all six actuated coordinates, so q8_ref has to have a
-  // producer while a grip is running, and the producer is this.
+  // producer while a grip is running, and the producer is this. Reached only by a
+  // phase that was adopted -- every refusal above returned without touching it.
+  standing_ = response.trajectory;
   reference_->publish(response.trajectory);
 
   response.success = true;
@@ -826,9 +1118,15 @@ void PlannerNode::grip(
       std::to_string(timing.peak_demand.cylinder_force) + " of cylinder force and " +
       std::to_string(timing.peak_demand.pump_flow) + " of pump flow, under kappa = " +
       std::to_string(timing.kappa) + " with speed_scale = " + std::to_string(timing.speed_scale);
+    response.message += ". " + grip_plan.motion.start_note;
     if (!scene_note_.empty()) {
       response.message += ". As for the scene: " + scene_note_;
     }
+  }
+  response.message += ". " + describe(ledger) + ", and this trajectory is now the one standing on "
+    + kReferenceTopic;
+  if (!payload_note.empty()) {
+    response.message += ". As for the payload: " + payload_note;
   }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }

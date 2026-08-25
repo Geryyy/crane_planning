@@ -561,11 +561,116 @@ crane_planner:
       at the machine's measured configuration and its header.stamp is that
       measurement's stamp (ROS 2 Interfaces 1: the absolute time the first point
       is valid for), so a stale measurement is a first point that was valid
-      seconds ago. Planning from a *moving* start, and the latency bound that
-      goes with it, is issue 045; this issue plans from a machine that is
-      standing still and refuses when it cannot tell."
+      seconds ago."
     validation:
       gt<>: [0.0]
+
+  pendulum_state_deadline:
+    type: double
+    default_value: 0.15
+    read_only: true
+    description: "Freshness deadline of /crane/pendulum_state, s. The 150 ms of
+      wiki/control_architecture.md 5.3's own table, which is where every input a
+      consumer closes on gets a deadline of its own -- a 100 Hz stream and a
+      20 Hz contract do not go stale at the same age, so this is per input and
+      not one number for all of them. Past it the estimate is 'died' as opposed
+      to 'never connected', and passive_estimate_policy decides what happens
+      next."
+    validation:
+      gt<>: [0.0]
+
+  payload_estimate_deadline:
+    type: double
+    default_value: 1.0
+    read_only: true
+    description: "Freshness deadline of /crane/payload_estimate, s. Not in
+      control_architecture 5.3's table, because the supervisor does not watch
+      this row; it is ten periods of the 10 Hz publication ROS 2 Interfaces 4
+      gives it. Past it the payload is the one the request declared, and the
+      answer says so."
+    validation:
+      gt<>: [0.0]
+
+  passive_estimate_policy:
+    type: string
+    default_value: "refuse"
+    read_only: true
+    description: "What this deployment does when /crane/pendulum_state is not
+      usable -- never connected, past its deadline, or reporting valid == false.
+      'refuse' returns success=false naming which of the three it was, which is
+      control_architecture 5.3's row for a state a consumer closes on.
+      'conservative' plans from the hanging pose of the measured actuated
+      configuration and holds back conservative_sway of the sway allowance for
+      the sway that may be there anyway, saying so in the answer. There is no
+      third value, because reading an absent estimate as zero sway is the
+      stopped-start convention wiki/trajectory_planning.md 7 removes."
+    validation:
+      one_of<>: [["refuse", "conservative"]]
+
+  conservative_sway:
+    q_u:
+      type: double
+      default_value: 0.05
+      read_only: true
+      description: "Sway angle held back from mpc 3 constraint 3's box when the
+        passive estimate is not usable and the policy is 'conservative', rad.
+        A reservation and not an assumption: the plan is solved inside a smaller
+        box, so sway up to this much can be present without leaving what the
+        controller permits or what trajectory_planning 4.3 cleared the path
+        over. **A design value** -- no recording measures the sway at the moment
+        a re-plan is issued."
+      validation:
+        gt_eq<>: [0.0]
+    dq_u:
+      type: double
+      default_value: 0.10
+      read_only: true
+      description: "The same reservation on the sway *rate*, rad/s, against
+        mpc 3 constraint 4. **A design value**, on the same terms as q_u above."
+      validation:
+        gt_eq<>: [0.0]
+
+  at_rest:
+    dq_a:
+      type: double
+      default_value: 0.0001
+      read_only: true
+      description: "Below this an actuated coordinate is standing still rather
+        than moving, rad/s or m/s. It decides one thing: whether a request is a
+        re-plan from a moving machine at all (wiki/trajectory_planning.md 7).
+        Below it the path meets its start at rest, as every plan did before
+        issue 045; above it the measured velocity becomes the first segment's own
+        boundary condition and pins the OCP's sigma_dot(0)."
+      validation:
+        gt<>: [0.0]
+    dq_u:
+      type: double
+      default_value: 0.002
+      read_only: true
+      description: "Below this the tool is hanging still rather than swinging,
+        rad/s. The gyro quantiser is 2^-9 rad/s = 0.00195 rad/s, measured from
+        the 7040 recordings, so a differenced sway rate under it is quantisation
+        and not sway. Used only to describe the start; the sway itself is carried
+        into the OCP whatever this says."
+      validation:
+        gt<>: [0.0]
+
+  latency_budget:
+    type: double
+    default_value: 45.0
+    read_only: true
+    description: "The latency bound of wiki/trajectory_planning.md 7, s, over
+      the whole of one request -- the endpoint IK, the geometry, the smoothing
+      and the OCP. Enforced **in the planner** and not in the caller's timeout:
+      7 is explicit that bounding only how long the caller waits leaves a slow
+      solve running under a request nobody is waiting on. Exceeding it returns
+      success=false naming the stage that overran and how long it had, keeps the
+      previous trajectory standing on /crane/reference and emits no partial plan.
+      Sized against what a plan costs rather than round -- one plan is some 14 s
+      here, of which kappa's OCP share (max_wall_clock) is 12 s -- because a
+      bound is only a bound if the ordinary case clears it on a slower machine
+      too. A value at or below zero is no budget at all, and the stages are then
+      charged and reported without any of them being able to refuse."
 
   kappa:
     type: double

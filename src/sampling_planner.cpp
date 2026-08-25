@@ -716,6 +716,9 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
   }
   fitted.q8_start = q8_start;
   fitted.q8_goal = q8_goal;
+  // 7's measured start, on the fallback's first segment. The shortcut may have
+  // dropped the waypoints after it, never the one the machine is standing at.
+  fitted.start_rate = request.dq_start;
   auto path = fit_c2_path(fitted, limits, fit);
   if (!path.ok()) {
     return Result<SamplingPlan>::failure(

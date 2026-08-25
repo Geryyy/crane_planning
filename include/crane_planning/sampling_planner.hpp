@@ -231,8 +231,19 @@ struct StateSpaceBounds
 /// One move the fallback is asked to cover, with the primitive already refused.
 struct SamplingRequest
 {
-  crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair at equilibrium
+  crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair as measured
   crane_model::Q q_goal{crane_model::Q::Zero()};   ///< the endpoint issue 039 solved
+
+  /// The measured rate at the start, over the five path coordinates of 4.1.
+  /**
+   * The same field `PrimitiveRequest` carries and for the same reason: 4.5's
+   * mandatory C2 refit is a `fit_c2_path` like any other, so a fallback answering
+   * a re-plan from a moving machine owes its first segment the same boundary
+   * condition the primitive's lift phase does. The *search* is unaffected -- a
+   * sampled polyline is geometry and has no rates in it.
+   */
+  PathVector dq_start{PathVector::Zero()};
+
   crane_model::Payload payload{};
   PayloadShape payload_shape{};
 
