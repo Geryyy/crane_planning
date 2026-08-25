@@ -2,6 +2,23 @@ cmake_minimum_required(VERSION 3.8)
 project(crane_planning)
 
 find_package(ament_cmake REQUIRED)
+# acados, for the path-constrained OCP of trajectory_planning §5.2.
+# `wiki/implementation/libraries.md` lists it for "the optimal control problems of
+# `mpc` and `trajectory_planning`", so no NLP is written here.
+#
+# **How CI resolves it.** The image installs acados to `/usr/local` and its config
+# lands at `/usr/local/cmake/acadosConfig.cmake` -- not under `lib/cmake` or
+# `share/*/cmake`, where CMake's UNIX config search looks. It is nevertheless
+# found without a hint, because `<prefix>/cmake/` is on the search list too and
+# `/usr/local` is a default system prefix. The `ACADOS_SOURCE_DIR=/opt/acados`
+# the image exports is the *source* tree and is not used here; only the install
+# is. If a future image drops the config, `acados_DIR` is the one variable to set
+# and this is the line that would need the hint.
+find_package(acados REQUIRED)
+# CasADi is reached through `crane_model::casadi_graph`, which carries it as an
+# INTERFACE usage requirement; naming it here is what makes that requirement
+# resolvable in the install tree, exactly as `crane_model` itself does.
+find_package(casadi REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(crane_model REQUIRED)
 find_package(crane_msgs REQUIRED)
@@ -41,6 +58,7 @@ find_package(urdfdom REQUIRED)
 # archive, and the only consumer here is an executable rather than a pluginlib
 # object, so no `--exclude-libs` workaround is needed.
 add_library(planner_core STATIC
+  src/acados_casadi_bridge.cpp
   src/arm_geometry.cpp
   src/collision.cpp
   src/equilibrium_ik.cpp
@@ -50,6 +68,7 @@ add_library(planner_core STATIC
   src/planner_core.cpp
   src/sampling_planner.cpp
   src/structured_primitive.cpp
+  src/timing_ocp.cpp
   src/trajectory_timing.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
 set_target_properties(planner_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -77,12 +96,19 @@ target_include_directories(planner_core
 # reorders the search path, so only the root goes on and Eigen comes from
 # Eigen3::Eigen exactly as it does everywhere else here.
 target_include_directories(planner_core SYSTEM PRIVATE ${OMPL_INCLUDE_DIR})
+# acados and CasADi are both PRIVATE, and that is the same rule contract §9
+# applies to `crane_model`: `timing_ocp.hpp` names neither an `acados` nor a
+# `casadi` type, so the OCP backend is an implementation detail of this library
+# and a consumer of the planner compiles against neither. `src/acados_casadi_bridge.hpp`
+# is where they meet, and it is not installed.
 target_link_libraries(planner_core
   PUBLIC
     crane_model::crane_model
     Eigen3::Eigen
     ruckig::ruckig
   PRIVATE
+    acados
+    crane_model::casadi_graph
     ${OMPL_LIBRARIES}
     urdfdom::urdfdom_model)
 
@@ -230,6 +256,16 @@ if(BUILD_TESTING)
   target_compile_definitions(test_sampling_planner PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
+  # S4 as well: the path-constrained OCP of trajectory_planning §5.2 -- the sway
+  # carried as a state, the force and pump-flow constraints read out of the same
+  # symbolic graph `crane_mpc` will export from, and the κ margin of §5.5.
+  # Offline C++ and deterministic: acados is a numerical solver in process, so no
+  # graph, no launch and no simulator is reachable from this binary either.
+  ament_add_gtest(test_timing_ocp test/test_timing_ocp.cpp TIMEOUT 1200)
+  target_link_libraries(test_timing_ocp planner_core)
+  target_compile_definitions(test_timing_ocp PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
   # S5: the served contract, on the isolated domain `verify.sh` pins. Two nodes
   # in one in-process executor -- the deployment's own node object and a client
   # -- and no launch, no controller manager and no simulator, because the planner
@@ -246,3 +282,10 @@ if(BUILD_TESTING)
 endif()
 
 ament_package()
+
+if(BUILD_TESTING)
+  ament_add_gtest(test_sweep_tmp test/test_sweep_tmp.cpp TIMEOUT 600)
+  target_link_libraries(test_sweep_tmp planner_core)
+  target_compile_definitions(test_sweep_tmp PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../crane_model/test/description")
+endif()

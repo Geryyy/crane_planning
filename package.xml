@@ -8,6 +8,21 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <!-- The optimal control problem of trajectory_planning §5.2.  Libraries §1
+       lists acados against "the optimal control problems of `mpc` and
+       `trajectory_planning`", which is this one and issue 049's; no NLP is
+       written by hand here.  There is no rosdep key for acados and none is
+       invented: the image installs it to /usr/local, and CMakeLists.txt records
+       how `find_package(acados)` resolves it. -->
+  <build_depend>acados</build_depend>
+  <exec_depend>acados</exec_depend>
+  <!-- The symbolic backend the OCP is written over.  It arrives through
+       `crane_model::casadi_graph`, which contract §9 keeps in a target of its
+       own so that a consumer of the public model header never sees a CasADi
+       type; this package opts in because §5.2's passive rows are exactly what
+       that target exists to hand over. -->
+  <build_depend>casadi</build_depend>
+  <exec_depend>casadi</exec_depend>
   <build_depend>eigen</build_depend>
   <exec_depend>eigen</exec_depend>
   <depend>crane_model</depend>

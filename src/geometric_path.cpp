@@ -58,6 +58,18 @@ double tool_shape_rate(double sigma)
   return 30.0 * sigma * sigma * rest * rest;
 }
 
+/// The curvature stage 2 needs, on the same terms `ddq_a` is carried for.
+/**
+ * `wiki/trajectory_planning.md` 5 writes the actuated acceleration as
+ * `q_a'' sigma_dot^2 + q_a' sigma_ddot`, over all six actuated coordinates and
+ * not over the five path ones -- so the tool row owes a second derivative just
+ * as the others do, and the path-constrained OCP of 5.2 reads it.
+ */
+double tool_shape_curvature(double sigma)
+{
+  return 60.0 * sigma * (1.0 - sigma) * (1.0 - 2.0 * sigma);
+}
+
 }  // namespace
 
 PathSample GeometricPath::at(double sigma) const
@@ -87,6 +99,7 @@ PathSample GeometricPath::at(double sigma) const
   const double travel = q8_goal_ - q8_start_;
   sample.q8 = q8_start_ + travel * tool_shape(sample.sigma);
   sample.dq8 = travel * tool_shape_rate(sample.sigma);
+  sample.ddq8 = travel * tool_shape_curvature(sample.sigma);
   return sample;
 }
 

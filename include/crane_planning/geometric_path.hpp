@@ -76,6 +76,7 @@ struct PathSample
   PathVector ddq_a{PathVector::Zero()};    ///< q_a''(sigma), per unit sigma squared
   double q8{};                             ///< carried, not a path variable
   double dq8{};                            ///< dq8/dsigma
+  double ddq8{};                           ///< d2q8/dsigma2, for the same reason `ddq_a` is here
 };
 
 /// What the fit is asked to interpolate, and what its refusals may call things.
