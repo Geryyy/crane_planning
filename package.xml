@@ -48,7 +48,20 @@
   <depend>ruckig</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <!-- `a2b_movement` (`CalcMovement.srv`), the one retained planning contract
+       ROS 2 Interfaces §9 keeps compatible, and the message package its payload
+       fields are made of.  These are **retained-tree interface packages, not new
+       dependencies** in Libraries' sense: that page governs which libraries this
+       workspace may take on, and these two are `.srv` and `.msg` definitions the
+       timber stack already builds and this workspace already installs.  Adding
+       them is what makes the adapter possible without carrying `LogShape` any
+       further than the adapter itself.  `wood_log_msgs` is named even though no
+       header here includes it directly, because `CalcMovement` embeds `LogShape`
+       and `Log[]`: an interface dependency that is only transitive is one a
+       manifest walk cannot see. -->
+  <depend>timber_crane_planning_interfaces</depend>
   <depend>trajectory_msgs</depend>
+  <depend>wood_log_msgs</depend>
   <!-- Pinocchio's own URDF front end, and the one `crane_model` parses the
        description with (`src/model.cpp`).  It is used here for the one thing the
        frozen model API does not expose and this planner cannot invent: the

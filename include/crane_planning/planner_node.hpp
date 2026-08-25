@@ -51,6 +51,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/string.hpp"
+#include "timber_crane_planning_interfaces/srv/calc_movement.hpp"
 #include "trajectory_msgs/msg/joint_trajectory.hpp"
 
 namespace crane_planning
@@ -158,8 +159,21 @@ public:
     const crane_msgs::srv::PlanGrip::Request & request,
     crane_msgs::srv::PlanGrip::Response & response);
 
-private:
-  void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
+  /// One `a2b_movement` request, answered as an adapter over `plan` above.
+  /**
+   * The compatibility row of `wiki/implementation/ros2_interfaces.md` 9. It
+   * translates, calls `plan` -- the very call `/crane/plan_motion` is answered
+   * by, so there is no second planner, no second set of limits and no second
+   * collision configuration -- and translates back. What it maps and what it
+   * refuses is `crane_planning/a2b_adapter.hpp`.
+   *
+   * Public for the same reason `plan` and `grip` are: the offline suite reads a
+   * refusal without a round trip. And it has to log its own refusals, because
+   * `CalcMovement::Response` carries no `message` field to put one on.
+   */
+  void a2b(
+    const timber_crane_planning_interfaces::srv::CalcMovement::Request & request,
+    timber_crane_planning_interfaces::srv::CalcMovement::Response & response);
 
   /// `crane_msgs/Payload` as the two halves the planner uses, or a reason it is not one.
   /**
@@ -167,10 +181,17 @@ private:
    * collision check takes a shape and an extent; they are different halves of
    * one message and both services read it the same way, so the conversion is
    * here and not written twice.
+   *
+   * Public, and static, because it is the far side of the adapter's boundary:
+   * the offline suite reads what a translated `LogShape` and a natively declared
+   * block each become here, without a node and without a graph.
    */
   [[nodiscard]] static bool read_payload(
     const crane_msgs::msg::Payload & message, crane_model::Payload & payload,
     PayloadShape & shape, std::string & why);
+
+private:
+  void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
 
   /// The six actuated rows of one trajectory as `trajectory_msgs`, with 1's stamp.
   [[nodiscard]] trajectory_msgs::msg::JointTrajectory as_message(
@@ -245,6 +266,19 @@ private:
 
   std::optional<crane_model::Model> model_;
   std::optional<PlannerContext> context_;
+
+  /// How far the tool hangs below the tip pivot K5, m, out of the description.
+  /**
+   * The one number the `a2b_movement` adapter needs and `CalcMovement` does not
+   * carry: `y_n` names the pivot and `crane_msgs/PlanMotion::goal` names the
+   * tool. Read once when the model is built, because it is a property of the
+   * description and the mounted tool; absent when the description does not carry
+   * both frames, and then the adapter refuses rather than placing the goal on
+   * the pivot.
+   */
+  std::optional<double> tip_to_tcp_drop_m_;
+  std::string tip_to_tcp_note_;  ///< where the drop came from, or why there is none
+
   sensor_msgs::msg::JointState::ConstSharedPtr joint_states_;
   crane_msgs::msg::PendulumState::ConstSharedPtr pendulum_state_;
   crane_msgs::msg::PayloadEstimate::ConstSharedPtr payload_estimate_;
@@ -270,6 +304,9 @@ private:
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
   rclcpp::Service<crane_msgs::srv::PlanMotion>::SharedPtr plan_motion_;
   rclcpp::Service<crane_msgs::srv::PlanGrip>::SharedPtr plan_grip_;
+
+  /// The retained row of 9, served by the same node and answered by `plan`.
+  rclcpp::Service<timber_crane_planning_interfaces::srv::CalcMovement>::SharedPtr a2b_movement_;
 };
 
 }  // namespace crane_planning

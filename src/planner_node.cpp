@@ -13,6 +13,7 @@
 
 #include "crane_msgs/msg/collision_primitive.hpp"
 #include "crane_msgs/msg/payload.hpp"
+#include "crane_planning/a2b_adapter.hpp"
 #include "crane_planning/crane_planner_parameters.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "trajectory_msgs/msg/joint_trajectory_point.hpp"
@@ -327,6 +328,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
       crane_msgs::srv::PlanGrip::Response::SharedPtr response) {
       grip(*request, *response);
     });
+  // The compatibility row of ROS 2 Interfaces 9, on this node and not on one of
+  // its own: it is an adapter over `plan` above, so a second node would be a
+  // second copy of the start state, the scene and the standing reference. It
+  // claims no interface and publishes nothing, exactly as the two rows above do.
+  a2b_movement_ = create_service<timber_crane_planning_interfaces::srv::CalcMovement>(
+    kA2bMovementService,
+    [this](
+      timber_crane_planning_interfaces::srv::CalcMovement::Request::SharedPtr request,
+      timber_crane_planning_interfaces::srv::CalcMovement::Response::SharedPtr response) {
+      a2b(*request, *response);
+    });
 
   RCLCPP_INFO(
     get_logger(),
@@ -367,6 +379,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "spans a reversal of that axis's transmission ratio is refused naming the crossing, never "
     "planned through: at the crossing the cylinder moves the tool through no distance at all.",
     kPlanGripService, kReferenceTopic, tool_end_name(settings_.tool_axis.closed_end));
+
+  RCLCPP_INFO(
+    get_logger(),
+    "crane_planner: %s answers timber_crane_planning_interfaces/CalcMovement as a thin adapter "
+    "over %s -- ROS 2 Interfaces 9's compatibility row. It translates and calls the same planning "
+    "path the native service is answered by, so there is no second planner, no second set of "
+    "limits and no second collision configuration; a request it cannot express is refused naming "
+    "the field it could not express, and the refusal goes to this log because CalcMovement's "
+    "response carries no message to put it on. Its payload fields are wood_log_msgs/LogShape, so "
+    "a log on this path becomes a crane_msgs/Payload cylinder and the LogShape stops here: a "
+    "block declared natively stays a box. `y_n` is the tip pivot K5 and the native goal is the "
+    "tool, so the goal is lowered onto the tool by the drop read out of the description, and "
+    "`q0`, `t_end`, `v_d_tip` and `logs_scene` have no native equivalent and are refused rather "
+    "than dropped.",
+    kA2bMovementService, kPlanMotionService);
 }
 
 void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr message)
@@ -406,6 +433,26 @@ void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr mes
     return;
   }
   context_.emplace(std::move(context).value());
+
+  // The one number the `a2b_movement` adapter needs beyond what this planner
+  // already reads: how far the tool hangs below the tip pivot `y_n` names. Read
+  // here rather than per request, because it is a property of this description
+  // and this tool -- and a failure to read it is the adapter's alone, so it is
+  // recorded and does not stop the two native services from being answered.
+  double drop = 0.0;
+  std::string why;
+  if (tip_to_tcp_drop(*model_, drop, why)) {
+    tip_to_tcp_drop_m_ = drop;
+    tip_to_tcp_note_ = "the tool hangs " + std::to_string(drop) +
+      " m below the tip pivot in this description, which is what an " +
+      std::string(kA2bMovementService) + " goal is lowered by";
+    RCLCPP_INFO(get_logger(), "%s", tip_to_tcp_note_.c_str());
+  } else {
+    tip_to_tcp_drop_m_.reset();
+    tip_to_tcp_note_ = why;
+    RCLCPP_WARN(
+      get_logger(), "%s will refuse every request: %s", kA2bMovementService, why.c_str());
+  }
 
   RCLCPP_INFO(
     get_logger(),
@@ -1129,6 +1176,56 @@ void PlannerNode::grip(
     response.message += ". As for the payload: " + payload_note;
   }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
+}
+
+void PlannerNode::a2b(
+  const timber_crane_planning_interfaces::srv::CalcMovement::Request & request,
+  timber_crane_planning_interfaces::srv::CalcMovement::Response & response)
+{
+  response.success = false;
+  response.trajectory = trajectory_msgs::msg::JointTrajectory{};
+  response.tcp_path.clear();
+
+  // Every refusal on this path goes to the log and nowhere else:
+  // `CalcMovement::Response` is `success`, `trajectory` and `tcp_path`, and the
+  // retained interface is not ours to widen. So the field that could not be
+  // expressed is named here, where an operator chasing a refused move can read
+  // it, rather than being reduced to a false on the wire and lost.
+  const auto refuse = [this](const std::string & why) {
+      RCLCPP_WARN(get_logger(), "%s refused: %s", kA2bMovementService, why.c_str());
+    };
+
+  if (!tip_to_tcp_drop_m_.has_value()) {
+    refuse(
+      tip_to_tcp_note_.empty() ?
+      std::string("no usable robot description has arrived on ") + kRobotDescriptionTopic +
+      " yet, so the drop from the tip pivot to the tool is unknown and `y_n` cannot be placed" :
+      tip_to_tcp_note_);
+    return;
+  }
+
+  crane_msgs::srv::PlanMotion::Request translated;
+  std::string why;
+  if (!translate_a2b_request(request, *tip_to_tcp_drop_m_, translated, why)) {
+    refuse(why);
+    return;
+  }
+
+  // The same call `/crane/plan_motion` is answered by, and not a copy of it: the
+  // start state, the passive estimate, the payload estimate, the scene, the
+  // latency budget, kappa, the standing reference and its republication are all
+  // that call's and are reached exactly once.
+  crane_msgs::srv::PlanMotion::Response planned;
+  plan(translated, planned);
+  translate_a2b_response(planned, response);
+
+  if (!response.success) {
+    refuse(planned.message);
+    return;
+  }
+  RCLCPP_INFO(
+    get_logger(), "%s answered from %s: %s", kA2bMovementService, kPlanMotionService,
+    planned.message.c_str());
 }
 
 }  // namespace crane_planning

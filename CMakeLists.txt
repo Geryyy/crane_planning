@@ -45,8 +45,18 @@ find_package(rclcpp REQUIRED)
 find_package(ruckig REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+# The retained `a2b_movement` contract of ROS 2 Interfaces §9 and the two message
+# packages that carry it. They are **retained-tree interface packages**, not new
+# third-party dependencies: `libraries.md` governs libraries, and these are the
+# `.srv` and `.msg` definitions the timber stack already ships and that §9 keeps
+# compatible rather than carrying over. Nothing in this package includes a
+# `wood_log_msgs` header directly -- `CalcMovement` embeds `LogShape` and `Log[]`
+# and pulls it in -- but it is named here anyway, because a transitive interface
+# dependency that is not declared is one a manifest walk cannot see.
+find_package(timber_crane_planning_interfaces REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(urdfdom REQUIRED)
+find_package(wood_log_msgs REQUIRED)
 
 # The planner's algorithm core: the semi-analytic inverse kinematics of
 # wiki/robot_model.md §2.2, the two-link geometry probed out of the model, the
@@ -121,7 +131,10 @@ generate_parameter_library(crane_planner_parameters
 # The adapter, as a library rather than as part of the executable: the service
 # test constructs this node object in process, so what is asserted is the node
 # the deployment runs and not a second one written for the test.
-add_library(planner_node STATIC src/planner_node.cpp)
+#
+# `src/a2b_adapter.cpp` is here and not in `planner_core` because it speaks ROS
+# messages on both sides -- that is all it does -- while the core is ROS-free.
+add_library(planner_node STATIC src/a2b_adapter.cpp src/planner_node.cpp)
 add_library(${PROJECT_NAME}::planner_node ALIAS planner_node)
 set_target_properties(planner_node PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(planner_node PUBLIC cxx_std_17)
@@ -137,7 +150,9 @@ target_link_libraries(planner_node
     ${geometry_msgs_TARGETS}
     ${sensor_msgs_TARGETS}
     ${std_msgs_TARGETS}
+    ${timber_crane_planning_interfaces_TARGETS}
     ${trajectory_msgs_TARGETS}
+    ${wood_log_msgs_TARGETS}
   PRIVATE
     crane_planner_parameters)
 
@@ -172,7 +187,9 @@ ament_export_dependencies(
   ruckig
   sensor_msgs
   std_msgs
-  trajectory_msgs)
+  timber_crane_planning_interfaces
+  trajectory_msgs
+  wood_log_msgs)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
@@ -322,14 +339,36 @@ if(BUILD_TESTING)
   # descend and lift are `plan_motion` itself, so serving the four phases adds
   # two more OCP solves of §5.2 at some 14 s each; 900 s is that with room, and
   # it bounds a hang rather than budgeting a latency (§7's latency is issue 045's).
-  ament_add_gtest(test_plan_motion_service test/test_plan_motion_service.cpp TIMEOUT 900)
+  # The timeout was 900 s while `/crane/plan_motion` and `/crane/plan_grip` were
+  # the only rows. `a2b_movement` (ROS 2 Interfaces §9) is served here too and one
+  # of its cases plans, which is one more OCP solve of §5.2 at some 14 s; the rest
+  # of them refuse, and a refusal costs nothing. 1200 s is that with room, and it
+  # bounds a hang rather than budgeting a latency (§7's latency is issue 045's).
+  ament_add_gtest(test_plan_motion_service test/test_plan_motion_service.cpp TIMEOUT 1200)
   target_link_libraries(test_plan_motion_service
     planner_node
     ${crane_msgs_TARGETS}
     ${sensor_msgs_TARGETS}
     ${std_msgs_TARGETS}
+    ${timber_crane_planning_interfaces_TARGETS}
     ${trajectory_msgs_TARGETS})
   target_compile_definitions(test_plan_motion_service PRIVATE
+    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
+
+  # S5 as well, and offline: the `a2b_movement` adapter of ROS 2 Interfaces §9,
+  # field by field in both directions. No node, no clock, no graph -- the two
+  # translations are message in, message out, and the one thing they read off the
+  # machine is the drop from the tip pivot to the tool, which comes out of the two
+  # checked-in descriptions. Cheap: nothing here plans, because what is under test
+  # is what the planner is *asked*, and `test_plan_motion_service.cpp` is where
+  # the served row is.
+  ament_add_gtest(test_a2b_adapter test/test_a2b_adapter.cpp TIMEOUT 300)
+  target_link_libraries(test_a2b_adapter
+    planner_node
+    ${crane_msgs_TARGETS}
+    ${timber_crane_planning_interfaces_TARGETS}
+    ${wood_log_msgs_TARGETS})
+  target_compile_definitions(test_a2b_adapter PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 endif()
 
