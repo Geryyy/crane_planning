@@ -261,8 +261,12 @@ if(BUILD_TESTING)
   # symbolic graph `crane_mpc` will export from, and the κ margin of §5.5.
   # Offline C++ and deterministic: acados is a numerical solver in process, so no
   # graph, no launch and no simulator is reachable from this binary either.
+  # This one binary links `crane_model::casadi_graph` on top of `planner_core`,
+  # which keeps it PRIVATE: `FlowAgreesWithTheGraph` rebuilds the graph and
+  # evaluates its output map itself, and a test that took the planner's word for
+  # the flow would assert nothing about the two being one expression.
   ament_add_gtest(test_timing_ocp test/test_timing_ocp.cpp TIMEOUT 1200)
-  target_link_libraries(test_timing_ocp planner_core)
+  target_link_libraries(test_timing_ocp planner_core crane_model::casadi_graph)
   target_compile_definitions(test_timing_ocp PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 

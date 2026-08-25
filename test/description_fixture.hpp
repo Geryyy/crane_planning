@@ -106,6 +106,34 @@ inline crane_model::QA centred(const crane_planning::JointLimits & limits, const
   return q_a;
 }
 
+/// `centred()`, pulled back into the range the arm actually **works** in.
+/**
+ * `centred()` centres every axis in the range the *description* gives it, and
+ * `wiki/trajectory_planning.md` 4.2 says in passing that the arm joint's range
+ * is far wider than its working range. That gap has a sharp edge: the arm
+ * cylinder's transmission Jacobian passes through zero at `theta3 = 1.85 rad`,
+ * which is almost exactly where the URDF's centre falls, and at a transmission
+ * zero the cylinder produces no torque about the joint at all. The static
+ * cylinder force there is some `5e7` N -- four hundred times what any relief
+ * setting delivers -- so `mpc.md` 3 constraint 6 is infeasible at that pose
+ * before a solver starts, and the machine cannot hold it either.
+ *
+ * That did not matter while the timing was issue 038's ramp, which constrained
+ * nothing. It matters now that the timing is the OCP of 5.2, and it is the same
+ * shape of correction as the one `test_trajectory_timing.cpp` already carries for
+ * the all-zero start: a pose the real check refuses, in a test that is not about
+ * that refusal. Every case that plans a *timing* therefore starts here, and the
+ * cases that only test geometry keep `centred()`.
+ */
+inline crane_model::QA working_centred(
+  const crane_planning::JointLimits & limits, const Machine & machine)
+{
+  crane_model::QA q_a = centred(limits, machine);
+  q_a[1] = -0.2;  // theta2_boom_joint
+  q_a[2] = 0.6;   // theta3_arm_joint, well clear of the 1.85 transmission zero
+  return q_a;
+}
+
 /// A move worth checking: slew across, drop the boom, extend a little.
 inline crane_model::QA moved(
   const crane_model::QA & start, const crane_planning::JointLimits & limits)

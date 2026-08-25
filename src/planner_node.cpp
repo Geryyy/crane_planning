@@ -191,6 +191,17 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
 
   settings_.ramp.Ts = parameters.Ts;
   settings_.ramp.min_duration = parameters.min_duration;
+
+  // trajectory_planning 5.5 and 5.2. kappa is the deployment's reservation and
+  // is deliberately not reachable from a request: `speed_scale` arrives per call
+  // on the service and multiplies the velocity bound only. The two hydraulic
+  // numbers and their evidence live in config/hydraulic_limits.yaml.
+  settings_.timing.kappa = parameters.kappa;
+  settings_.timing.sample_period = parameters.Ts;
+  settings_.timing.actuation.pump_flow_max = parameters.pump_flow_max;
+  settings_.timing.actuation.pump_flow_planning_factor =
+    parameters.pump_flow_planning_factor;
+  settings_.system_pressure_pa = parameters.system_pressure_pa;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
   max_input_age_ = parameters.max_input_age;
 
@@ -231,10 +242,15 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. A primitive that is "
     "blocked falls back to the RRT-Connect sampling planner of 4.4 over the five path coordinates "
     "of 4.1, shortcut, refitted C2 and re-checked as 4.5 makes mandatory, from a fixed seed and "
-    "inside a per-call budget -- and which of the two answered is in every reply. There is no "
-    "path-constrained OCP, so no force, flow or kappa margin (issue 043); that absence is refused "
-    "or named rather than approximated.",
-    kPlanMotionService, kReferenceTopic, kCollisionSceneTopic);
+    "inside a per-call budget -- and which of the two answered is in every reply. The timing is "
+    "the path-constrained OCP of trajectory_planning 5.2, solved with acados over crane_model's "
+    "symbolic graph: the sway is a state, so 5.4's terminal condition makes the tool arrive "
+    "hanging still, and the cylinder force and pump flow are constrained by the same expressions "
+    "mpc 3 constrains them with rather than by a second copy of them. kappa = %.2f of 5.5 is held "
+    "back from every physical limit for the MPC to correct with, and a caller's speed_scale "
+    "cannot reach it. A solve that does not converge is a refusal carrying the solver's own "
+    "status word, never a clipped trajectory.",
+    kPlanMotionService, kReferenceTopic, kCollisionSceneTopic, settings_.timing.kappa);
 }
 
 void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr message)

@@ -349,7 +349,7 @@ TEST_F(PlanMotionService, ASubscribedSceneBecomesTheTruckOfTrajectoryPlanningFou
   // self check is right to make and this test is not about.
   const crane_planning::JointLimits limits = fixture_limits();
   const crane_model::QA start =
-    crane_planning_test::centred(limits, crane_planning_test::machines().front());
+    crane_planning_test::working_centred(limits, crane_planning_test::machines().front());
   publish_start(positions_of(start));
 
   auto request = collision_blind_request();

@@ -1,0 +1,78 @@
+# The hydraulic limits the timing OCP of wiki/trajectory_planning.md 5.2 is
+# solved against. **Two numbers, and neither of them is strong.**
+#
+# They live here rather than in `crane_planner.yaml` for the reason that file
+# states in its own header: everything there is a property of the *solve*, and
+# the machine's own numbers are read out of the description the node is remapped
+# onto.  These two are neither.  They are properties of the hydraulics that the
+# URDF does not carry and that nothing in this workspace can measure, so they are
+# written down -- and a number that has to be written down gets its evidence
+# written down beside it.  `crane_control/config/tracking_tolerance.yaml` set
+# that shape for the tracking tolerance; this is the same shape for the pump and
+# the relief valve.
+#
+# ---------------------------------------------------------------------------
+# Q_P^max -- the pump flow limit
+# ---------------------------------------------------------------------------
+#
+# `wiki/implementation/parameters.md` 4 states it exactly once, and states its
+# provenance in the same sentence:
+#
+#     pump limit Q_P^max = 1.4e-3 m^3/s (measured 2023, **pre-retrofit, not
+#     re-verified**), used at 0.95x in planning.
+#
+# Both halves of that are carried here on purpose.  *Pre-retrofit* means the
+# measurement was taken on a machine that has since been rebuilt, and *not
+# re-verified* means nobody has checked that the pump on the crane today still
+# delivers it.  The `0.95x` is `parameters.md`'s own planning factor and it is
+# **not** a second kappa: it is the discount that number's weak evidence has
+# always carried, it is applied to `Q_P^max` alone, and it was already in force
+# in the legacy planner's retiming.  kappa (5.5) is a separate, larger reservation
+# applied to *every* physical limit so that the MPC has authority left to correct
+# with -- see the README.  The two multiply; neither substitutes for the other.
+#
+# What would replace this number: a flow measurement on the retrofitted machine.
+# The recordings under `control_recordings/` do not contain one -- `/cranedata`
+# carries hydraulic pressures and encoder angles, not pump displacement -- so
+# this cannot be closed from the bags either.
+#
+# ---------------------------------------------------------------------------
+# system_pressure_pa -- the relief setting the cylinder force limit comes from
+# ---------------------------------------------------------------------------
+#
+# **This one is not measured at all, and it is not in `parameters.md`.**
+# `wiki/trajectory_planning.md` 3 records that no existing planner enforces the
+# cylinder force limit, so there is no earlier number to inherit; `parameters.md`
+# carries the chamber areas but no relief setting, and its 7 lists the pressure
+# constants among its outright gaps.
+#
+# The areas are therefore *not* repeated here.  `derive_cylinder_force_limits()`
+# asks `crane_model` for them -- `hydraulics.md` 4's `F_i = A_A p_A - A_B p_B`,
+# which `Model::cylinder_force` already implements -- and multiplies the smaller
+# of the two chamber areas by the pressure below, because `mpc.md` 3 constraint 6
+# is written symmetrically in `|tau_i|` and the retracting side of a differential
+# cylinder is the weaker one.  Copying the areas into this file would let them
+# drift away from the description every controller in the deployment shares.
+#
+# `2.5e7` Pa (250 bar) is a **plausible relief setting for a crane of this class,
+# not a reading off this machine.**  It is stated rather than omitted because a
+# force limit that does not exist is the status quo 3 objects to, and a
+# conservative guess that the OCP enforces is worth more than no constraint at
+# all -- but it should be replaced by the plate on the power pack or by the
+# identification campaign of `wiki/hydraulics.md` 5.8, both human-only.
+#
+# The consequence of it being wrong is bounded and asymmetric: too low and the
+# planner refuses moves the machine could make, or takes longer over them; too
+# high and the force constraint stops binding before the hydraulics do, which is
+# the situation 3 already describes and this issue set out to end.  Erring low is
+# the safe direction and 250 bar errs low for most of the working range.
+crane_planner:
+  ros__parameters:
+    # m^3/s. Measured 2023, pre-retrofit, not re-verified. See the header.
+    pump_flow_max: 1.4e-3
+
+    # parameters.md 4's planning discount on the line above. Not kappa.
+    pump_flow_planning_factor: 0.95
+
+    # Pa. **Not measured on this machine** -- a plausible 250 bar relief setting.
+    system_pressure_pa: 2.5e7

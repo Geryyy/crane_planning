@@ -145,7 +145,7 @@ TEST(PlanMotion, CollisionAvoidanceIsHonouredAndItsAbsenceIsSaidOutLoud)
   // start at every joint zero, where the PZS100's rail gripper lies against the
   // arm: with a real self-collision check that path is refused, correctly, and
   // this test is not about that.
-  const crane_model::QA start = crane_planning_test::centred(context.limits, machine);
+  const crane_model::QA start = crane_planning_test::working_centred(context.limits, machine);
   const crane_model::Q goal =
     crane_planning_test::settled(model, crane_planning_test::moved(start, context.limits));
   auto goal_pose = model.forward_kinematics(

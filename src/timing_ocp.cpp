@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -121,7 +122,8 @@ Symbols make_symbols()
 }
 
 /// 5's chain rule: `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`.
-SX joint_acceleration(const SX & dq_a_path, const SX & ddq_a_path, const SX & rate, const SX & input)
+SX joint_acceleration(
+  const SX & dq_a_path, const SX & ddq_a_path, const SX & rate, const SX & input)
 {
   return ddq_a_path * (rate * rate) + dq_a_path * input;
 }
@@ -420,6 +422,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   const int intervals = static_cast<int>(settings.intervals);
   const double d_sigma = 1.0 / static_cast<double>(intervals);
   const Symbols symbols = make_symbols();
+  const ScaledLimits scaled = scale_limits(limits, settings, request.speed_scale);
 
   casadi::Function ode;
   casadi::Function vde;
@@ -506,8 +509,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
           "the path is not finite at sigma = " + std::to_string(sample.sigma)));
     }
   }
-
-  const ScaledLimits scaled = scale_limits(limits, settings, request.speed_scale);
 
   // The passive pair the machine hangs at, at **every** node and not only at the
   // two ends. 5.4's terminal condition is `q_u(T) = q_eq` and the start is the
@@ -738,9 +739,16 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     std::vector<double> lower;
     std::vector<double> upper;
     if (stage == 0) {
-      index = {0, 2, 3, 4, 5};
-      lower = {0.0, q_u_start[0], q_u_start[1], 0.0, 0.0};
-      upper = lower;
+      // `sigma_dot(0)` carries the same box as every running stage and for the
+      // same reason the terminal stage does: the objective divides by it, so a
+      // rate the QP is free to take through zero -- or negative, which is the
+      // path run backwards -- makes `1/sigma_dot` singular on the first step.
+      // The machine still starts at rest whatever the box says, because the path
+      // meets its start with `q_a'(0) = 0`; what is pinned here is the tool's
+      // state, not the coordinate's.
+      index = {0, 1, 2, 3, 4, 5};
+      lower = {0.0, settings.sigma_rate_min, q_u_start[0], q_u_start[1], 0.0, 0.0};
+      upper = {0.0, rate_ceiling, q_u_start[0], q_u_start[1], 0.0, 0.0};
     } else if (stage == intervals) {
       // 5.4, in full: the path is finished, the tool hangs at its equilibrium and
       // it is not moving. `sigma_dot(T)` is the one row 5.4 asks for that this
@@ -823,6 +831,72 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     }
     rate_guesses[static_cast<std::size_t>(stage)] =
       std::max(rate, 2.0 * settings.sigma_rate_min);
+  }
+
+  // ...and then pulled down until the *force* and *flow* rows are inside their
+  // bounds too, which the curve above says nothing about.
+  //
+  // This is the difference between a first QP that solves and `ACADOS_QP_FAILURE`
+  // on SQP iteration 1. The velocity-limit curve is feasible for constraints 1
+  // and 2 of the 3 table by construction, but `F_cyl` and `Q` are evaluated
+  // through the transmission and can be far outside constraints 6 and 7 at a
+  // rate that respects the other two -- most sharply on the structured
+  // primitive's lift phase, where the arm carries the load against gravity. The
+  // QP is then handed a violation of a nonlinear row it has no feasible step
+  // for, and it reports a solver failure rather than an infeasible problem.
+  //
+  // Both rows fall monotonically as the rate falls -- flow is linear in the
+  // piston velocity and the dynamic part of the force is quadratic in it -- so
+  // halving is enough and no search is needed. What does *not* fall with the
+  // rate is the **static** force: at rest the cylinder still holds the arm up.
+  // If gravity alone is outside constraint 6 then no guess is feasible and the
+  // problem genuinely is not solvable, which is the honest refusal below rather
+  // than something to warm-start around.
+  for (int stage = 0; stage <= intervals; ++stage) {
+    const std::size_t at = static_cast<std::size_t>(stage);
+    const crane_model::QA position = actuated(nodes[at], 0);
+    const crane_model::QA slope = actuated(nodes[at], 1);
+    const crane_model::QA curvature = actuated(nodes[at], 2);
+    const double floor_rate = 2.0 * settings.sigma_rate_min;
+
+    for (int attempt = 0; attempt < 24; ++attempt) {
+      const double rate = rate_guesses[at];
+      std::vector<double> state16;
+      state16.reserve(16U);
+      for (int row = 0; row < dof; ++row) {state16.push_back(position[row]);}
+      state16.push_back(q_u_equilibrium[at][0]);
+      state16.push_back(q_u_equilibrium[at][1]);
+      for (int row = 0; row < dof; ++row) {state16.push_back(slope[row] * rate);}
+      state16.push_back(0.0);
+      state16.push_back(0.0);
+      std::vector<double> acceleration(static_cast<std::size_t>(dof), 0.0);
+      for (int row = 0; row < dof; ++row) {
+        acceleration[static_cast<std::size_t>(row)] = curvature[row] * rate * rate;
+      }
+
+      double worst = 0.0;
+      try {
+        const std::vector<casadi::DM> outputs = graph->z(
+          std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
+        const std::vector<double> z = outputs[0].nonzeros();
+        double flow = 0.0;
+        for (int row = 0; row < dof; ++row) {
+          const double force =
+            z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
+          worst = std::max(
+            worst, std::abs(force) / scaled.force_max[static_cast<std::size_t>(row)]);
+          flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+        }
+        worst = std::max(worst, std::abs(flow) / scaled.flow_max);
+      } catch (const std::exception &) {
+        worst = std::numeric_limits<double>::infinity();
+      }
+
+      if (!(worst > 1.0) || rate <= floor_rate) {
+        break;
+      }
+      rate_guesses[at] = std::max(floor_rate, 0.5 * rate);
+    }
   }
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);
@@ -947,6 +1021,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   // ------------------------------------------------------------------
   // What the answer actually demands of the machine
   // ------------------------------------------------------------------
+  solution.nodes.reserve(static_cast<std::size_t>(intervals) + 1U);
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> state(static_cast<std::size_t>(kOcpStateDof), 0.0);
     ocp_nlp_out_get(ocp.config_, ocp.dims_, ocp.out_, stage, "x", state.data());
@@ -985,6 +1060,13 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     const std::vector<casadi::DM> outputs = graph->z(
       std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
     const std::vector<double> z = outputs[0].nonzeros();
+    OcpNode record;
+    record.sigma = static_cast<double>(stage) * d_sigma;
+    record.sigma_rate = state[1];
+    record.q_a = position;
+    record.q_u = crane_model::QU(state[2], state[3]);
+    record.dq_u = crane_model::DQU(state[4], state[5]);
+    record.q_u_equilibrium = q_u_equilibrium[static_cast<std::size_t>(stage)];
     double flow = 0.0;
     for (int row = 0; row < dof; ++row) {
       const double force =
@@ -994,7 +1076,12 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         std::abs(force) /
         settings.actuation.cylinder_force_max[static_cast<std::size_t>(row)]);
       flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+      record.dq_a[row] = slope[row] * state[1];
+      record.ddq_a[row] = acceleration[static_cast<std::size_t>(row)];
+      record.cylinder_force[row] = force;
     }
+    record.pump_flow = flow;
+    solution.nodes.push_back(record);
     solution.peak_demand.pump_flow = std::max(
       solution.peak_demand.pump_flow,
       flow / (settings.actuation.pump_flow_planning_factor * settings.actuation.pump_flow_max));

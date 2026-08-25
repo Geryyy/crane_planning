@@ -58,6 +58,7 @@
 #include <array>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 #include "crane_model/model.hpp"
 #include "crane_planning/geometric_path.hpp"
@@ -192,10 +193,42 @@ struct PeakDemand
   [[nodiscard]] double worst() const noexcept;
 };
 
+/// One shooting node of the solved OCP, in physical units.
+/**
+ * The trajectory is resampled onto a uniform time grid and carries the six
+ * actuated rows only, which is what a reference is. This is the solve itself:
+ * the sway states 5.2 carries and the two constrained quantities read off the
+ * graph's output map, at the nodes the constraints were actually imposed at.
+ *
+ * It exists so that the two things this issue's acceptance turns on are
+ * *checkable from outside* rather than only believed. 5.4's terminal condition
+ * is a statement about `q_u` and `dq_u`, which a six-row reference cannot show;
+ * and "the planner's flow is the graph's flow, not a second copy of it" is a
+ * claim a test can only settle by re-evaluating the graph at the same points and
+ * comparing. Both are what `test_timing_ocp.cpp` does with this.
+ */
+struct OcpNode
+{
+  double sigma{};
+  double sigma_rate{};                ///< `sigma_dot`, per second
+  crane_model::QA q_a{};
+  crane_model::DQA dq_a{};            ///< `q_a'(sigma) sigma_dot`, so a real velocity
+  crane_model::QA ddq_a{};            ///< 5.2's `q_a'' sigma_dot^2 + q_a' sigma_ddot`
+  crane_model::QU q_u{};
+  crane_model::DQU dq_u{};
+  crane_model::QU q_u_equilibrium{};  ///< where the tool hangs at this `q_a`
+  crane_model::QA cylinder_force{};   ///< N, mpc.md 3 constraint 6's left-hand side
+  double pump_flow{};                 ///< m^3/s, constraint 7's, summed over the axes
+};
+
 /// One solved timing.
 struct TimingSolution
 {
   TimedTrajectory trajectory{};
+
+  /// The solve on its own sigma grid. See `OcpNode`.
+  std::vector<OcpNode> nodes;
+
   PeakDemand peak_demand{};
   double kappa{};             ///< the margin actually applied
   double speed_scale{};       ///< the caller's request, kept separate from kappa

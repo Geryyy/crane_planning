@@ -33,7 +33,10 @@ named*, never approximated.
 | sway | §4.3's envelope, at the `q_sway_max` of `mpc` §3 constraint 3, resolved rather than inflated |
 | fallback | §4.4's second mechanism, RRT-Connect over `q_a`, reached **only** when the primitive is blocked |
 | smoothing | §4.5's mandatory shortcut → C² fit → re-check, on every sampled path and on no primitive |
-| timing | one scaled ramp obeying the velocity limits, run along that path |
+| timing | the path-constrained OCP of §5.2, solved with acados over `crane_model`'s CasADi graph |
+| sway in the timing | `q_u` is a **state** of that OCP, so §5.4's "arrive hanging still" is an imposed terminal condition |
+| force and flow | the graph's own output-map rows — the expressions `mpc` §3 constraints 6 and 7 are written from |
+| margin | §5.5's κ, applied to every physical limit, reserved for the MPC and not spendable by a caller |
 
 **Which of §2.2's two formulations runs is this planner's decision, not a
 parameter.** §2.2's closing paragraph is the rule — the semi-analytic route where
@@ -291,11 +294,14 @@ pair blocked and where.
   geometry and not on the load's. Closing it means either a scene-primitive pair
   query in `crane_model` or a second geometry path here, and the first is the
   right one.
-- **The timing is deliberately trivial.** One velocity-limited ramp, C¹ at both
-  ends and at rest there. The real stage 2 — the path-constrained OCP of
-  `trajectory_planning` §5.2, carrying the sway explicitly, with the cylinder
-  force and pump-flow constraints and the κ margin that leaves the MPC authority
-  — arrives with **issue 043**. Nothing here reads `Q_P^max` or a cylinder force.
+- **Issue 038's velocity-limited ramp no longer answers anything.** The
+  trajectory `/crane/plan_motion` returns and `/crane/reference` republishes is
+  §5.2's, on every call and with no path back to the ramp — a timing that could
+  silently degrade to one that ignores force and flow would put exactly the
+  reference §5.3 calls a planner bug on the wire. `scaled_ramp_along_path` stays
+  in `trajectory_timing.hpp` because `TimedTrajectory` and its sampling are what
+  the OCP's grid is resampled onto, and it is still covered by its own tests;
+  nothing in the planning path calls it.
 - **Clearance is half the redundancy score, and only where the redundancy is
   resolved.** `robot_model` §2.2 step 3 scores the telescope's one leftover
   degree of freedom by joint-range centring *and* collision clearance, and both
@@ -320,6 +326,84 @@ pair blocked and where.
   do with a plan that could not be produced in time.
 - `/crane/plan_grip` is **issue 044**, replanning from a moving and swinging start
   **issue 045**, and the `a2b_movement` adapter **issue 046**.
+
+## κ is not `speed_scale`
+
+They are both numbers below one that make the machine go slower, they multiply,
+and confusing them would quietly give away the thing §5.5 exists to keep.
+
+| | κ | `speed_scale` |
+|---|---|---|
+| whose | the **deployment's** reservation | the **caller's** request |
+| where | `timing.kappa`, a node parameter | a field of `crane_msgs/PlanMotion` |
+| applies to | *every* physical limit — velocity, acceleration, cylinder force, pump flow | the joint **velocity** bound alone |
+| default | `0.8` | `1.0` |
+| means | "the MPC gets the other 20 %" | "I want this move taken gently" |
+
+> [!IMPORTANT]
+> **κ defaults below one on purpose, and raising it to one is not a speed
+> setting — it is a decision to hand the MPC a reference it cannot correct.**
+> §5.5 is the argument: a timing computed exactly at the actuation limits
+> saturates the actuators *by construction*, at every instant the limit binds. The
+> MPC's job is to add a corrective acceleration on top of the reference, and at
+> saturation there is none left to add — the controller's authority is zero
+> precisely where the trajectory is hardest to track. The legacy planner had the
+> same insight and expressed it as a refusal to iterate its time-scale factor to
+> unity; making it a named parameter is the change, not the idea.
+
+**A caller cannot raise κ by asking for more speed.** `speed_scale` enters
+`scale_limits()` on the velocity row only and multiplies κ there rather than
+replacing it, so `speed_scale > 1` — which the service validates away in any case
+— could at most undo a caller's own earlier slow-down. The reserved authority is
+not reachable from the request message. That is why `TimingSolution` carries
+`kappa` and `speed_scale` as two fields and why `PeakDemand` reports each peak as
+a fraction of the **physical** limit rather than of the scaled one: "the peak
+demand sat at κ and not at one" is then something the caller reads, not something
+it has to trust.
+
+`Q_P^max`'s own `0.95×` is a third factor and is neither of these. It is
+`parameters.md` §4's discount on one weakly-evidenced number, it applies to the
+pump flow alone, and `config/hydraulic_limits.yaml` carries it with the "measured
+2023, pre-retrofit, not re-verified" provenance that is the reason for it.
+
+## What the OCP is, and what it refuses
+
+State `x_σ = (σ, σ̇, q_u, dq_u) ∈ ℝ⁶`, input `u_σ = σ̈`, discretised over **σ and
+not over time** — §5.2 already writes the objective as `∫₀¹ dσ/σ̇`, and on a fixed
+σ-grid `q_a'(σ)` and `q_a''(σ)` are known numbers at every shooting node instead
+of something that would have to be carried symbolically. `σ` is a state anyway so
+that §5.4's `σ(T) = 1` is imposed rather than an artefact of the grid.
+
+The passive rows come from `crane_model::symbolic::CasadiGraph`, and the force and
+flow rows are read out of that graph's **output map** — the same expressions
+`mpc` §3 constraints 6 and 7 are built from, including §3.1's smoothing, which is
+compiled into the graph and must not be applied a second time. §5.3's *"a
+reference the MPC would reject is a planner bug"* therefore holds by construction
+and not by two implementations agreeing; `test_timing_ocp.cpp` asserts the
+planner's flow row and the graph's output map agree pointwise rather than
+resembling each other.
+
+Two things it will not do:
+
+- **A solve that does not converge is `success=false` carrying acados' own status
+  word**, never a partial or clipped trajectory. `mpc` §5.3 requirement 1 — a
+  backend that always reports success removes the only signal a supervisor could
+  act on — binds the planner exactly as it binds the controller.
+- **The solve is bounded in wall clock here**, by `timing.max_wall_clock`, and not
+  in a caller's timeout. §7's bounded-latency requirement as a whole is issue
+  045's; this cap is the piece of it that lives inside the OCP.
+
+**The OCP starts from rest**, and it is worth being exact about which coordinate
+says so. The passive pair is pinned at the settled `q_u^eq` of the start pose with
+`dq_u(0) = 0`, and the *joints* are at rest because the path meets its start with
+`q_a'(0) = 0` — not because `σ̇(0)` is pinned to zero. It is not: `σ̇` is a path
+rate, the objective divides by it, and pinning it at either end would make the
+first and last stage singular. What is asserted is what the machine does, not what
+the coordinate reads. This is the stopped-start convention `trajectory_planning`
+§7 calls a defect to inherit; issue 045 lifts it, and the boundary condition that
+changes is the *initial* one — `q_u(0)` and `dq_u(0)` become the measured state at
+the replan instant, and the path is refitted so that `q_a'(0)` matches the measured
+velocity instead of vanishing. §5.4's terminal conditions do not change.
 
 ## It is not a second command producer
 
@@ -358,6 +442,9 @@ reading these sources.
     include/crane_planning/collision.hpp           §4.2's scene and truck, §4.3's sway envelope
     include/crane_planning/sampling_planner.hpp    §4.4's fallback and §4.5's mandatory smoothing
     include/crane_planning/trajectory_timing.hpp   the ramp, and the seam it meets the path at
+    include/crane_planning/timing_ocp.hpp          §5.2's OCP, §5.3's constraints and §5.5's κ
+    src/acados_casadi_bridge.hpp                   where acados meets CasADi; not installed
+    config/hydraulic_limits.yaml                   Q_P^max and the relief setting, with their evidence
     include/crane_planning/planner_core.hpp        goal in, trajectory out, ROS-free
     include/crane_planning/planner_node.hpp        the adapter
     config/crane_planner.yaml                      what a deployment configures

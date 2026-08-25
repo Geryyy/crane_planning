@@ -58,10 +58,12 @@ struct TimedTrajectory
 
 /// The scaled ramp between two configurations.
 /**
- * `margin_factor` is kappa of `wiki/trajectory_planning.md` 5.5, taken straight
- * off `crane_msgs/PlanMotion.speed_scale`. It scales the velocity bound and
- * therefore the duration; a value outside (0, 1] is refused rather than clamped,
- * because a clamp would answer a request nobody made.
+ * `margin_factor` is `crane_msgs/PlanMotion.speed_scale` and **not** kappa. Issue
+ * 038 wrote them as one thing because the timing constrained nothing else; they
+ * are two, they are owned by different parties, and `timing_ocp.hpp` is where
+ * the distinction now lives. This scales the velocity bound and therefore the
+ * duration; a value outside (0, 1] is refused rather than clamped, because a
+ * clamp would answer a request nobody made.
  */
 [[nodiscard]] crane_model::Result<TimedTrajectory> scaled_ramp(
   const crane_model::QA & q_a_start, const crane_model::QA & q_a_goal, const JointLimits & limits,

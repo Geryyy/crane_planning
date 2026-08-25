@@ -86,7 +86,7 @@ Fixture build_fixture(const Machine & machine)
 {
   crane_model::Model model = crane_planning_test::build_model(machine);
   crane_planning::PlannerContext context = crane_planning_test::build_context(model, machine);
-  const crane_model::QA start = centred(context.limits, machine);
+  const crane_model::QA start = crane_planning_test::working_centred(context.limits, machine);
 
   crane_planning::PrimitiveRequest request;
   request.q_start = settled(model, start);

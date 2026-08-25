@@ -516,3 +516,67 @@ crane_planner:
       standing still and refuses when it cannot tell."
     validation:
       gt<>: [0.0]
+
+  kappa:
+    type: double
+    default_value: 0.8
+    read_only: true
+    description: "The margin of wiki/trajectory_planning.md 5.5: the fraction of
+      the machine's actuation authority the planner is allowed to spend, applied
+      to every physical limit -- joint velocity, actuator acceleration, cylinder
+      force and pump flow. **It defaults below one on purpose and raising it to
+      one is not a speed setting.** 5.5's [!important] is the reason: a timing
+      computed exactly at the limits saturates the actuators by construction, at
+      every instant a limit binds, and the MPC's job is to add a corrective
+      acceleration on top of the reference -- at saturation there is none left to
+      add, so the controller's authority is zero precisely where the trajectory
+      is hardest to track. The legacy planner expressed the same insight as a
+      refusal to iterate its time-scale factor to unity; making it a named
+      parameter is the change. It is **not** speed_scale: that is the caller's
+      request on crane_msgs/PlanMotion, it touches the velocity bound alone, and
+      no value of it raises this."
+    validation:
+      bounds<>: [0.0, 1.0]
+
+  pump_flow_max:
+    type: double
+    default_value: 0.0014
+    read_only: true
+    description: "Q_P^max of wiki/implementation/parameters.md 4, m^3/s, the
+      right-hand side of mpc.md 3 constraint 7 before the planning factor below.
+      **Measured 2023, pre-retrofit, not re-verified** -- parameters.md states the
+      provenance in the same sentence as the number and config/hydraulic_limits.yaml
+      carries both. Pre-retrofit means it was measured on a machine that has since
+      been rebuilt; not re-verified means nobody has checked the pump on the crane
+      today still delivers it."
+    validation:
+      gt<>: [0.0]
+
+  pump_flow_planning_factor:
+    type: double
+    default_value: 0.95
+    read_only: true
+    description: "The 0.95x parameters.md 4 prescribes for using Q_P^max in
+      planning. **Not a second kappa**: it is the discount that one weakly
+      evidenced number has always carried, it applies to the pump flow alone, and
+      it was already in force in the legacy planner's retiming. kappa is the
+      separate, larger reservation applied to every limit. The two multiply and
+      neither substitutes for the other."
+    validation:
+      bounds<>: [0.0, 1.0]
+
+  system_pressure_pa:
+    type: double
+    default_value: 25000000.0
+    read_only: true
+    description: "The hydraulic relief setting F_i^max is derived from, Pa.
+      trajectory_planning 3 records that no existing planner enforces the cylinder
+      force limit, so there is no earlier number to inherit, and parameters.md
+      carries the chamber areas but no relief setting at all -- its 7 lists the
+      pressure constants among its gaps. The areas are asked of the model rather
+      than declared here, so they cannot drift from the description; this is the
+      one number that cannot be derived. **The default is a plausible 250 bar for
+      a crane of this class, not a reading off this machine.**
+      config/hydraulic_limits.yaml is where that is written down at length."
+    validation:
+      gt<>: [0.0]
