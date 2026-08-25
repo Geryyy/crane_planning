@@ -338,9 +338,21 @@ TEST(TimingOcp, ForceLimitCostsTime)
   // under: squeeze past it and the problem is genuinely infeasible, which is a
   // refusal and not a slower move. So walk the limit down from the loose solve's
   // own peak and take the first tightening that still solves.
+  //
+  // The walk is coarse where nothing can happen and fine where everything does.
+  // On this fixture the loose solve peaks at some 0.64 of the physical limit and
+  // the static floor sits at about 0.71x, so the whole window in which the force
+  // both binds and is satisfiable is **0.80x to 0.71x** -- a tightening of 0.8x
+  // leaves the peak at 99.5% of its allowance, close enough that which of the two
+  // durations is larger is decided in the fifth decimal. A grid that steps
+  // straight from 0.8 to 0.7 falls through that window on one side or the other.
   crane_planning::TimingSolution tight;
   double applied = 0.0;
-  for (const double factor : {0.9, 0.8, 0.7, 0.6, 0.5}) {
+  // What each tightening did, so that a failure here says which of the two ways
+  // it can fail happened -- squeezed past the static floor and refused, or
+  // solved and did not cost anything -- rather than only that neither worked.
+  std::string walked;
+  for (const double factor : {0.90, 0.85, 0.80, 0.78, 0.76, 0.74, 0.72}) {
     Fixture binding = make_fixture(machine);
     for (double & limit : binding.settings.actuation.cylinder_force_max) {
       limit *= factor;
@@ -349,6 +361,11 @@ TEST(TimingOcp, ForceLimitCostsTime)
     request.payload = empty_gripper();
     auto attempt = crane_planning::solve_timing_ocp(
       binding.model, binding.config, binding.path, binding.limits, request, binding.settings);
+    walked += "\n  " + std::to_string(factor) + "x: " +
+      (attempt.ok() ?
+      "solved, duration " + std::to_string(attempt.value().trajectory.duration) +
+      " s, peak force " + std::to_string(attempt.value().peak_demand.cylinder_force) :
+      "refused -- " + attempt.status().message);
     if (attempt.ok() && attempt.value().trajectory.duration > loose.trajectory.duration) {
       tight = std::move(attempt).value();
       applied = factor;
@@ -357,8 +374,10 @@ TEST(TimingOcp, ForceLimitCostsTime)
   }
 
   ASSERT_GT(applied, 0.0)
-    << "no tightening of F_i^max between 0.9x and 0.5x made the move take longer, "
-       "so the force limit is not deciding anything";
+    << "no tightening of F_i^max between 0.90x and 0.72x made the move take longer, "
+       "so the force limit is not deciding anything. The loose solve took " <<
+    loose.trajectory.duration << " s at peak force " << loose.peak_demand.cylinder_force <<
+    " of the physical limit, and the walk went:" << walked;
   EXPECT_GT(tight.trajectory.duration, loose.trajectory.duration);
 
   // And it was the force that decided it: the tight solve pushes the force to its

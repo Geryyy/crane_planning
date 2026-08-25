@@ -236,7 +236,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "is a decision variable under g_u(q) = 0 rather than a pinning, so the tool arrives at rest "
     "-- the geometry is the structured lift/traverse/descend primitive of trajectory_planning "
     "4.4, built C2 in sigma with its transfer altitude derived from the endpoints and the tool's "
-    "own reach rather than hard-coded, and the timing is one velocity-limited ramp run along it. "
+    "own reach rather than hard-coded. "
     "The path is checked against %s -- the scene, the truck bed and the runges of "
     "trajectory_planning 4.2 keyed to the measured truck pose, and the crane against itself -- "
     "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. A primitive that is "

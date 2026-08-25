@@ -950,8 +950,23 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   // so climbing back up from a guess that is too slow is exactly the direction
   // the merit line search is slowest in: on the structured primitive that was
   // 117 SQP iterations and eight seconds. Twelve bisection steps place the guess
-  // within 0.03% of the largest feasible rate and cost twelve evaluations of an
+  // within 0.03% of the target below and cost twelve evaluations of an
   // expression the solver evaluates thousands of times.
+  //
+  // **The target is a fraction of the allowance and not the allowance itself.**
+  // Bisecting against 1.0 places the guess *on* the boundary of constraints 6
+  // and 7 -- and at almost every node at once, because the largest feasible rate
+  // is what makes some row bind by definition. The QP underneath acados is an
+  // interior-point method: a point with zero slack on a dozen rows per stage is
+  // exactly where its barrier terms and its Riccati factorisation break down,
+  // and what comes back is `ACADOS_QP_FAILURE` on the first QP with a NaN inside
+  // it rather than an honest infeasibility. Backing the target off to 0.9 leaves
+  // every row strictly interior at the cost of a tenth of the guess's speed,
+  // which the SQP then recovers in a handful of iterations. This is what the
+  // sampled fallback's path needs and the structured primitive did not: the
+  // refit of 4.5 leaves curvatures an order of magnitude larger, so far more
+  // nodes are pinned against a row at once.
+  constexpr double kGuessInteriorTarget = 0.9;
   const double floor_rate = 2.0 * settings.sigma_rate_min;
   for (int stage = 0; stage <= intervals; ++stage) {
     const std::size_t at = static_cast<std::size_t>(stage);
@@ -997,18 +1012,50 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
 
     double feasible = floor_rate;
     double infeasible = std::max(rate_guesses[at], floor_rate);
-    if (!(demand(infeasible) > 1.0)) {
-      continue;  // the acceleration curve already fits; nothing to pull down
+    if (!(demand(infeasible) > kGuessInteriorTarget)) {
+      continue;  // the acceleration curve is already interior; nothing to do
     }
     for (int step = 0; step < 12; ++step) {
       const double middle = 0.5 * (feasible + infeasible);
-      if (demand(middle) > 1.0) {
+      if (demand(middle) > kGuessInteriorTarget) {
         infeasible = middle;
       } else {
         feasible = middle;
       }
     }
     rate_guesses[at] = feasible;
+  }
+
+  // ...and then made *reachable*, which per-node feasibility does not make it.
+  /*
+   * Each rate above is the largest one node can be crossed at on its own. Where
+   * the path is stationary -- the two endpoints, where `q_a'` and `q_a''` both
+   * vanish -- nothing limits it at all and it comes back at `sigma_rate_max`,
+   * beside neighbours an order of magnitude slower. A guess that steps by a
+   * factor of twenty over one interval is not a trajectory of the dynamics it is
+   * a guess for: the shooting gap at that stage is enormous, and the first QP
+   * spends its step closing that rather than descending the objective.
+   *
+   * The classical forward-backward pass of 5.1 is what turns a per-node speed
+   * limit into a profile the input can actually produce. In sigma it is one line
+   * -- `d(sigma_dot^2)/dsigma = 2 sigma_ddot` -- so a sweep each way, taking the
+   * smaller of what the node allows and what the neighbour can be accelerated
+   * from, is enough. It only ever lowers a rate, so everything the bisection
+   * above established stays true.
+   */
+  const double rate_step = 2.0 * settings.sigma_accel_max * d_sigma;
+  for (int stage = 1; stage <= intervals; ++stage) {
+    const std::size_t at = static_cast<std::size_t>(stage);
+    rate_guesses[at] = std::min(
+      rate_guesses[at], std::sqrt(rate_guesses[at - 1U] * rate_guesses[at - 1U] + rate_step));
+  }
+  for (int stage = intervals - 1; stage >= 0; --stage) {
+    const std::size_t at = static_cast<std::size_t>(stage);
+    rate_guesses[at] = std::min(
+      rate_guesses[at], std::sqrt(rate_guesses[at + 1U] * rate_guesses[at + 1U] + rate_step));
+  }
+  for (double & rate : rate_guesses) {
+    rate = std::max(rate, floor_rate);
   }
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);

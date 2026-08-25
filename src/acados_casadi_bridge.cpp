@@ -271,7 +271,14 @@ std::string AcadosCasadiFunction::bind(const casadi::Function & function, std::s
   slot_ = index;
   handles_.reserve(instances);
   for (std::size_t instance = 0; instance < instances; ++instance) {
-    auto * fun = new external_function_external_param_casadi{};
+    // Value-initialised -- `()` and not `{}` -- so every field acados does not
+    // set below starts zero. The two are the same initialisation for this
+    // aggregate; the parentheses are for cppcheck 2.7, which reads `new T{}`
+    // for a `T` whose definition it cannot see as leaving the pointer
+    // uninitialised. acados' headers are not on the checker's include path, so
+    // every one of its types is such a `T`. A parser failure rather than a
+    // defect, but one `pre-commit run -a` fails CI on.
+    auto * fun = new external_function_external_param_casadi();
     fun->casadi_fun = trampoline.evaluate;
     fun->casadi_work = trampoline.work;
     fun->casadi_sparsity_in = trampoline.sparsity_in;
