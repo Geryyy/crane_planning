@@ -142,7 +142,11 @@ primitive-first is what buys deterministic latency in the common case and leaves
 completeness to the rare one. Nothing runs the fallback beside the primitive, to
 compare with it or to "check" it; a fallback that runs anyway spends exactly what
 the ordering was for, and there is a test that asserts a clear scene comes back
-with the primitive's own path and **zero** configurations sampled.
+with the primitive's own path and **zero** configurations sampled. The other half
+of the order is asserted through the same `plan_motion` call and the same request,
+with only the scene moved onto the path: the primitive is refused, the search runs,
+and what comes back is the sampled path itself — the geometry the trajectory was
+timed along, with the primitive's refusal kept beside it.
 
 Which of the two answered is on `MotionPlan::mechanism` and in the service
 `message`, because a caller cannot otherwise tell a lucky deterministic plan from
