@@ -415,8 +415,19 @@ TEST(TimingOcp, AFlowLimitedMultiAxisMoveIsSlowerWhenThePumpIsSmaller)
   // two contribute to the same sum.
   EXPECT_GT(slow.trajectory.duration, fast.trajectory.duration)
     << "a fifth of the pump cost nothing, so constraint 7 was not enforced";
-  EXPECT_GT(slow.peak_demand.pump_flow, fast.peak_demand.pump_flow)
-    << "the starved solve did not push the pump harder as a fraction of its own limit";
+  // The **duration** is what separates the two, and it is the only thing that
+  // can. `PeakDemand` is a fraction of each solve's *own* configured limit, so
+  // once both solves are pump-bound they both read `kappa` and the fraction says
+  // nothing about which pump was smaller -- that is arithmetic, not a finding.
+  // Issue 045's measured start widened stage 0 by `StartResolution`, which bought
+  // the ample solve enough freedom to reach the bound as well; it read below
+  // `kappa` before only because stage 0 was pinned to machine epsilon. What is
+  // still worth asserting is that the starved solve is *on* its bound rather than
+  // slowed down by something else that happened to move with the pump.
+  EXPECT_NEAR(slow.peak_demand.pump_flow, ample.settings.kappa, 1.0e-3)
+    << "the starved solve did not end up on its own pump bound, so the fifth of a pump is not "
+    "what made it slower";
+  EXPECT_GE(slow.peak_demand.pump_flow, fast.peak_demand.pump_flow - 1.0e-9);
 }
 
 /// The 0.95x of parameters.md 4, which is not kappa and is not optional.

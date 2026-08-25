@@ -634,6 +634,12 @@ TEST_F(PlanMotionService, ThePayloadEstimateEntersWhereItIsValidAndIsStatedWhere
   // stands and the answer says so rather than quietly substituting numbers the
   // estimator does not stand behind.
   publish_payload_estimate(137.0, false);
+  // ...and the start state again with it. Each `out_of_reach_request()` above
+  // spends some hundreds of milliseconds inside the equilibrium-constrained solve
+  // before it refuses, so a `/joint_states` published once at the top of the case
+  // is past `max_input_age` by the second call and the node refuses for *that*
+  // reason instead -- a wall-clock race, and one this case is not about.
+  publish_start();
   settle();
   const auto not_valid = call(out_of_reach_request());
   ASSERT_NE(not_valid, nullptr);
@@ -650,6 +656,7 @@ TEST_F(PlanMotionService, ThePayloadEstimateEntersWhereItIsValidAndIsStatedWhere
   // (`wiki/robot_model.md` 5.3: for a gravity moment the payload is a point mass,
   // which is exactly what this message carries).
   publish_payload_estimate(137.0, true);
+  publish_start();
   settle();
   const auto valid = call(out_of_reach_request());
   ASSERT_NE(valid, nullptr);
