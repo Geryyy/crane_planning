@@ -49,7 +49,17 @@ using trajectory_msgs::msg::JointTrajectory;
 
 /// How long any one wait may take before the test fails, s. Generous, because it
 /// bounds a failure rather than a success.
-constexpr double kBudget = 20.0;
+/**
+ * It was 20 s while the timing was issue 038's ramp and one plan cost a few
+ * seconds. The timing is now the OCP of `wiki/trajectory_planning.md` 5.2 and
+ * one plan costs some 14 s -- of which the solve itself is 4 s and the rest is
+ * the endpoint IK, the collision check and one `Model::passive_equilibrium` per
+ * emitted point. Twenty seconds is then a coin toss rather than a bound, and a
+ * flaky suite is worse than a slow one. **This is not a latency budget**: 7's
+ * bounded latency is issue 045's, the OCP's own share of it is
+ * `TimingOcpSettings::max_wall_clock` and it is enforced inside the solver.
+ */
+constexpr double kBudget = 60.0;
 
 /// The domain this binary runs on: one step off the one it was given, so that
 /// the suites colcon runs beside it cannot see this fixture's `/joint_states`
@@ -97,9 +107,19 @@ std::string fixture_description()
 }
 
 /// The configuration the fixture reports on `/joint_states`, and plans from.
+/**
+ * Inside the arm's **working** range, which is narrower than the range the
+ * description gives it. That did not matter while the timing was issue 038's
+ * ramp, because a ramp constrains nothing; it matters now that the timing is the
+ * OCP of `wiki/trajectory_planning.md` 5.2, which enforces `mpc.md` 3 constraint
+ * 6 on the cylinder force. The boom-up, arm-out pose this used to hold --
+ * `boom = 0.4, arm = 1.2` -- needs 0.91 of the arm cylinder's whole force just to
+ * stand still, so there is nothing left under kappa = 0.8 for a move, and the
+ * planner is right to refuse it. Here the same pose costs 0.49.
+ */
 const std::vector<double> & start_positions()
 {
-  static const std::vector<double> positions{0.0, 0.4, 1.2, 0.6, 0.0, 0.0, 0.0, 0.3};
+  static const std::vector<double> positions{0.0, -0.2, 0.6, 0.6, 0.0, 0.0, 0.0, 0.3};
   return positions;
 }
 
@@ -220,10 +240,19 @@ protected:
     return goal;
   }
 
+  /// A goal that moves every axis worth moving, and that the machine can hold.
+  /**
+   * `arm = 1.6` used to stand here and it is 2.76 of the arm cylinder's force at
+   * rest -- nearly three times what the hydraulics deliver, because 1.6 rad is
+   * within a quarter radian of the transmission zero at 1.85 where `J_c,22`
+   * vanishes and the cylinder has no moment arm about the joint at all. The
+   * machine cannot hold that pose either, so it is not a goal to plan to. See
+   * `start_positions()` above; this one costs 0.55.
+   */
   static crane_model::QA goal_configuration()
   {
     crane_model::QA q_a;
-    q_a << 0.9, 0.2, 1.6, 1.1, 0.4, 0.3;
+    q_a << 0.9, -0.1, 0.8, 1.4, 0.4, 0.3;
     return q_a;
   }
 

@@ -616,8 +616,28 @@ void PlannerNode::plan(
   response.message += (motion_plan.mechanism == PathMechanism::SamplingFallback) ?
     describe(motion_plan.sampled) :
     describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note;
-  response.message +=
-    ". The timing is the ramp of this tracer, not the OCP of trajectory_planning 5.2 (issue 043)";
+  // What the timing was, and what it cost the machine. `PeakDemand` is a fraction
+  // of the **physical** limit, so a caller reads the margin directly rather than
+  // taking on trust that kappa was applied: every number below sits at or under
+  // kappa, and the gap between it and one is what the MPC has left to correct
+  // with (trajectory_planning 5.5).
+  const TimingSolution & timing = motion_plan.timing;
+  response.message += ". The timing is the path-constrained OCP of trajectory_planning 5.2, "
+    "solved with acados over crane_model's symbolic graph in " +
+    std::to_string(timing.solve_time) + " s and " + std::to_string(timing.iterations) +
+    " SQP iterations (" + timing.solver_status +
+    "): the sway is a state, so 5.4's terminal condition holds and the tool arrives hanging "
+    "still. Of the physical limits the peak demand is " +
+    std::to_string(timing.peak_demand.joint_velocity) + " of joint velocity, " +
+    std::to_string(timing.peak_demand.joint_acceleration) + " of joint acceleration, " +
+    std::to_string(timing.peak_demand.cylinder_force) + " of cylinder force and " +
+    std::to_string(timing.peak_demand.pump_flow) +
+    " of pump flow -- the force and flow expressions being the ones mpc 3 constrains with, "
+    "read off the same output map rather than restated. kappa = " +
+    std::to_string(timing.kappa) + " of 5.5 bounds all four and is the deployment's "
+    "reservation; speed_scale = " + std::to_string(timing.speed_scale) +
+    " is this caller's own request and scales the velocity bound alone, so no value of it "
+    "reaches into the margin";
   if (!scene_note_.empty()) {
     response.message += ". As for the scene: " + scene_note_;
   }

@@ -132,6 +132,15 @@ crane_planning::TimingSolution solved(const Fixture & fixture)
   return std::move(solution).value();
 }
 
+}  // namespace
+
+// The cases below sit **outside** the anonymous namespace above, as every other
+// test binary in this package does. That is not a style choice: cppcheck 2.7
+// cannot parse a `TEST(...)` macro that follows a declaration inside an
+// anonymous namespace, and reports it as a `syntaxError` on the first macro --
+// a parser failure rather than a defect, but one `pre-commit run -a` fails CI
+// on. Closing the namespace first is what the rest of the suite already does.
+
 TEST(TimingOcp, SolvesTheStraightMove)
 {
   for (const Machine & machine : machines()) {
@@ -353,11 +362,14 @@ TEST(TimingOcp, ForceLimitCostsTime)
   EXPECT_GT(tight.trajectory.duration, loose.trajectory.duration);
 
   // And it was the force that decided it: the tight solve pushes the force to its
-  // own scaled bound, which against the *unscaled* limit it is reported over is
-  // `factor x kappa`.
-  const double bound = applied * generous.settings.kappa;
+  // own scaled bound, which is kappa of the limit it was given. `PeakDemand` is a
+  // fraction of the **configured** limit and the tightening went into that
+  // configuration, so `factor` has already been divided out and does not appear
+  // here -- multiplying by it again would ask the tight solve to sit at
+  // `factor x kappa` of a limit that is itself `factor` smaller.
+  const double bound = generous.settings.kappa;
   EXPECT_GT(tight.peak_demand.cylinder_force, 0.5 * bound)
-    << "the force never approached the limit that was supposed to bind";
+    << "the force never approached the limit that was supposed to bind, at factor " << applied;
   EXPECT_LE(tight.peak_demand.cylinder_force, bound + 1.0e-6);
 }
 
@@ -435,5 +447,3 @@ TEST(TimingOcp, ARefusalIsARefusalAndNotAClippedTrajectory)
   EXPECT_NE(solution.status().message.find("ACADOS_"), std::string::npos)
     << solution.status().message;
 }
-
-}  // namespace

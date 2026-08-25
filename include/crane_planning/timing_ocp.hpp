@@ -150,10 +150,18 @@ struct TimingOcpSettings
   double sample_period{0.04};
 
   /// The bound of 7, enforced inside the solver rather than in a caller's timeout.
-  double max_wall_clock{5.0};
+  /**
+   * Sized against what the solve actually costs rather than round: the
+   * structured lift/traverse/descend primitive converges in some 44 SQP
+   * iterations and 4.1 s here, and a bound is only a bound if the ordinary case
+   * clears it on a slower machine too. This is the piece of 7's latency that
+   * lives in the OCP; the end-to-end budget is issue 045's, and it is the larger
+   * number -- one plan is 14 s of which the solve is under a third.
+   */
+  double max_wall_clock{12.0};
 
   /// SQP iteration cap. Hitting it is a refusal, never a clipped trajectory.
-  int max_iterations{120};
+  int max_iterations{250};
 
   /// When the SQP step is small enough to stop, in the two units it has.
   /**

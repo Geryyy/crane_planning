@@ -214,6 +214,25 @@ Eigen::Vector3d chord_midpoint(const Fixture & scenario)
   return tcp_of(scenario.model, settled(scenario.model, halfway));
 }
 
+/// The edge of the structure the cases below round, metres.
+/**
+ * It has to be large enough to block the primitive and small enough to leave the
+ * two **endpoints** clear, and the second half of that is not free: the chord
+ * midpoint sits 1.80 m from the start tool centre and 1.67 m from the goal's, but
+ * what is checked at an endpoint is the whole machine over the sway envelope of
+ * 4.3, which reaches a good deal further than the tool centre does. A one-metre
+ * cube there refuses the goal outright, and a goal that is itself blocked is a
+ * different refusal from the one every case here is about -- it is the one
+ * `AGoalThatIsItselfBlockedIsNotABudgetRefusal` exists to make, deliberately,
+ * with a box placed on the goal rather than between the endpoints.
+ *
+ * 0.8 m is measured rather than guessed: it is the largest of the sizes tried
+ * that leaves both endpoints clear, and it still blocks the primitive, which
+ * `ItRoundsAStructureThePrimitiveCannotAndTheAnswerIsCleared` asserts before it
+ * asserts anything else.
+ */
+constexpr double kStructureSide = 0.8;
+
 /// A structure that must be rounded -- 4.4's own reason for a fallback.
 crane_model::CollisionScene structure_to_round(const Fixture & scenario, double side)
 {
@@ -429,7 +448,7 @@ const SampledOnce & sampled_once()
   if (!done) {
     done = true;
     const Fixture & scenario = fixture(0);
-    answer.scene = structure_to_round(scenario, 1.0);
+    answer.scene = structure_to_round(scenario, kStructureSide);
     auto plan = crane_planning::plan_sampled_path(
       scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
       quick_settings(), quick_search(), sampling_request(scenario, answer.scene));
@@ -535,7 +554,7 @@ TEST(SamplingFallback, TheSameSeedGivesTheSamePathTwice)
 TEST(SamplingFallback, AnExhaustedWallClockBudgetIsARefusalNamingItAndNotAPartialPath)
 {
   const Fixture & scenario = fixture(0);
-  const crane_model::CollisionScene scene = structure_to_round(scenario, 1.0);
+  const crane_model::CollisionScene scene = structure_to_round(scenario, kStructureSide);
 
   SamplingSettings starved = quick_search();
   starved.time_budget_s = 1.0e-6;  // spent before the first sample is drawn
@@ -562,7 +581,7 @@ TEST(SamplingFallback, AnExhaustedWallClockBudgetIsARefusalNamingItAndNotAPartia
 TEST(SamplingFallback, AnExhaustedCheckAllowanceIsARefusalNamingItToo)
 {
   const Fixture & scenario = fixture(0);
-  const crane_model::CollisionScene scene = structure_to_round(scenario, 1.0);
+  const crane_model::CollisionScene scene = structure_to_round(scenario, kStructureSide);
 
   SamplingSettings starved = quick_search();
   starved.max_validity_checks = 2U;  // the search gets two configurations and no more
@@ -732,7 +751,7 @@ TEST(MechanismOrder, ABlockedPrimitiveIsAnsweredByTheFallbackAndTheAnswerSaysWhi
 TEST(Probe, DISABLED_WhatOneValidityCheckCosts)
 {
   const Fixture & scenario = fixture(0);
-  const crane_model::CollisionScene scene = structure_to_round(scenario, 1.0);
+  const crane_model::CollisionScene scene = structure_to_round(scenario, kStructureSide);
   const crane_model::Q q = scenario.q_start;
 
   const auto began = std::chrono::steady_clock::now();

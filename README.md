@@ -6,9 +6,9 @@ serves `/crane/plan_motion` and publishes the trajectory it answered with on
 
 It grew out of the **slice-5 tracer bullet** of `docs/features/cbs-arch/prd.md`
 §2 — one goal pose in, one timed joint trajectory out, through a real node and a
-real service. Stage 1 of `wiki/trajectory_planning.md` is now there in full; stage
-2 is not, and the point of this package is that every absence is *refused or
-named*, never approximated.
+real service. Both stages of `wiki/trajectory_planning.md` are now there in full —
+stage 1's geometry and stage 2's path-constrained OCP — and the point of this
+package is that every remaining absence is *refused or named*, never approximated.
 
 > **Build note.** This package needs **OMPL** (`libraries.md` §1) for §4.4's
 > sampling fallback, and the devcontainer image does not carry it yet: add
@@ -383,7 +383,7 @@ and not by two implementations agreeing; `test_timing_ocp.cpp` asserts the
 planner's flow row and the graph's output map agree pointwise rather than
 resembling each other.
 
-Two things it will not do:
+Three things it will not do:
 
 - **A solve that does not converge is `success=false` carrying acados' own status
   word**, never a partial or clipped trajectory. `mpc` §5.3 requirement 1 — a
@@ -391,7 +391,20 @@ Two things it will not do:
   act on — binds the planner exactly as it binds the controller.
 - **The solve is bounded in wall clock here**, by `timing.max_wall_clock`, and not
   in a caller's timeout. §7's bounded-latency requirement as a whole is issue
-  045's; this cap is the piece of it that lives inside the OCP.
+  045's; this cap is the piece of it that lives inside the OCP. The measured cost
+  of the structured primitive is some 44 SQP iterations and 4 s, and the cap is
+  three times that, so an ordinary plan clears it on a slower machine too.
+- **A path the machine cannot hold at rest is refused before the solver runs,**
+  by name. A cylinder holds the arm up at rest and that part of constraint 6 does
+  not fall when the move is slowed down, so if gravity alone is outside the scaled
+  limit at any node no timing exists. Left to acados that comes back as
+  `ACADOS_QP_FAILURE`, which is a correct refusal and a useless diagnostic; here
+  it names the node, the axis, the force it would take and the transmission
+  `J_c,ii` at that pose. The usual cause is a pose near a transmission zero, where
+  `J_c,ii` vanishes and the cylinder has no moment arm about the joint at any
+  force — the sharp edge on §4.2's remark that the arm joint's range is far wider
+  than its working range. On the PZS100 the arm's zero is at `θ₃ = 1.85 rad`,
+  which is almost exactly where the URDF's own mid-range falls.
 
 **The OCP starts from rest**, and it is worth being exact about which coordinate
 says so. The passive pair is pinned at the settled `q_u^eq` of the start pose with

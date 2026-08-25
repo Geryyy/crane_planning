@@ -531,6 +531,95 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   const crane_model::QU q_u_start = q_u_equilibrium.front();
   const crane_model::QU q_u_goal = q_u_equilibrium.back();
 
+  // The **static** force, before any timing is chosen, at every node.
+  /*
+   * A cylinder holds the arm up at rest, and that part of constraint 6 does not
+   * fall when the move is slowed down: it is the floor the warm start below
+   * cannot bisect under. If gravity alone is outside the scaled limit at any
+   * node then no timing exists, and this is where that is said.
+   *
+   * It is said *here*, and not left to the solver, because the solver's answer
+   * to it is `ACADOS_QP_FAILURE` -- a refusal that is correct under `mpc.md` 5.3
+   * requirement 1 and useless to whoever has to act on it. The usual cause is a
+   * pose near a transmission zero, where `J_c,ii -> 0` and the cylinder has no
+   * moment arm about its joint at all, so `|tau_i| <= J_c,ii F_i^max` cannot
+   * hold at any force. `trajectory_planning` 4.2 says in passing that the arm
+   * joint's range is far wider than its working range; this is that sentence
+   * with a number on it, and it names the node, the axis and the transmission
+   * so a caller can tell an unreachable pose from an unavailable solver.
+   */
+  for (std::size_t at = 0; at < nodes.size(); ++at) {
+    std::vector<double> state16;
+    state16.reserve(16U);
+    const crane_model::QA position = actuated(nodes[at], 0);
+    for (int row = 0; row < static_cast<int>(crane_model::kActuatedDof); ++row) {
+      state16.push_back(position[row]);
+    }
+    state16.push_back(q_u_equilibrium[at][0]);
+    state16.push_back(q_u_equilibrium[at][1]);
+    state16.resize(16U, 0.0);  // at rest: every velocity row is zero
+    const std::vector<double> rest(crane_model::kActuatedDof, 0.0);
+
+    std::vector<double> z;
+    try {
+      const std::vector<casadi::DM> outputs =
+        graph->z(std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(rest)});
+      z = outputs[0].nonzeros();
+    } catch (const std::exception & error) {
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::SymbolicBackendFailure,
+          std::string("the output map of mpc 3 could not be evaluated at rest at sigma = ") +
+          std::to_string(nodes[at].sigma) + ": " + error.what()));
+    }
+
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      const double force = z[crane_model::symbolic::kCylinderForceOffset + row];
+      if (std::isfinite(force) && std::abs(force) <= scaled.force_max[static_cast<int>(row)]) {
+        continue;
+      }
+      // The transmission at the same pose, so the message can say *why* rather
+      // than only that. `J_c,ii` near zero is the usual cause and is the one a
+      // reader can act on: it is a pose off the working range, not a load.
+      crane_model::Q q = crane_model::Q::Zero();
+      for (std::size_t axis = 0; axis < crane_model::kActuatedDof; ++axis) {
+        q[static_cast<Eigen::Index>(kActuatedRows[axis])] =
+          position[static_cast<Eigen::Index>(axis)];
+      }
+      q[4] = q_u_equilibrium[at][0];
+      q[5] = q_u_equilibrium[at][1];
+      crane_model::ChamberPressure quiescent;
+      quiescent.p_a_pa.setZero();
+      quiescent.p_b_pa.setZero();
+      std::string transmission_note;
+      auto ratios = model.transmission(q, crane_model::DQA::Zero(), quiescent);
+      if (ratios.ok()) {
+        transmission_note = ". J_c," + std::to_string(row) + std::to_string(row) + " = " +
+          std::to_string(
+          ratios.value().joint_to_cylinder(
+            static_cast<Eigen::Index>(row), static_cast<Eigen::Index>(row))) +
+          " there, so a torque about the joint costs that much cylinder force";
+      }
+
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::InvalidArgument,
+          "the path cannot be held at rest, so no timing of it exists: at sigma = " +
+          std::to_string(nodes[at].sigma) + " the cylinder of actuated row " +
+          std::to_string(row) + " must carry " + std::to_string(force) +
+          " N to hold the machine still, against the " +
+          std::to_string(scaled.force_max[static_cast<int>(row)]) +
+          " N this solve allows it (kappa = " + std::to_string(settings.kappa) + " of " +
+          std::to_string(settings.actuation.cylinder_force_max[row]) + " N)" +
+          transmission_note +
+          ". A static force does not fall when a move is slowed down, so this is a "
+          "refusal about the path and not about the solver: the usual cause is a pose near "
+          "that axis's transmission zero, where J_c,ii vanishes and the cylinder has no "
+          "moment arm about the joint at any force (trajectory_planning 4.2 -- the arm "
+          "joint's range is far wider than its working range)"));
+    }
+  }
+
   // ------------------------------------------------------------------
   // The acados problem
   // ------------------------------------------------------------------
@@ -847,56 +936,79 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   //
   // Both rows fall monotonically as the rate falls -- flow is linear in the
   // piston velocity and the dynamic part of the force is quadratic in it -- so
-  // halving is enough and no search is needed. What does *not* fall with the
-  // rate is the **static** force: at rest the cylinder still holds the arm up.
-  // If gravity alone is outside constraint 6 then no guess is feasible and the
-  // problem genuinely is not solvable, which is the honest refusal below rather
-  // than something to warm-start around.
+  // the largest feasible rate can be found by bisection and is worth finding.
+  // What does *not* fall with the rate is the **static** force: at rest the
+  // cylinder still holds the arm up. That case has already been refused above,
+  // by name, so the floor here is known to be feasible and the bracket below is
+  // known to close.
+  //
+  // **Bisecting rather than halving is what makes this converge in a service
+  // call.** Halving stops at the first rate that fits, which is up to a factor
+  // two under the largest one that does, and the guess then starts an order of
+  // magnitude of traversal time away from the optimum in the worst nodes. The
+  // cost is `1/sigma_dot`, whose Gauss-Newton curvature falls as the rate rises,
+  // so climbing back up from a guess that is too slow is exactly the direction
+  // the merit line search is slowest in: on the structured primitive that was
+  // 117 SQP iterations and eight seconds. Twelve bisection steps place the guess
+  // within 0.03% of the largest feasible rate and cost twelve evaluations of an
+  // expression the solver evaluates thousands of times.
+  const double floor_rate = 2.0 * settings.sigma_rate_min;
   for (int stage = 0; stage <= intervals; ++stage) {
     const std::size_t at = static_cast<std::size_t>(stage);
     const crane_model::QA position = actuated(nodes[at], 0);
     const crane_model::QA slope = actuated(nodes[at], 1);
     const crane_model::QA curvature = actuated(nodes[at], 2);
-    const double floor_rate = 2.0 * settings.sigma_rate_min;
 
-    for (int attempt = 0; attempt < 24; ++attempt) {
-      const double rate = rate_guesses[at];
-      std::vector<double> state16;
-      state16.reserve(16U);
-      for (int row = 0; row < dof; ++row) {state16.push_back(position[row]);}
-      state16.push_back(q_u_equilibrium[at][0]);
-      state16.push_back(q_u_equilibrium[at][1]);
-      for (int row = 0; row < dof; ++row) {state16.push_back(slope[row] * rate);}
-      state16.push_back(0.0);
-      state16.push_back(0.0);
-      std::vector<double> acceleration(static_cast<std::size_t>(dof), 0.0);
-      for (int row = 0; row < dof; ++row) {
-        acceleration[static_cast<std::size_t>(row)] = curvature[row] * rate * rate;
-      }
-
-      double worst = 0.0;
-      try {
-        const std::vector<casadi::DM> outputs = graph->z(
-          std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
-        const std::vector<double> z = outputs[0].nonzeros();
-        double flow = 0.0;
+    // How far outside constraints 6 and 7 this node is at one candidate rate,
+    // as a fraction of the allowance. At or below one is feasible.
+    const auto demand = [&](double rate) {
+        std::vector<double> state16;
+        state16.reserve(16U);
+        for (int row = 0; row < dof; ++row) {state16.push_back(position[row]);}
+        state16.push_back(q_u_equilibrium[at][0]);
+        state16.push_back(q_u_equilibrium[at][1]);
+        for (int row = 0; row < dof; ++row) {state16.push_back(slope[row] * rate);}
+        state16.push_back(0.0);
+        state16.push_back(0.0);
+        std::vector<double> acceleration(static_cast<std::size_t>(dof), 0.0);
         for (int row = 0; row < dof; ++row) {
-          const double force =
-            z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
-          worst = std::max(
-            worst, std::abs(force) / scaled.force_max[static_cast<std::size_t>(row)]);
-          flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+          acceleration[static_cast<std::size_t>(row)] = curvature[row] * rate * rate;
         }
-        worst = std::max(worst, std::abs(flow) / scaled.flow_max);
-      } catch (const std::exception &) {
-        worst = std::numeric_limits<double>::infinity();
-      }
 
-      if (!(worst > 1.0) || rate <= floor_rate) {
-        break;
-      }
-      rate_guesses[at] = std::max(floor_rate, 0.5 * rate);
+        double worst = 0.0;
+        try {
+          const std::vector<casadi::DM> outputs = graph->z(
+            std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
+          const std::vector<double> z = outputs[0].nonzeros();
+          double flow = 0.0;
+          for (int row = 0; row < dof; ++row) {
+            const double force =
+              z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
+            worst = std::max(
+              worst, std::abs(force) / scaled.force_max[static_cast<std::size_t>(row)]);
+            flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+          }
+          worst = std::max(worst, std::abs(flow) / scaled.flow_max);
+        } catch (const std::exception &) {
+          worst = std::numeric_limits<double>::infinity();
+        }
+        return worst;
+      };
+
+    double feasible = floor_rate;
+    double infeasible = std::max(rate_guesses[at], floor_rate);
+    if (!(demand(infeasible) > 1.0)) {
+      continue;  // the acceleration curve already fits; nothing to pull down
     }
+    for (int step = 0; step < 12; ++step) {
+      const double middle = 0.5 * (feasible + infeasible);
+      if (demand(middle) > 1.0) {
+        infeasible = middle;
+      } else {
+        feasible = middle;
+      }
+    }
+    rate_guesses[at] = feasible;
   }
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> guess(static_cast<std::size_t>(kOcpStateDof), 0.0);
