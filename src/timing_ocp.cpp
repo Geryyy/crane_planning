@@ -31,7 +31,21 @@ using crane_model::Status;
 
 constexpr int kOcpStateDof = 6;   ///< (sigma, sigma_dot, q_u, dq_u), 5.2
 constexpr int kOcpInputDof = 1;   ///< sigma_ddot
-constexpr int kOcpConstraints = 13;  ///< 6 acceleration, 6 cylinder force, 1 pump flow
+
+/// 5 acceleration, 5 cylinder force, 1 pump flow -- the **path** coordinates only.
+/**
+ * Eleven and not thirteen. The tool coordinate is driven by the low-level
+ * velocity/position controller (`tool_axis.hpp`, and `crane_mpc/ocp.hpp` for the
+ * same statement one layer up), so no timing this OCP chooses moves it: it has no
+ * acceleration to bound, no cylinder force to hold and no pump draw to charge
+ * against constraint 7's shared supply.
+ *
+ * The tool **link** does not leave with the coordinate. It is pinned at the
+ * configuration the path carries -- `q8` still reaches the model, `dq8` and `ddq8`
+ * are zero -- so its mass and inertia are still in `M(q)` and the arm is still
+ * timed against the machine it really is. See `actuated`.
+ */
+constexpr int kOcpConstraints = 2 * static_cast<int>(kPathDof) + 1;
 
 /// One block of path data: q_a(sigma), q_a'(sigma), q_a''(sigma), all six rows.
 constexpr int kPathBlock = 3 * static_cast<int>(crane_model::kActuatedDof);
@@ -64,6 +78,16 @@ std::string acados_status_word(int status)
 }
 
 /// The full actuated row of a path sample: the five path coordinates, then q8.
+/**
+ * **The tool row is pinned, at every derivative above the zeroth.** `q8` is
+ * carried, because the model has to be evaluated at the configuration the tool is
+ * actually in -- its inertia is in `M(q)` and dropping it would time the arm
+ * against a lighter machine. `dq8` and `ddq8` are **not**: the OCP holds the tool
+ * still, so a rate or an acceleration on that row would be a motion this solve
+ * neither planned nor bounded. Along an arm path they are zero anyway (`q8` is not
+ * a path variable, 4.1), and zeroing them here is what makes that a property of
+ * the problem rather than of the path that happened to arrive.
+ */
 crane_model::QA actuated(const PathSample & sample, int derivative)
 {
   crane_model::QA value = crane_model::QA::Zero();
@@ -73,7 +97,7 @@ crane_model::QA actuated(const PathSample & sample, int derivative)
       (derivative == 1 ? sample.dq_a[axis] : sample.ddq_a[axis]);
   }
   const Eigen::Index tool = static_cast<Eigen::Index>(kToolRow);
-  value[tool] = derivative == 0 ? sample.q8 : (derivative == 1 ? sample.dq8 : sample.ddq8);
+  value[tool] = derivative == 0 ? sample.q8 : 0.0;
   return value;
 }
 
@@ -193,9 +217,14 @@ ScaledLimits scale_limits(
  * `q_a'`, i.e. a per-stage bound on one state and cheaper as a box than as a
  * nonlinear row.
  *
+ * The **tool row is absent from all three groups**, for the reason
+ * `kOcpConstraints` gives: the low-level controller drives that axis, this OCP
+ * holds it still, and a row for an axis the solve cannot move is a row that can
+ * only ever be satisfied.
+ *
  * **Every row is divided by its own scaled limit**, so the vector is a set of
  * *fractions of the allowance* and the box is plain `[-1, 1]`. That is not
- * cosmetic. Written in physical units the thirteen rows span nine decades --
+ * cosmetic. Written in physical units the eleven rows span nine decades --
  * radians per second squared near one, newtons near `1e5`, cubic metres per
  * second near `1e-3` -- and the QP's constraint Jacobian inherits the spread.
  * HPIPM fails on it: `ACADOS_QP_FAILURE` on the first step, for a problem whose
@@ -220,15 +249,16 @@ SX constraint_vector(
   const int flow = static_cast<int>(crane_model::symbolic::kAxisFlowOffset);
   const int dof = static_cast<int>(crane_model::kActuatedDof);
 
+  const int planned = static_cast<int>(kPathDof);
   const SX cylinder_force = z(casadi::Slice(force, force + dof));
-  const SX pump_flow = SX::sum1(z(casadi::Slice(flow, flow + dof)));
+  const SX pump_flow = SX::sum1(z(casadi::Slice(flow, flow + planned)));
 
   std::vector<SX> rows;
   rows.reserve(static_cast<std::size_t>(kOcpConstraints));
-  for (int row = 0; row < dof; ++row) {
+  for (int row = 0; row < planned; ++row) {
     rows.push_back(ddq_a(row) / scaled.ddq_a_max[row]);
   }
-  for (int row = 0; row < dof; ++row) {
+  for (int row = 0; row < planned; ++row) {
     rows.push_back(cylinder_force(row) / scaled.force_max[row]);
   }
   rows.push_back(pump_flow / scaled.flow_max);
@@ -627,7 +657,9 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
           std::to_string(nodes[at].sigma) + ": " + error.what()));
     }
 
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    // The path coordinates only: constraint 6 has no tool row, so a tool cylinder
+    // holding a closed gripper at rest is not a reason to refuse a path.
+    for (std::size_t row = 0; row < kPathDof; ++row) {
       const double force = z[crane_model::symbolic::kCylinderForceOffset + row];
       if (std::isfinite(force) && std::abs(force) <= scaled.force_max[static_cast<int>(row)]) {
         continue;
@@ -795,7 +827,8 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   std::vector<double> lower_h(static_cast<std::size_t>(kOcpConstraints), -1.0);
   std::vector<double> upper_h(static_cast<std::size_t>(kOcpConstraints), 1.0);
   const int dof = static_cast<int>(crane_model::kActuatedDof);
-  lower_h[static_cast<std::size_t>(2 * dof)] = 0.0;
+  const int planned = static_cast<int>(kPathDof);
+  lower_h[static_cast<std::size_t>(2 * planned)] = 0.0;
 
   std::vector<int> input_index{0};
   std::vector<double> input_lower{-settings.sigma_accel_max};
@@ -1135,7 +1168,10 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
             std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
           const std::vector<double> z = outputs[0].nonzeros();
           double flow = 0.0;
-          for (int row = 0; row < dof; ++row) {
+          // The rows the constraint vector carries, and no others: bisecting
+          // against a tool row the solve cannot relieve would lower every guess
+          // for a demand no timing can change.
+          for (int row = 0; row < planned; ++row) {
             const double force =
               z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
             worst = std::max(
@@ -1365,9 +1401,15 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
 
     std::vector<double> acceleration(static_cast<std::size_t>(crane_model::kActuatedDof), 0.0);
     const crane_model::QA position = actuated(node, 0);
+    // All six rows go into the model, because the tool link is pinned and not
+    // removed; only the five the OCP constrained are reported as demand, because
+    // `PeakDemand` is a fraction of a limit this solve was actually held to.
     for (int row = 0; row < dof; ++row) {
       acceleration[static_cast<std::size_t>(row)] =
         curvature[row] * state[1] * state[1] + slope[row] * input;
+      if (row >= planned) {
+        continue;
+      }
       solution.peak_demand.joint_acceleration = std::max(
         solution.peak_demand.joint_acceleration,
         std::abs(acceleration[static_cast<std::size_t>(row)]) /
@@ -1401,14 +1443,20 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     for (int row = 0; row < dof; ++row) {
       const double force =
         z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
+      // The record carries all six -- the tool cylinder is still in the model and
+      // what it holds is worth reading -- while the demand and constraint 7's sum
+      // carry the five the constraint vector does.
+      record.dq_a[row] = slope[row] * state[1];
+      record.ddq_a[row] = acceleration[static_cast<std::size_t>(row)];
+      record.cylinder_force[row] = force;
+      if (row >= planned) {
+        continue;
+      }
       solution.peak_demand.cylinder_force = std::max(
         solution.peak_demand.cylinder_force,
         std::abs(force) /
         settings.actuation.cylinder_force_max[static_cast<std::size_t>(row)]);
       flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
-      record.dq_a[row] = slope[row] * state[1];
-      record.ddq_a[row] = acceleration[static_cast<std::size_t>(row)];
-      record.cylinder_force[row] = force;
     }
     record.pump_flow = flow;
     solution.nodes.push_back(record);

@@ -259,9 +259,20 @@ TEST(TimingOcp, FlowAgreesWithTheGraph)
         std::vector<casadi::DM>{casadi::DM(state), casadi::DM(acceleration)});
       const std::vector<double> z = outputs[0].nonzeros();
 
+      // The force is compared on all six rows, because the record carries all six
+      // -- the tool cylinder is still in the model after issue 068 took its
+      // coordinate out of the OCP. The **flow is summed over the five** the
+      // constraint sums, because `OcpNode::pump_flow` is constraint 7's left-hand
+      // side and constraint 7 no longer charges the tool: an axis the timing holds
+      // still draws nothing it chose. The difference is the `A±(0) eps` the
+      // smoothing leaves at zero velocity, some `6e-9 m^3/s`, which is four
+      // decades above this comparison's own tolerance and would read as a
+      // disagreement about the expression rather than about which rows it sums.
       double flow = 0.0;
       for (int row = 0; row < 6; ++row) {
-        flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+        if (row < static_cast<int>(crane_planning::kPathDof)) {
+          flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+        }
         const double force =
           z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
         worst_force = std::max(worst_force, std::abs(force - node.cylinder_force[row]));

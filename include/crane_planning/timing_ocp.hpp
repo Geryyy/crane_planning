@@ -43,6 +43,26 @@
 // **"a reference the MPC would reject is a planner bug"** then holds by
 // construction rather than by agreement between two implementations.
 //
+// # The tool coordinate is not timed here, and the tool link is not removed
+//
+// 4.1 already says `q8` is **not a path variable** and `tool_axis.hpp` is the
+// primitive that drives it on the arm's own clock. This OCP takes the same view
+// one step further: the tool is opened and closed by the low-level
+// velocity/position controller, so no timing chosen here can move it, and it
+// therefore has **no row in the constraint vector** -- not in the acceleration
+// group, not in constraint 6's force group, and no term in constraint 7's pump
+// sum. Eleven rows, not thirteen. `crane_mpc/ocp.hpp` drops it from the same two
+// constraints for the same reason, so 5.3's "a reference the MPC would reject is a
+// planner bug" is unaffected: the two problems still bound the same quantities on
+// the same axes.
+//
+// **The tool link is pinned, not removed.** `q8` still reaches the model at every
+// node -- it is a real configuration and the tool's mass is in `M(q)` there -- and
+// only `dq8` and `ddq8` are held at zero. Dropping a coordinate is a statement
+// about what is *timed* and never about what has mass. It holds while the gripper
+// is stationary during transit, which is what a close or an open phase being a
+// separate phase already means.
+//
 // # kappa is not speed_scale
 //
 // `kappa` (5.5) is the fraction of the machine's authority the planner is allowed
@@ -75,6 +95,11 @@ namespace crane_planning
  * is what the description does not carry -- `wiki/implementation/parameters.md`
  * 3 and 4, and the cylinder force limit that no existing planner enforces
  * (`wiki/trajectory_planning.md` 3).
+ *
+ * Both per-axis rows are six long, because the machine has six axes and
+ * `tool_axis.hpp` reads the tool's own entries out of this same struct. The OCP
+ * bounds the five path coordinates; `[kToolRow]` of each is carried for that other
+ * consumer and is not a bound this solve imposes.
  */
 struct ActuationLimits
 {
@@ -244,6 +269,11 @@ struct TimingOcpSettings
  * Reported against the unscaled limit rather than against `kappa x limit`, so
  * that "the peak demand sits at kappa and not at one" is something a caller can
  * read rather than something it has to trust.
+ *
+ * Over the **five path coordinates**, which are the rows the constraint vector
+ * carries. The tool axis is not timed by this OCP, so a fraction of its limit
+ * would be a demand no timing chose; `ToolAxisDemand` is where a tool phase's own
+ * fractions are reported.
  */
 struct PeakDemand
 {
@@ -279,8 +309,18 @@ struct OcpNode
   crane_model::QU q_u{};
   crane_model::DQU dq_u{};
   crane_model::QU q_u_equilibrium{};  ///< where the tool hangs at this `q_a`
-  crane_model::QA cylinder_force{};   ///< N, mpc.md 3 constraint 6's left-hand side
-  double pump_flow{};                 ///< m^3/s, constraint 7's, summed over the axes
+
+  /// N, mpc.md 3 constraint 6's left-hand side. All six rows; five are bounded.
+  /**
+   * The tool row is what the model says its cylinder is carrying at the pinned
+   * configuration -- read rather than dropped, because the transmission stays in
+   * the model when the coordinate leaves the OCP -- and it is not held to
+   * `cylinder_force_max`.
+   */
+  crane_model::QA cylinder_force{};
+
+  /// m^3/s, constraint 7's left-hand side: summed over the **five** timed axes.
+  double pump_flow{};
 };
 
 /// One solved timing.

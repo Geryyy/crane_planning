@@ -3,6 +3,15 @@
 // drive to, the limits the phase is held inside, and the transmission reversal
 // issue 037's notes measured inside the 7040 jaw's own range.
 //
+// **The model-level half of this file moved to `crane_model` with issue 068.**
+// "The tool row of `J_cyl` is a function of the tool coordinate alone" is a
+// statement about the numeric model and nothing else, and it belongs beside the
+// model now that the coordinate has left both OCPs --
+// `crane_model/test/test_tool_axis.cpp` carries it, with the jaw's reversal at
+// `0.2623 rad` and the chamber-area step. What stays here is what is
+// `crane_planning`'s own: the grip primitive, `probe_tool_transmission`'s use of
+// that independence, and the phase the two produce.
+//
 // Offline C++ against both machine descriptions. Nothing here launches, links a
 // simulator or reaches a ROS graph, and no phase in this file solves an OCP:
 // a tool phase is a cosine and three scalar bounds, and that is the whole cost
@@ -96,45 +105,10 @@ TEST(ToolAxis, TheRetainedCosineIsCtwoAtBothEndsAndMonotoneBetween)
   EXPECT_NEAR(peak_curvature, crane_planning::kGripCosinePeakCurvature, 1.0e-5);
 }
 
-TEST(ToolAxis, TheToolRowOfTheCylinderJacobianIsAFunctionOfTheToolCoordinateAlone)
-{
-  // `probe_tool_transmission` sweeps q8 across one `Q` and leaves the arm and
-  // the passive pair where the caller put them. That is only sound because the
-  // tool row of J_cyl depends on nothing else, and this is where that is
-  // measured rather than assumed -- if a later description coupled the jaw to
-  // the arm, the probe would be reading the wrong number and this fails first.
-  for (const Machine & machine : crane_planning_test::machines()) {
-    const crane_model::Model model = crane_planning_test::build_model(machine);
-    const crane_planning::PlannerContext context =
-      crane_planning_test::build_context(model, machine);
-    const crane_model::QA first =
-      crane_planning_test::working_centred(context.limits, machine);
-    crane_model::QA second = first;
-    second[0] += 0.7;   // slew
-    second[1] += 0.2;   // boom
-    second[2] -= 0.3;   // arm
-    second[3] += 0.3;   // telescope
-
-    crane_model::Q left = crane_planning_test::settled(model, first);
-    crane_model::Q right = crane_planning_test::settled(model, second);
-    // ...and a passive pair deliberately away from either equilibrium.
-    right[4] += 0.15;
-    right[5] -= 0.12;
-
-    const crane_planning::AxisLimit & axis = context.limits.axis[kToolRow];
-    for (int step = 0; step <= 8; ++step) {
-      const double q8 = axis.lower + (axis.upper - axis.lower) * step / 8.0;
-      left[static_cast<Eigen::Index>(crane_planning::kActuatedRows[kToolRow])] = q8;
-      right[static_cast<Eigen::Index>(crane_planning::kActuatedRows[kToolRow])] = q8;
-      auto a = model.cylinder_jacobian(left);
-      auto b = model.cylinder_jacobian(right);
-      ASSERT_TRUE(a.ok() && b.ok()) << machine.name;
-      const Eigen::Index row = static_cast<Eigen::Index>(kToolRow);
-      EXPECT_NEAR(a.value()(row, row), b.value()(row, row), 1.0e-15)
-        << machine.name << " at q8 = " << q8;
-    }
-  }
-}
+// The independence `probe_tool_transmission` rests on -- that the tool row of
+// `J_cyl` is a function of the tool coordinate alone -- moved to
+// `crane_model/test/test_tool_axis.cpp` with issue 068, where the model it is a
+// statement about lives. What the probe *does* with it is still tested below.
 
 TEST(ToolAxis, TheJawReversesSignInsideItsOwnRangeAndTheRailDoesNot)
 {
