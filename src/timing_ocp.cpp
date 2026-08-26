@@ -1,61 +1,69 @@
 #include "crane_planning/timing_ocp.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <limits>
-#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include <casadi/casadi.hpp>
-
-#include "crane_model/symbolic/casadi_graph.hpp"
-
-#include "acados_casadi_bridge.hpp"
-
 extern "C" {
 #include "acados_c/ocp_nlp_interface.h"
+
+#include "acados_solver_crane_planning_timing_epsilon7040.h"  // NOLINT(build/include_subdir)
+#include "acados_solver_crane_planning_timing_pzs100.h"  // NOLINT(build/include_subdir)
+
+#include "crane_planning_timing_epsilon7040_output.h"  // NOLINT(build/include_subdir)
+#include "crane_planning_timing_pzs100_output.h"  // NOLINT(build/include_subdir)
 }
+
+#include "crane_planning_timing_ocp_generated.h"  // NOLINT(build/include_subdir)
 
 namespace crane_planning
 {
 namespace
 {
 
-using casadi::SX;
 using crane_model::ErrorCode;
 using crane_model::Result;
 using crane_model::Status;
 
-constexpr int kOcpStateDof = 6;   ///< (sigma, sigma_dot, q_u, dq_u), 5.2
-constexpr int kOcpInputDof = 1;   ///< sigma_ddot
+// Every dimension below is read off `scripts/export_timing_ocp.py`'s own header
+// rather than restated here. The problem is defined in Python now; what is left
+// in this file is the binding that opens the shipped solver, writes what stays
+// runtime-settable, builds the warm start acados does not provide, and reads
+// acados' own answers back.
+constexpr int kOcpStateDof = CRANE_PLANNING_TIMING_NX;   ///< (sigma, sigma_dot, q_u, dq_u)
+constexpr int kOcpInputDof = CRANE_PLANNING_TIMING_NU;   ///< sigma_ddot
+constexpr int kOcpConstraints = CRANE_PLANNING_TIMING_NH;
+constexpr int kOcpParameters = CRANE_PLANNING_TIMING_NP;
+constexpr int kResidualDof = CRANE_PLANNING_TIMING_NY;
+constexpr int kTerminalResidualDof = CRANE_PLANNING_TIMING_NY_E;
+constexpr int kPathBlock = CRANE_PLANNING_TIMING_PATH_BLOCK;
+constexpr std::size_t kPayloadDof = CRANE_PLANNING_TIMING_PAYLOAD_DOF;
 
-/// 5 acceleration, 5 cylinder force, 1 pump flow -- the **path** coordinates only.
+constexpr int kConstraintAcceleration = CRANE_PLANNING_TIMING_CONSTRAINT_ACCELERATION;
+constexpr int kConstraintCylinderForce = CRANE_PLANNING_TIMING_CONSTRAINT_CYLINDER_FORCE;
+constexpr int kConstraintPumpFlow = CRANE_PLANNING_TIMING_CONSTRAINT_PUMP_FLOW;
+
+constexpr std::size_t kOutputCylinderForce = CRANE_PLANNING_TIMING_OUTPUT_CYLINDER_FORCE;
+constexpr std::size_t kOutputAxisFlow = CRANE_PLANNING_TIMING_OUTPUT_AXIS_FLOW;
+constexpr std::size_t kOutputDof = CRANE_PLANNING_TIMING_OUTPUT_DOF;
+
+/// The generated tree's own conditioning divisors, read and never re-derived.
 /**
- * Eleven and not thirteen. The tool coordinate is driven by the low-level
- * velocity/position controller (`tool_axis.hpp`, and `crane_mpc/ocp.hpp` for the
- * same statement one layer up), so no timing this OCP chooses moves it: it has no
- * acceleration to bound, no cylinder force to hold and no pump draw to charge
- * against constraint 7's shared supply.
- *
- * The tool **link** does not leave with the coordinate. It is pinned at the
- * configuration the path carries -- `q8` still reaches the model, `dq8` and `ddq8`
- * are zero -- so its mass and inertia are still in `M(q)` and the arm is still
- * timed against the machine it really is. See `actuated`.
+ * Every row of `h` is a physical quantity divided by one of these, so the bound
+ * that goes in is the machine's limit divided by the same number. The divisor is
+ * conditioning and the bound is the limit -- see `export_timing_ocp.py`.
  */
-constexpr int kOcpConstraints = 2 * static_cast<int>(kPathDof) + 1;
+constexpr std::array<double, static_cast<std::size_t>(kOcpConstraints)> kConstraintScale =
+  CRANE_PLANNING_TIMING_CONSTRAINT_SCALE;
 
-/// One block of path data: q_a(sigma), q_a'(sigma), q_a''(sigma), all six rows.
-constexpr int kPathBlock = 3 * static_cast<int>(crane_model::kActuatedDof);
-
-/// Two blocks: the node, which the cost and the constraints are written at, and
-/// the interval midpoint, which the integrator holds the path fixed at.
-constexpr int kOcpParameters = 2 * kPathBlock;
-
-constexpr int kResidualDof = 4;      ///< traversal time, two sway rows, the input
-constexpr int kTerminalResidualDof = 2;
+/// The `(row, column)` of the six independent entries of `Theta_L`, in `p`'s order.
+constexpr std::array<std::array<int, 2>, 6> kInertiaEntries = {
+  CRANE_PLANNING_TIMING_INERTIA_ENTRIES};
 
 Status failure(ErrorCode code, std::string message)
 {
@@ -76,6 +84,79 @@ std::string acados_status_word(int status)
     default: return "acados status " + std::to_string(status);
   }
 }
+
+// The two shapes of generated function this file calls. acados' own casadi
+// output takes `void * mem`; CasADi's takes an `int` memory token, and
+// `<tool>_output` is CasADi's.
+using CasadiFunction = int (*)(const double **, double **, int *, double *, int);
+
+/// One generated timing solver, as the handful of entry points this file uses.
+/**
+ * Two artifacts, one shape. The capsule types differ per tool -- that is what
+ * makes them two solvers rather than one parameterised one -- so the handle is
+ * `void *` and the thunks below are where the cast lives, in exactly one place
+ * per entry point per tool.
+ */
+struct Backend
+{
+  const char * name{nullptr};
+  void * (*create_capsule)() = nullptr;
+  int (*create_with_grid)(void *, int, double *) = nullptr;
+  int (*solve)(void *) = nullptr;
+  int (*destroy)(void *) = nullptr;
+  int (*free_capsule)(void *) = nullptr;
+  int (*update_params)(void *, int, double *, int) = nullptr;
+  ocp_nlp_config * (*config)(void *) = nullptr;
+  ocp_nlp_dims * (*dims)(void *) = nullptr;
+  ocp_nlp_in * (*in)(void *) = nullptr;
+  ocp_nlp_out * (*out)(void *) = nullptr;
+  ocp_nlp_solver * (*solver)(void *) = nullptr;
+  void * (*opts)(void *) = nullptr;
+
+  CasadiFunction output{nullptr};
+};
+
+// One macro, two uses. The alternative is thirty lines of the same thunks with a
+// different token pasted into every symbol, which is what a macro is for.
+#define CRANE_PLANNING_TIMING_BACKEND(NAME)                                            \
+  []() {                                                                               \
+    using Capsule = NAME ## _solver_capsule;                                           \
+    Backend backend;                                                                   \
+    backend.name = #NAME;                                                              \
+    backend.create_capsule = []() -> void * {return NAME ## _acados_create_capsule();}; \
+    backend.create_with_grid = [](void * h, int n, double * steps) {                   \
+        return NAME ## _acados_create_with_discretization(static_cast<Capsule *>(h), n, steps); \
+      };                                                                               \
+    backend.solve = [](void * h) {return NAME ## _acados_solve(static_cast<Capsule *>(h));};   \
+    backend.destroy = [](void * h) {return NAME ## _acados_free(static_cast<Capsule *>(h));};  \
+    backend.free_capsule =                                                             \
+      [](void * h) {return NAME ## _acados_free_capsule(static_cast<Capsule *>(h));};  \
+    backend.update_params = [](void * h, int stage, double * value, int np) {          \
+        return NAME ## _acados_update_params(static_cast<Capsule *>(h), stage, value, np); \
+      };                                                                               \
+    backend.config =                                                                   \
+      [](void * h) {return NAME ## _acados_get_nlp_config(static_cast<Capsule *>(h));}; \
+    backend.dims =                                                                     \
+      [](void * h) {return NAME ## _acados_get_nlp_dims(static_cast<Capsule *>(h));};  \
+    backend.in = [](void * h) {return NAME ## _acados_get_nlp_in(static_cast<Capsule *>(h));}; \
+    backend.out = [](void * h) {return NAME ## _acados_get_nlp_out(static_cast<Capsule *>(h));}; \
+    backend.solver =                                                                   \
+      [](void * h) {return NAME ## _acados_get_nlp_solver(static_cast<Capsule *>(h));}; \
+    backend.opts =                                                                     \
+      [](void * h) {return NAME ## _acados_get_nlp_opts(static_cast<Capsule *>(h));};  \
+    backend.output = &NAME ## _output;                                                 \
+    return backend;                                                                    \
+  }()
+
+Backend backend_for(crane_model::Tool tool)
+{
+  if (tool == crane_model::Tool::Pzs100) {
+    return CRANE_PLANNING_TIMING_BACKEND(crane_planning_timing_pzs100);
+  }
+  return CRANE_PLANNING_TIMING_BACKEND(crane_planning_timing_epsilon7040);
+}
+
+#undef CRANE_PLANNING_TIMING_BACKEND
 
 /// The full actuated row of a path sample: the five path coordinates, then q8.
 /**
@@ -101,87 +182,65 @@ crane_model::QA actuated(const PathSample & sample, int derivative)
   return value;
 }
 
-/// The 16-state contract 2 orders as `[q_a, q_u, dq_a, dq_u]`, symbolically.
-SX full_state(const SX & q_a, const SX & q_u, const SX & dq_a, const SX & dq_u)
+/// The payload half of `p`, packed as `export_timing_ocp.py` packs it.
+std::array<double, kPayloadDof> payload_block(const crane_model::Payload & payload)
 {
-  return SX::vertcat({q_a, q_u, dq_a, dq_u});
+  std::array<double, kPayloadDof> block{};
+  block[CRANE_PLANNING_TIMING_PAYLOAD_MASS] = payload.mass_kg;
+  for (std::size_t row = 0; row < 3U; ++row) {
+    block[CRANE_PLANNING_TIMING_PAYLOAD_COM + row] =
+      payload.center_of_mass_k8_m[static_cast<Eigen::Index>(row)];
+  }
+  for (std::size_t entry = 0; entry < kInertiaEntries.size(); ++entry) {
+    block[CRANE_PLANNING_TIMING_PAYLOAD_INERTIA + entry] = payload.inertia_k8_kg_m2(
+      static_cast<Eigen::Index>(kInertiaEntries[entry][0]),
+      static_cast<Eigen::Index>(kInertiaEntries[entry][1]));
+  }
+  return block;
 }
 
-/// Everything the expressions below are written in terms of, unpacked once.
-struct Symbols
+/// One evaluation of the shipped output map `z`, in physical units.
+/**
+ * The generated solver reports the eleven rows of `h`, each already divided by
+ * its conditioning constant. Three things want the physical quantity instead:
+ * `OcpNode`'s record of what the answer demands of the machine, the static-force
+ * refusal that names a path no timing exists for, and the bisected warm start,
+ * which asks how far outside constraints 6 and 7 a node is at a candidate rate.
+ *
+ * `<tool>_output` is `crane_symbolic`'s own `z` over the shared module's own
+ * `(x, u, p)` -- the same function `crane_mpc` ships. All six axes are returned,
+ * because the tool cylinder is still in the model when its coordinate leaves the
+ * OCP.
+ */
+bool evaluate_output(
+  const Backend & backend, const crane_model::QA & q_a, const crane_model::QA & dq_a,
+  const crane_model::QA & ddq_a, const crane_model::QU & q_u, const crane_model::DQU & dq_u,
+  const std::array<double, kPayloadDof> & payload, std::vector<double> & z)
 {
-  SX x;        ///< the OCP state, 6
-  SX u;        ///< the OCP input, 1
-  SX p;        ///< the parameter vector, kOcpParameters
-  SX sigma_rate;
-  SX q_u;
-  SX dq_u;
+  const int planned = static_cast<int>(kPathDof);
+  std::vector<double> state;
+  state.reserve(2U * static_cast<std::size_t>(planned + crane_model::kPassiveDof));
+  for (int row = 0; row < planned; ++row) {state.push_back(q_a[row]);}
+  state.push_back(q_u[0]);
+  state.push_back(q_u[1]);
+  for (int row = 0; row < planned; ++row) {state.push_back(dq_a[row]);}
+  state.push_back(dq_u[0]);
+  state.push_back(dq_u[1]);
 
-  SX q_a_node;
-  SX dq_a_node;    ///< q_a'(sigma_k)
-  SX ddq_a_node;   ///< q_a''(sigma_k)
-  SX q_a_mid;
-  SX dq_a_mid;
-  SX ddq_a_mid;
-};
+  std::vector<double> input(static_cast<std::size_t>(planned), 0.0);
+  for (int row = 0; row < planned; ++row) {
+    input[static_cast<std::size_t>(row)] = ddq_a[row];
+  }
 
-Symbols make_symbols()
-{
-  Symbols symbols;
-  symbols.x = SX::sym("x", kOcpStateDof);
-  symbols.u = SX::sym("u", kOcpInputDof);
-  symbols.p = SX::sym("p", kOcpParameters);
-  symbols.sigma_rate = symbols.x(1);
-  symbols.q_u = symbols.x(casadi::Slice(2, 4));
-  symbols.dq_u = symbols.x(casadi::Slice(4, 6));
+  std::vector<double> parameter;
+  parameter.reserve(1U + kPayloadDof);
+  parameter.push_back(q_a[static_cast<Eigen::Index>(kToolRow)]);
+  for (const double value : payload) {parameter.push_back(value);}
 
-  const int dof = static_cast<int>(crane_model::kActuatedDof);
-  symbols.q_a_node = symbols.p(casadi::Slice(0, dof));
-  symbols.dq_a_node = symbols.p(casadi::Slice(dof, 2 * dof));
-  symbols.ddq_a_node = symbols.p(casadi::Slice(2 * dof, 3 * dof));
-  symbols.q_a_mid = symbols.p(casadi::Slice(kPathBlock, kPathBlock + dof));
-  symbols.dq_a_mid = symbols.p(casadi::Slice(kPathBlock + dof, kPathBlock + 2 * dof));
-  symbols.ddq_a_mid = symbols.p(casadi::Slice(kPathBlock + 2 * dof, kPathBlock + 3 * dof));
-  return symbols;
-}
-
-/// 5's chain rule: `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`.
-SX joint_acceleration(
-  const SX & dq_a_path, const SX & ddq_a_path, const SX & rate, const SX & input)
-{
-  return ddq_a_path * (rate * rate) + dq_a_path * input;
-}
-
-/// 5.2's right-hand side, divided through by `sigma_dot` because sigma is the
-/// independent variable. The passive block is the graph's, not a second copy.
-SX path_dynamics(
-  const crane_model::symbolic::CasadiGraph & graph, const Symbols & symbols)
-{
-  const SX ddq_a = joint_acceleration(
-    symbols.dq_a_mid, symbols.ddq_a_mid, symbols.sigma_rate, symbols.u);
-  const SX state16 = full_state(
-    symbols.q_a_mid, symbols.q_u, symbols.dq_a_mid * symbols.sigma_rate, symbols.dq_u);
-
-  const std::vector<SX> rows = graph.passive_rows(std::vector<SX>{state16});
-  const SX & mass_uu = rows[0];
-  const SX & mass_ua = rows[1];
-  const SX & bias_u = rows[2];
-
-  // 2x2 by hand, exactly as `crane_model/src/symbolic_graph.cpp` does it: a
-  // singular `M_uu` is then a non-finite expression rather than a branch the
-  // solver would have to take.
-  const SX right = SX::mtimes(mass_ua, ddq_a) + bias_u;
-  const SX determinant = mass_uu(0, 0) * mass_uu(1, 1) - mass_uu(0, 1) * mass_uu(1, 0);
-  const SX ddq_u = SX::vertcat(
-    {-(mass_uu(1, 1) * right(0) - mass_uu(0, 1) * right(1)) / determinant,
-      -(mass_uu(0, 0) * right(1) - mass_uu(1, 0) * right(0)) / determinant});
-
-  // d/dsigma of 5.2's dx/dt, i.e. every time derivative over sigma_dot. The
-  // first row is `dsigma/dsigma = 1` and it is what makes 5.4's `sigma(T) = 1`
-  // a terminal condition on a state rather than a property of the grid.
-  return SX::vertcat(
-    {SX(1.0), symbols.u / symbols.sigma_rate, symbols.dq_u / symbols.sigma_rate,
-      ddq_u / symbols.sigma_rate});
+  z.assign(kOutputDof, 0.0);
+  const double * arguments[3] = {state.data(), input.data(), parameter.data()};
+  double * results[1] = {z.data()};
+  return backend.output(arguments, results, nullptr, nullptr, 0) == 0;
 }
 
 /// The scaled limits one solve is run against.
@@ -208,125 +267,71 @@ ScaledLimits scale_limits(
   return scaled;
 }
 
-/// 5.3 and the 3 guarantee table, as one vector of nonlinear constraints.
-/**
- * Joint *position* is absent on purpose and is not dropped: it is a property of
- * the geometry, which `fit_c2_path` has already refused a path for, and sigma is
- * pinned to the grid here, so nothing the OCP decides can move it. Joint
- * *velocity* is absent because it is `|q_a'(sigma_k)| sigma_dot` with a known
- * `q_a'`, i.e. a per-stage bound on one state and cheaper as a box than as a
- * nonlinear row.
- *
- * The **tool row is absent from all three groups**, for the reason
- * `kOcpConstraints` gives: the low-level controller drives that axis, this OCP
- * holds it still, and a row for an axis the solve cannot move is a row that can
- * only ever be satisfied.
- *
- * **Every row is divided by its own scaled limit**, so the vector is a set of
- * *fractions of the allowance* and the box is plain `[-1, 1]`. That is not
- * cosmetic. Written in physical units the eleven rows span nine decades --
- * radians per second squared near one, newtons near `1e5`, cubic metres per
- * second near `1e-3` -- and the QP's constraint Jacobian inherits the spread.
- * HPIPM fails on it: `ACADOS_QP_FAILURE` on the first step, for a problem whose
- * functions are all finite and whose solution exists. Normalised, the same
- * problem converges.
- */
-SX constraint_vector(
-  const crane_model::symbolic::CasadiGraph & graph, const Symbols & symbols,
-  const ScaledLimits & scaled)
-{
-  const SX ddq_a = joint_acceleration(
-    symbols.dq_a_node, symbols.ddq_a_node, symbols.sigma_rate, symbols.u);
-  const SX state16 = full_state(
-    symbols.q_a_node, symbols.q_u, symbols.dq_a_node * symbols.sigma_rate, symbols.dq_u);
-
-  // The output map of mpc.md 3, read rather than rebuilt: `F_cyl` is constraint
-  // 6's left-hand side and the per-axis `Q` sums to constraint 7's, with 3.1's
-  // smoothing already inside it.
-  const std::vector<SX> outputs = graph.z(std::vector<SX>{state16, ddq_a});
-  const SX & z = outputs[0];
-  const int force = static_cast<int>(crane_model::symbolic::kCylinderForceOffset);
-  const int flow = static_cast<int>(crane_model::symbolic::kAxisFlowOffset);
-  const int dof = static_cast<int>(crane_model::kActuatedDof);
-
-  const int planned = static_cast<int>(kPathDof);
-  const SX cylinder_force = z(casadi::Slice(force, force + dof));
-  const SX pump_flow = SX::sum1(z(casadi::Slice(flow, flow + planned)));
-
-  std::vector<SX> rows;
-  rows.reserve(static_cast<std::size_t>(kOcpConstraints));
-  for (int row = 0; row < planned; ++row) {
-    rows.push_back(ddq_a(row) / scaled.ddq_a_max[row]);
-  }
-  for (int row = 0; row < planned; ++row) {
-    rows.push_back(cylinder_force(row) / scaled.force_max[row]);
-  }
-  rows.push_back(pump_flow / scaled.flow_max);
-  return SX::vertcat(rows);
-}
-
-/// The Gauss-Newton residual whose half-square-norm is 5.2's objective.
-SX residual_vector(const Symbols & symbols, const TimingOcpSettings & settings, double d_sigma)
-{
-  // acados' nonlinear least squares cost is `0.5 ||y||^2_W`, so each residual
-  // carries a `sqrt(2 dsigma)`: the first row squares to `dsigma / sigma_dot`,
-  // which is 5.2's `int dsigma / sigma_dot`, and the two sway rows square to
-  // `w ||dq_u||^2 dsigma / sigma_dot`, which is its `int ||dq_u||^2 dt` because
-  // `dt = dsigma / sigma_dot`.
-  const SX rate = symbols.sigma_rate;
-  const SX inverse_root = 1.0 / sqrt(rate);
-  return SX::vertcat(
-    {std::sqrt(2.0 * d_sigma) * inverse_root,
-      std::sqrt(2.0 * settings.sway_weight * d_sigma) * inverse_root * symbols.dq_u,
-      std::sqrt(2.0 * settings.input_weight * d_sigma) * symbols.u});
-}
-
 /// Every acados object one solve owns, freed in the order acados wants.
-class OcpSolver
+class TimingSolver
 {
 public:
-  explicit OcpSolver(int intervals)
-  : intervals_(intervals) {}
+  explicit TimingSolver(Backend backend)
+  : backend_(backend) {}
 
-  ~OcpSolver()
+  ~TimingSolver()
   {
-    if (solver_ != nullptr) {ocp_nlp_solver_destroy(solver_);}
-    if (out_ != nullptr) {ocp_nlp_out_destroy(out_);}
-    if (in_ != nullptr) {ocp_nlp_in_destroy(in_);}
-    if (opts_ != nullptr) {ocp_nlp_solver_opts_destroy(opts_);}
-    if (dims_ != nullptr) {ocp_nlp_dims_destroy(dims_);}
-    if (config_ != nullptr) {ocp_nlp_config_destroy(config_);}
-    if (plan_ != nullptr) {ocp_nlp_plan_destroy(plan_);}
+    if (capsule_ != nullptr) {
+      backend_.destroy(capsule_);
+      backend_.free_capsule(capsule_);
+    }
   }
 
-  OcpSolver(const OcpSolver &) = delete;
-  OcpSolver & operator=(const OcpSolver &) = delete;
-  OcpSolver(OcpSolver &&) = delete;
-  OcpSolver & operator=(OcpSolver &&) = delete;
+  TimingSolver(const TimingSolver &) = delete;
+  TimingSolver & operator=(const TimingSolver &) = delete;
+  TimingSolver(TimingSolver &&) = delete;
+  TimingSolver & operator=(TimingSolver &&) = delete;
 
-  ocp_nlp_plan_t * plan_{nullptr};
+  /// Open the shipped solver on this solve's own grid.
+  /**
+   * `<name>_acados_create_with_discretization(capsule, N, steps)` is generated
+   * beside the fixed-`N` entry point, so `TimingOcpSettings::intervals` is still
+   * an argument and the artifact's own `DEFAULT_INTERVALS` is a default rather
+   * than a contract. The steps carry `dsigma` into the ERK4 integrator, which is
+   * what makes sigma and not time the independent variable.
+   */
+  bool open(int intervals, double d_sigma)
+  {
+    capsule_ = backend_.create_capsule();
+    if (capsule_ == nullptr) {
+      return false;
+    }
+    std::vector<double> steps(static_cast<std::size_t>(intervals), d_sigma);
+    if (backend_.create_with_grid(capsule_, intervals, steps.data()) != 0) {
+      return false;
+    }
+    config_ = backend_.config(capsule_);
+    dims_ = backend_.dims(capsule_);
+    in_ = backend_.in(capsule_);
+    out_ = backend_.out(capsule_);
+    solver_ = backend_.solver(capsule_);
+    opts_ = backend_.opts(capsule_);
+    return true;
+  }
+
+  const Backend & backend() const {return backend_;}
+  void * capsule() const {return capsule_;}
+  ocp_nlp_config * config() const {return config_;}
+  ocp_nlp_dims * dims() const {return dims_;}
+  ocp_nlp_in * in() const {return in_;}
+  ocp_nlp_out * out() const {return out_;}
+  ocp_nlp_solver * solver() const {return solver_;}
+  void * opts() const {return opts_;}
+
+private:
+  Backend backend_;
+  void * capsule_{nullptr};
   ocp_nlp_config * config_{nullptr};
   ocp_nlp_dims * dims_{nullptr};
   ocp_nlp_in * in_{nullptr};
   ocp_nlp_out * out_{nullptr};
-  void * opts_{nullptr};
   ocp_nlp_solver * solver_{nullptr};
-  int intervals_;
-
-  /// The bound functions. One entry per distinct `casadi::Function`, each
-  /// holding one acados struct per stage that registers it.
-  std::vector<std::unique_ptr<AcadosCasadiFunction>> functions_{};
-
-  AcadosCasadiFunction & bind(
-    const casadi::Function & function, std::size_t instances, std::string & error)
-  {
-    functions_.push_back(std::make_unique<AcadosCasadiFunction>());
-    std::string message = functions_.back()->bind(function, instances);
-    if (!message.empty() && error.empty()) {
-      error = std::move(message);
-    }
-    return *functions_.back();
-  }
+  void * opts_{nullptr};
 };
 
 }  // namespace
@@ -416,6 +421,21 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     return Result<TimingSolution>::failure(
       failure(ErrorCode::InvalidArgument, "sigma_rate_min must be positive and below its ceiling"));
   }
+  // The one setting the generated artifact caps rather than carries. acados
+  // sizes the SQP's own statistics array from `nlp_solver_max_iter` at code
+  // generation, so a solve asking for more iterations than the shipped solver
+  // allocated would write past it. Everything else in `TimingOcpSettings` --
+  // kappa, the boxes, the weights, the grid, the tolerances, the wall clock --
+  // is written onto the solver below and needs no re-export.
+  if (settings.max_iterations > CRANE_PLANNING_TIMING_MAX_ITERATIONS) {
+    return Result<TimingSolution>::failure(
+      failure(
+        ErrorCode::InvalidArgument,
+        "this solve asks for " + std::to_string(settings.max_iterations) +
+        " SQP iterations and the shipped solver allocated its statistics for " +
+        std::to_string(CRANE_PLANNING_TIMING_MAX_ITERATIONS) +
+        ". Raising the cap is a re-export (`./scripts/export_timing_ocp.py`), not a setting"));
+  }
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
     if (!(settings.actuation.ddq_a_max[row] > 0.0) ||
       !(settings.actuation.cylinder_force_max[row] > 0.0))
@@ -437,86 +457,14 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       failure(ErrorCode::InvalidArgument, "Q_P^max and its planning factor must be positive"));
   }
 
-  // ------------------------------------------------------------------
-  // The graph, and the expressions built out of it
-  // ------------------------------------------------------------------
-  crane_model::SymbolicGraphSpec spec;
-  spec.sample_time_s = settings.sample_period;
-  spec.include_output_map = true;
-  auto graph_result = crane_model::symbolic::casadi_graph(model_config, spec, request.payload);
-  if (!graph_result.ok()) {
-    return Result<TimingSolution>::failure(graph_result.status());
-  }
-  const crane_model::symbolic::CasadiGraphHandle graph = std::move(graph_result).value();
+  const Backend backend = backend_for(model_config.tool);
+  const std::array<double, kPayloadDof> payload = payload_block(request.payload);
 
   const int intervals = static_cast<int>(settings.intervals);
   const double d_sigma = 1.0 / static_cast<double>(intervals);
-  const Symbols symbols = make_symbols();
   const ScaledLimits scaled = scale_limits(limits, settings, request.speed_scale);
-
-  casadi::Function ode;
-  casadi::Function vde;
-  casadi::Function residual_jacobian;
-  casadi::Function residual;
-  casadi::Function terminal_residual_jacobian;
-  casadi::Function terminal_residual;
-  casadi::Function constraint_jacobian;
-  casadi::Function constraint;
-  try {
-    const SX derivative = path_dynamics(*graph, symbols);
-    const SX sensitivity_x = SX::sym("Sx", kOcpStateDof, kOcpStateDof);
-    const SX sensitivity_u = SX::sym("Su", kOcpStateDof, kOcpInputDof);
-    ode = casadi::Function(
-      "expl_ode_fun", {symbols.x, symbols.u, symbols.p}, {densify(derivative)});
-    vde = casadi::Function(
-      "expl_vde_for", {symbols.x, sensitivity_x, sensitivity_u, symbols.u, symbols.p},
-      {densify(derivative),
-        densify(SX::jtimes(derivative, symbols.x, sensitivity_x)),
-        densify(
-          SX::jtimes(derivative, symbols.x, sensitivity_u) +
-          SX::jacobian(derivative, symbols.u))});
-
-    // acados asks for the *transposed* Jacobian with respect to `[u; x]`, which
-    // is the order the QP carries its variables in.
-    const SX variables = SX::vertcat({symbols.u, symbols.x});
-    const SX algebraic = SX::sym("z", 0);
-    const SX time = SX::sym("t");
-
-    const SX cost_rows = residual_vector(symbols, settings, d_sigma);
-    residual = casadi::Function(
-      "nls_y_fun", {symbols.x, symbols.u, algebraic, time, symbols.p}, {densify(cost_rows)});
-    residual_jacobian = casadi::Function(
-      "nls_y_fun_jac", {symbols.x, symbols.u, algebraic, time, symbols.p},
-      {densify(cost_rows), densify(SX::jacobian(cost_rows, variables).T()),
-        SX::zeros(kResidualDof, 0)});
-
-    // The terminal stage has no input, so `nu = 0` there: acados reads the
-    // residual Jacobian as `(nu + nx) x ny`, which is `nx x ny` and not one row
-    // taller, and it hands the function an empty `u`. A terminal function built
-    // over the running stage's symbols is exactly one row wrong, which the
-    // solver reports as a NaN rather than as a dimension error.
-    const SX no_input = SX::sym("u_e", 0);
-    const SX terminal_rows = std::sqrt(2.0 * settings.sway_weight) * symbols.dq_u;
-    terminal_residual = casadi::Function(
-      "nls_y_fun_e", {symbols.x, no_input, algebraic, time, symbols.p}, {densify(terminal_rows)});
-    terminal_residual_jacobian = casadi::Function(
-      "nls_y_fun_jac_e", {symbols.x, no_input, algebraic, time, symbols.p},
-      {densify(terminal_rows), densify(SX::jacobian(terminal_rows, symbols.x).T()),
-        SX::zeros(kTerminalResidualDof, 0)});
-
-    const SX constraint_rows = constraint_vector(*graph, symbols, scaled);
-    constraint = casadi::Function(
-      "nl_constr_h_fun", {symbols.x, symbols.u, algebraic, symbols.p}, {densify(constraint_rows)});
-    constraint_jacobian = casadi::Function(
-      "nl_constr_h_fun_jac", {symbols.x, symbols.u, algebraic, symbols.p},
-      {densify(constraint_rows), densify(SX::jacobian(constraint_rows, variables).T())});
-  } catch (const std::exception & error) {
-    return Result<TimingSolution>::failure(
-      failure(
-        ErrorCode::SymbolicBackendFailure,
-        std::string("the timing OCP could not be written over the symbolic graph: ") +
-        error.what()));
-  }
+  const int dof = static_cast<int>(crane_model::kActuatedDof);
+  const int planned = static_cast<int>(kPathDof);
 
   // ------------------------------------------------------------------
   // The path, sampled onto the grid
@@ -632,35 +580,24 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
    * with a number on it, and it names the node, the axis and the transmission
    * so a caller can tell an unreachable pose from an unavailable solver.
    */
+  std::vector<double> z;
   for (std::size_t at = 0; at < nodes.size(); ++at) {
-    std::vector<double> state16;
-    state16.reserve(16U);
     const crane_model::QA position = actuated(nodes[at], 0);
-    for (int row = 0; row < static_cast<int>(crane_model::kActuatedDof); ++row) {
-      state16.push_back(position[row]);
-    }
-    state16.push_back(q_u_equilibrium[at][0]);
-    state16.push_back(q_u_equilibrium[at][1]);
-    state16.resize(16U, 0.0);  // at rest: every velocity row is zero
-    const std::vector<double> rest(crane_model::kActuatedDof, 0.0);
-
-    std::vector<double> z;
-    try {
-      const std::vector<casadi::DM> outputs =
-        graph->z(std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(rest)});
-      z = outputs[0].nonzeros();
-    } catch (const std::exception & error) {
+    if (!evaluate_output(
+        backend, position, crane_model::QA::Zero(), crane_model::QA::Zero(),
+        q_u_equilibrium[at], crane_model::DQU::Zero(), payload, z))
+    {
       return Result<TimingSolution>::failure(
         failure(
           ErrorCode::SymbolicBackendFailure,
           std::string("the output map of mpc 3 could not be evaluated at rest at sigma = ") +
-          std::to_string(nodes[at].sigma) + ": " + error.what()));
+          std::to_string(nodes[at].sigma)));
     }
 
     // The path coordinates only: constraint 6 has no tool row, so a tool cylinder
     // holding a closed gripper at rest is not a reason to refuse a path.
     for (std::size_t row = 0; row < kPathDof; ++row) {
-      const double force = z[crane_model::symbolic::kCylinderForceOffset + row];
+      const double force = z[kOutputCylinderForce + row];
       if (std::isfinite(force) && std::abs(force) <= scaled.force_max[static_cast<int>(row)]) {
         continue;
       }
@@ -707,130 +644,63 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   }
 
   // ------------------------------------------------------------------
-  // The acados problem
+  // The shipped solver, opened on this solve's grid
   // ------------------------------------------------------------------
-  OcpSolver ocp(intervals);
-  ocp.plan_ = ocp_nlp_plan_create(intervals);
-  ocp.plan_->nlp_solver = SQP;
-  ocp.plan_->regularization = NO_REGULARIZE;
-  // A merit line search rather than a full step. The traversal-time cost is
-  // `1/sigma_dot`, whose Gauss-Newton curvature *falls* as the rate rises, so a
-  // full Newton step from a slow guess overshoots by orders of magnitude and the
-  // QP is then asked about a state the model has no answer for.
-  ocp.plan_->globalization = MERIT_BACKTRACKING;
-  ocp.plan_->ocp_qp_solver_plan.qp_solver = PARTIAL_CONDENSING_HPIPM;
-  for (int stage = 0; stage <= intervals; ++stage) {
-    ocp.plan_->nlp_cost[stage] = NONLINEAR_LS;
-    ocp.plan_->nlp_constraints[stage] = BGH;
-    if (stage < intervals) {
-      ocp.plan_->nlp_dynamics[stage] = CONTINUOUS_MODEL;
-      ocp.plan_->sim_solver_plan[stage].sim_solver = ERK;
-    }
-  }
-  ocp.config_ = ocp_nlp_config_create(*ocp.plan_);
-
-  std::vector<int> nx(static_cast<std::size_t>(intervals) + 1U, kOcpStateDof);
-  std::vector<int> nu(static_cast<std::size_t>(intervals) + 1U, kOcpInputDof);
-  std::vector<int> nz(static_cast<std::size_t>(intervals) + 1U, 0);
-  std::vector<int> ns(static_cast<std::size_t>(intervals) + 1U, 0);
-  std::vector<int> np(static_cast<std::size_t>(intervals) + 1U, kOcpParameters);
-  nu.back() = 0;
-
-  ocp.dims_ = ocp_nlp_dims_create(ocp.config_);
-  ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "nx", nx.data());
-  ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "nu", nu.data());
-  ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "nz", nz.data());
-  ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "ns", ns.data());
-  ocp_nlp_dims_set_opt_vars(ocp.config_, ocp.dims_, "np", np.data());
-
-  // **Every** state row is boxed at every stage, stage 0 included. It carried
-  // `kOcpStateDof - 1` here while the comment above it said "stage 0 pins
-  // everything but the path rate", and the two stopped agreeing when the rate was
-  // given a box of its own further down: acados copies `nbx` entries out of
-  // `idxbx`, so a six-entry index list read as five silently dropped the **last**
-  // row, `dq_u[1]`, and the second passive rate was unconstrained at the start.
-  // That was invisible while the start was the stopped one -- the guess put it at
-  // zero and nothing pushed it away -- and it is exactly the row 7's measured
-  // start has to pin, so it is fixed rather than worked around.
-  //
-  // The rows are held by `lbx`/`ubx` **alone**, and are deliberately not also
-  // declared to acados as equalities through `nbxe`/`idxbxe`. Declaring them
-  // looks like the tidier way to write `sigma(0) = 0`: the row really is an
-  // equality, and a declared one is eliminated by HPIPM instead of being handed
-  // to a barrier as a bound with zero slack, which is where an interior-point
-  // method is weakest. It does not work in this acados build. Setting
-  // `nbxe = 1` at stage 0 for that single row -- with `lbx == ubx` genuinely true
-  // on it and on no other row of the stage -- turns every converging solve in
-  // this file into `ACADOS_QP_FAILURE` on the first QP, HPIPM status 3, a NaN in
-  // the solution at QP iteration 4. Removing the declaration and changing nothing
-  // else makes all of them converge again.
-  //
-  // Two neighbouring explanations were measured and are wrong, so that the next
-  // reader does not spend the time again: the terminal stage's five coincident
-  // rows are **not** the trouble (widening them changes nothing), and neither is
-  // boxing `dq_u[1]`, whose box can be opened to 1e3 with the failure unchanged.
-  // The declaration is. acados also refuses `nbxe` outright on any stage but the
-  // first -- *"relaxed QP with nbxe= 5 >0 for stage 40 > 0 not supported"* -- so
-  // there was never a version of it that reached 5.4's terminal rows anyway.
-  const int nonlinear_rows = kOcpConstraints;
-  for (int stage = 0; stage <= intervals; ++stage) {
-    const int constraints = stage < intervals ? nonlinear_rows : 0;
-    const int residual_rows = stage < intervals ? kResidualDof : kTerminalResidualDof;
-    const int bounded_x = kOcpStateDof;
-    const int bounded_u = stage < intervals ? kOcpInputDof : 0;
-    ocp_nlp_dims_set_cost(ocp.config_, ocp.dims_, stage, "ny", &residual_rows);
-    ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbx", &bounded_x);
-    ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nbu", &bounded_u);
-    ocp_nlp_dims_set_constraints(ocp.config_, ocp.dims_, stage, "nh", &constraints);
-  }
-
-  ocp.in_ = ocp_nlp_in_create(ocp.config_, ocp.dims_);
-  ocp.out_ = ocp_nlp_out_create(ocp.config_, ocp.dims_);
-  ocp.opts_ = ocp_nlp_solver_opts_create(ocp.config_, ocp.dims_);
-
-  // Seven binds, and seven trampoline slots -- not seven per stage. Each carries
-  // one acados struct per stage that registers it, because acados takes the
-  // stage's parameter pointer at registration time.
-  std::string bind_error;
-  const std::size_t path_stages = static_cast<std::size_t>(intervals);
-  AcadosCasadiFunction & bound_vde = ocp.bind(vde, path_stages, bind_error);
-  AcadosCasadiFunction & bound_ode = ocp.bind(ode, path_stages, bind_error);
-  AcadosCasadiFunction & bound_residual_jacobian =
-    ocp.bind(residual_jacobian, path_stages, bind_error);
-  AcadosCasadiFunction & bound_residual = ocp.bind(residual, path_stages, bind_error);
-  AcadosCasadiFunction & bound_constraint_jacobian =
-    ocp.bind(constraint_jacobian, path_stages, bind_error);
-  AcadosCasadiFunction & bound_constraint = ocp.bind(constraint, path_stages, bind_error);
-  AcadosCasadiFunction & bound_terminal_jacobian =
-    ocp.bind(terminal_residual_jacobian, 1U, bind_error);
-  AcadosCasadiFunction & bound_terminal = ocp.bind(terminal_residual, 1U, bind_error);
-  if (!bind_error.empty()) {
+  TimingSolver ocp{backend};
+  if (!ocp.open(intervals, d_sigma)) {
     return Result<TimingSolution>::failure(
-      failure(ErrorCode::BackendUnavailable, bind_error));
+      failure(
+        ErrorCode::BackendUnavailable,
+        std::string("the generated timing solver ") + backend.name +
+        " would not open on " + std::to_string(intervals) + " shooting intervals"));
   }
 
+  // The cost. Every weight and the grid's own `dsigma` are in `W` rather than in
+  // the shipped residual, which is what keeps `sway_weight`, `input_weight` and
+  // `intervals` runtime settings: acados' nonlinear least squares cost is
+  // `0.5 ||y||^2_W`, so `W_00 = 2 dsigma` on `y_0 = 1/sqrt(sigma_dot)` squares to
+  // 5.2's `int dsigma / sigma_dot`, and the two sway rows to
+  // `w ||dq_u||^2 dsigma / sigma_dot`, which is its `int ||dq_u||^2 dt` because
+  // `dt = dsigma / sigma_dot`.
   std::vector<double> weight(
     static_cast<std::size_t>(kResidualDof * kResidualDof), 0.0);
-  for (int row = 0; row < kResidualDof; ++row) {
-    weight[static_cast<std::size_t>(row * kResidualDof + row)] = 1.0;
+  const auto diagonal = [](std::vector<double> & matrix, int size, int row, double value) {
+      matrix[static_cast<std::size_t>(row * size + row)] = value;
+    };
+  diagonal(weight, kResidualDof, CRANE_PLANNING_TIMING_RESIDUAL_TIME, 2.0 * d_sigma);
+  for (int row = 0; row < static_cast<int>(crane_model::kPassiveDof); ++row) {
+    diagonal(
+      weight, kResidualDof, CRANE_PLANNING_TIMING_RESIDUAL_SWAY + row,
+      2.0 * settings.sway_weight * d_sigma);
   }
+  diagonal(
+    weight, kResidualDof, CRANE_PLANNING_TIMING_RESIDUAL_INPUT,
+    2.0 * settings.input_weight * d_sigma);
   std::vector<double> terminal_weight(
     static_cast<std::size_t>(kTerminalResidualDof * kTerminalResidualDof), 0.0);
   for (int row = 0; row < kTerminalResidualDof; ++row) {
-    terminal_weight[static_cast<std::size_t>(row * kTerminalResidualDof + row)] = 1.0;
+    diagonal(terminal_weight, kTerminalResidualDof, row, 2.0 * settings.sway_weight);
   }
-  const std::vector<double> reference(static_cast<std::size_t>(kResidualDof), 0.0);
+  std::vector<double> reference(static_cast<std::size_t>(kResidualDof), 0.0);
 
-  // Every row of `constraint_vector` is already a fraction of its own scaled
-  // limit, so the box is the unit one and carries no machine number at all. The
-  // flow row is one-sided because `Q` is a draw and not a signed force.
-  std::vector<double> lower_h(static_cast<std::size_t>(kOcpConstraints), -1.0);
-  std::vector<double> upper_h(static_cast<std::size_t>(kOcpConstraints), 1.0);
-  const int dof = static_cast<int>(crane_model::kActuatedDof);
-  const int planned = static_cast<int>(kPathDof);
-  lower_h[static_cast<std::size_t>(2 * planned)] = 0.0;
+  // The bounds, in the units the shipped rows are written in: each row of `h` is
+  // a physical quantity divided by its own conditioning constant, so the limit
+  // goes in divided by the same one. The flow row is one-sided because `Q` is a
+  // draw and not a signed force.
+  std::vector<double> lower_h(static_cast<std::size_t>(kOcpConstraints), 0.0);
+  std::vector<double> upper_h(static_cast<std::size_t>(kOcpConstraints), 0.0);
+  for (int row = 0; row < planned; ++row) {
+    const std::size_t acceleration = static_cast<std::size_t>(kConstraintAcceleration + row);
+    const std::size_t force = static_cast<std::size_t>(kConstraintCylinderForce + row);
+    upper_h[acceleration] = scaled.ddq_a_max[row] / kConstraintScale[acceleration];
+    lower_h[acceleration] = -upper_h[acceleration];
+    upper_h[force] = scaled.force_max[row] / kConstraintScale[force];
+    lower_h[force] = -upper_h[force];
+  }
+  upper_h[static_cast<std::size_t>(kConstraintPumpFlow)] =
+    scaled.flow_max / kConstraintScale[static_cast<std::size_t>(kConstraintPumpFlow)];
+  lower_h[static_cast<std::size_t>(kConstraintPumpFlow)] = 0.0;
 
-  std::vector<int> input_index{0};
   std::vector<double> input_lower{-settings.sigma_accel_max};
   std::vector<double> input_upper{settings.sigma_accel_max};
 
@@ -839,7 +709,8 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
 
   for (int stage = 0; stage <= intervals; ++stage) {
     // Parameters: the node block, then the block the integrator holds fixed over
-    // the interval. The last stage has no interval, so it repeats its own node.
+    // the interval, then the payload. The last stage has no interval, so it
+    // repeats its own node.
     std::vector<double> stage_parameters(static_cast<std::size_t>(kOcpParameters), 0.0);
     const PathSample & node = nodes[static_cast<std::size_t>(stage)];
     const PathSample & mid =
@@ -847,65 +718,44 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     for (int derivative = 0; derivative < 3; ++derivative) {
       const crane_model::QA node_value = actuated(node, derivative);
       const crane_model::QA mid_value = actuated(mid, derivative);
-      for (int row = 0; row < dof; ++row) {
-        stage_parameters[static_cast<std::size_t>(derivative * dof + row)] = node_value[row];
-        stage_parameters[static_cast<std::size_t>(kPathBlock + derivative * dof + row)] =
-          mid_value[row];
+      const int offset = derivative * planned;
+      for (int row = 0; row < planned; ++row) {
+        stage_parameters[static_cast<std::size_t>(offset + row)] = node_value[row];
+        stage_parameters[static_cast<std::size_t>(kPathBlock + offset + row)] = mid_value[row];
       }
     }
+    stage_parameters[CRANE_PLANNING_TIMING_BLOCK_TOOL] = node.q8;
+    stage_parameters[kPathBlock + CRANE_PLANNING_TIMING_BLOCK_TOOL] = mid.q8;
+    for (std::size_t entry = 0; entry < kPayloadDof; ++entry) {
+      stage_parameters[CRANE_PLANNING_TIMING_PARAMETER_PAYLOAD + entry] = payload[entry];
+    }
     parameters.push_back(std::move(stage_parameters));
-    ocp_nlp_in_set(
-      ocp.config_, ocp.dims_, ocp.in_, stage, "parameter_values",
-      parameters.back().data());
+    if (ocp.backend().update_params(
+        ocp.capsule(), stage, parameters.back().data(), kOcpParameters) != 0)
+    {
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::BackendUnavailable,
+          "the generated solver refused the stage parameters at stage " + std::to_string(stage)));
+    }
 
     if (stage < intervals) {
-      double step = d_sigma;
-      ocp_nlp_in_set(ocp.config_, ocp.dims_, ocp.in_, stage, "Ts", &step);
-      const std::size_t instance = static_cast<std::size_t>(stage);
-      ocp_nlp_dynamics_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "expl_vde_for", bound_vde.handle(instance));
-      ocp_nlp_dynamics_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "expl_ode_fun", bound_ode.handle(instance));
-      ocp_nlp_cost_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "nls_y_fun_jac",
-        bound_residual_jacobian.handle(instance));
-      ocp_nlp_cost_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "nls_y_fun", bound_residual.handle(instance));
-      if (nonlinear_rows > 0) {
-        ocp_nlp_constraints_model_set_external_param_fun(
-          ocp.config_, ocp.dims_, ocp.in_, stage, "nl_constr_h_fun_jac",
-          bound_constraint_jacobian.handle(instance));
-        ocp_nlp_constraints_model_set_external_param_fun(
-          ocp.config_, ocp.dims_, ocp.in_, stage, "nl_constr_h_fun",
-          bound_constraint.handle(instance));
-      }
-      ocp_nlp_cost_model_set(ocp.config_, ocp.dims_, ocp.in_, stage, "W", weight.data());
+      ocp_nlp_cost_model_set(ocp.config(), ocp.dims(), ocp.in(), stage, "W", weight.data());
       ocp_nlp_cost_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "yref",
-        const_cast<double *>(reference.data()));
+        ocp.config(), ocp.dims(), ocp.in(), stage, "yref", reference.data());
       ocp_nlp_constraints_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "idxbu", input_index.data());
+        ocp.config(), ocp.dims(), ocp.in(), stage, "lbu", input_lower.data());
       ocp_nlp_constraints_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "lbu", input_lower.data());
+        ocp.config(), ocp.dims(), ocp.in(), stage, "ubu", input_upper.data());
       ocp_nlp_constraints_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "ubu", input_upper.data());
-      if (nonlinear_rows > 0) {
-        ocp_nlp_constraints_model_set(
-          ocp.config_, ocp.dims_, ocp.in_, stage, "lh", lower_h.data());
-        ocp_nlp_constraints_model_set(
-          ocp.config_, ocp.dims_, ocp.in_, stage, "uh", upper_h.data());
-      }
+        ocp.config(), ocp.dims(), ocp.in(), stage, "lh", lower_h.data());
+      ocp_nlp_constraints_model_set(
+        ocp.config(), ocp.dims(), ocp.in(), stage, "uh", upper_h.data());
     } else {
-      ocp_nlp_cost_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "nls_y_fun_jac",
-        bound_terminal_jacobian.handle(0U));
-      ocp_nlp_cost_model_set_external_param_fun(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "nls_y_fun", bound_terminal.handle(0U));
       ocp_nlp_cost_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "W", terminal_weight.data());
+        ocp.config(), ocp.dims(), ocp.in(), stage, "W", terminal_weight.data());
       ocp_nlp_cost_model_set(
-        ocp.config_, ocp.dims_, ocp.in_, stage, "yref",
-        const_cast<double *>(reference.data()));
+        ocp.config(), ocp.dims(), ocp.in(), stage, "yref", reference.data());
     }
   }
 
@@ -953,16 +803,24 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         "MPC and a plan may not spend it merely by having been asked for late"));
   }
 
-  std::vector<std::vector<int>> state_index;
+  // **Every** state row is boxed at every stage, stage 0 included, and by
+  // `lbx`/`ubx` **alone**: the export deliberately does not set `x0`, because
+  // declaring the stage-0 rows to acados as equalities through `idxbxe_0` turns
+  // every converging solve in this file into `ACADOS_QP_FAILURE` on the first QP
+  // -- HPIPM status 3, a NaN in the solution at QP iteration 4. Removing the
+  // declaration and changing nothing else makes all of them converge again.
+  //
+  // Two neighbouring explanations were measured and are wrong, so that the next
+  // reader does not spend the time again: the terminal stage's five coincident
+  // rows are **not** the trouble (widening them changes nothing), and neither is
+  // boxing `dq_u[1]`, whose box can be opened to 1e3 with the failure unchanged.
   std::vector<std::vector<double>> state_lower;
   std::vector<std::vector<double>> state_upper;
-  state_index.reserve(static_cast<std::size_t>(intervals) + 1U);
   state_lower.reserve(static_cast<std::size_t>(intervals) + 1U);
   state_upper.reserve(static_cast<std::size_t>(intervals) + 1U);
   for (int stage = 0; stage <= intervals; ++stage) {
     const double rate_ceiling = rate_ceilings[static_cast<std::size_t>(stage)];
 
-    std::vector<int> index;
     std::vector<double> lower;
     std::vector<double> upper;
     if (stage == 0) {
@@ -997,7 +855,6 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         settings.sigma_rate_min;
       const double upper_rate = request.start.sigma_rate_pinned ?
         std::min(rate_ceiling, request.start.sigma_rate + rate_window) : rate_ceiling;
-      index = {0, 1, 2, 3, 4, 5};
       lower = {
         0.0, lower_rate,
         q_u_start[0] - settings.start_resolution.q_u,
@@ -1017,12 +874,10 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       // does not need to be pinned, because the path meets its end with
       // `q_a'(1) = q_a''(1) = 0` and the joints are therefore at rest whatever
       // the path rate is. What the machine does is asserted, not the coordinate.
-      index = {0, 1, 2, 3, 4, 5};
       lower = {1.0, settings.sigma_rate_min, q_u_goal[0], q_u_goal[1], 0.0, 0.0};
       upper = {1.0, rate_ceiling, q_u_goal[0], q_u_goal[1], 0.0, 0.0};
     } else {
       const crane_model::QU & rest = q_u_equilibrium[static_cast<std::size_t>(stage)];
-      index = {0, 1, 2, 3, 4, 5};
       lower = {
         0.0, settings.sigma_rate_min, rest[0] - settings.q_u_max[0],
         rest[1] - settings.q_u_max[1], -settings.dq_u_max[0], -settings.dq_u_max[1]};
@@ -1030,48 +885,30 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         1.0, rate_ceiling, rest[0] + settings.q_u_max[0],
         rest[1] + settings.q_u_max[1], settings.dq_u_max[0], settings.dq_u_max[1]};
     }
-    state_index.push_back(std::move(index));
     state_lower.push_back(std::move(lower));
     state_upper.push_back(std::move(upper));
     ocp_nlp_constraints_model_set(
-      ocp.config_, ocp.dims_, ocp.in_, stage, "idxbx", state_index.back().data());
+      ocp.config(), ocp.dims(), ocp.in(), stage, "lbx", state_lower.back().data());
     ocp_nlp_constraints_model_set(
-      ocp.config_, ocp.dims_, ocp.in_, stage, "lbx", state_lower.back().data());
-    ocp_nlp_constraints_model_set(
-      ocp.config_, ocp.dims_, ocp.in_, stage, "ubx", state_upper.back().data());
+      ocp.config(), ocp.dims(), ocp.in(), stage, "ubx", state_upper.back().data());
   }
 
-  int stages = 1;
-  int steps = 1;
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "max_iter", const_cast<int *>(
-      &settings.max_iterations));
+  // The solver options the artifact ships as defaults and this solve owns.
+  // acados re-reads every one of them while it iterates, so none of them is a
+  // property of the generated code -- only `max_iter`'s ceiling is, and that was
+  // checked above.
+  int max_iterations = settings.max_iterations;
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "max_iter", &max_iterations);
   double budget = settings.max_wall_clock;
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "timeout_max_time", &budget);
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "timeout_max_time", &budget);
   double regularisation = settings.levenberg_marquardt;
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "levenberg_marquardt", &regularisation);
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "levenberg_marquardt", &regularisation);
   double tolerance_stationarity = settings.tolerance_stationarity;
   double tolerance_feasibility = settings.tolerance_feasibility;
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_stat", &tolerance_stationarity);
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_eq", &tolerance_feasibility);
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_ineq", &tolerance_feasibility);
-  ocp_nlp_solver_opts_set(ocp.config_, ocp.opts_, "tol_comp", &tolerance_feasibility);
-  for (int stage = 0; stage < intervals; ++stage) {
-    stages = 4;
-    steps = 1;
-    ocp_nlp_solver_opts_set_at_stage(ocp.config_, ocp.opts_, stage, "dynamics_ns", &stages);
-    ocp_nlp_solver_opts_set_at_stage(
-      ocp.config_, ocp.opts_, stage, "dynamics_num_steps", &steps);
-  }
-
-  ocp.solver_ = ocp_nlp_solver_create(ocp.config_, ocp.dims_, ocp.opts_, ocp.in_);
-
-  const int precompute = ocp_nlp_precompute(ocp.solver_, ocp.in_, ocp.out_);
-  if (precompute != ACADOS_SUCCESS) {
-    return Result<TimingSolution>::failure(
-      failure(
-        ErrorCode::BackendUnavailable,
-        "acados could not precompute the timing OCP: " + acados_status_word(precompute)));
-  }
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "tol_stat", &tolerance_stationarity);
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "tol_eq", &tolerance_feasibility);
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "tol_ineq", &tolerance_feasibility);
+  ocp_nlp_solver_opts_set(ocp.config(), ocp.opts(), "tol_comp", &tolerance_feasibility);
 
   // A guess that already satisfies the boundary conditions and every box: the
   // path rate on the classical velocity-limit curve of 5.1 -- the largest rate at
@@ -1149,39 +986,31 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
     // How far outside constraints 6 and 7 this node is at one candidate rate,
     // as a fraction of the allowance. At or below one is feasible.
     const auto demand = [&](double rate) {
-        std::vector<double> state16;
-        state16.reserve(16U);
-        for (int row = 0; row < dof; ++row) {state16.push_back(position[row]);}
-        state16.push_back(q_u_equilibrium[at][0]);
-        state16.push_back(q_u_equilibrium[at][1]);
-        for (int row = 0; row < dof; ++row) {state16.push_back(slope[row] * rate);}
-        state16.push_back(0.0);
-        state16.push_back(0.0);
-        std::vector<double> acceleration(static_cast<std::size_t>(dof), 0.0);
+        crane_model::QA velocity = crane_model::QA::Zero();
+        crane_model::QA acceleration = crane_model::QA::Zero();
         for (int row = 0; row < dof; ++row) {
-          acceleration[static_cast<std::size_t>(row)] = curvature[row] * rate * rate;
+          velocity[row] = slope[row] * rate;
+          acceleration[row] = curvature[row] * rate * rate;
         }
-
+        std::vector<double> outputs;
+        if (!evaluate_output(
+            backend, position, velocity, acceleration, q_u_equilibrium[at],
+            crane_model::DQU::Zero(), payload, outputs))
+        {
+          return std::numeric_limits<double>::infinity();
+        }
         double worst = 0.0;
-        try {
-          const std::vector<casadi::DM> outputs = graph->z(
-            std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
-          const std::vector<double> z = outputs[0].nonzeros();
-          double flow = 0.0;
-          // The rows the constraint vector carries, and no others: bisecting
-          // against a tool row the solve cannot relieve would lower every guess
-          // for a demand no timing can change.
-          for (int row = 0; row < planned; ++row) {
-            const double force =
-              z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
-            worst = std::max(
-              worst, std::abs(force) / scaled.force_max[static_cast<std::size_t>(row)]);
-            flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
-          }
-          worst = std::max(worst, std::abs(flow) / scaled.flow_max);
-        } catch (const std::exception &) {
-          worst = std::numeric_limits<double>::infinity();
+        double flow = 0.0;
+        // The rows the constraint vector carries, and no others: bisecting
+        // against a tool row the solve cannot relieve would lower every guess
+        // for a demand no timing can change.
+        for (int row = 0; row < planned; ++row) {
+          const double force = outputs[kOutputCylinderForce + static_cast<std::size_t>(row)];
+          worst = std::max(
+            worst, std::abs(force) / scaled.force_max[static_cast<std::size_t>(row)]);
+          flow += outputs[kOutputAxisFlow + static_cast<std::size_t>(row)];
         }
+        worst = std::max(worst, std::abs(flow) / scaled.flow_max);
         return worst;
       };
 
@@ -1270,29 +1099,29 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       guess[4] = dq_u_start[0];
       guess[5] = dq_u_start[1];
     }
-    ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "x", guess.data());
+    ocp_nlp_out_set(ocp.config(), ocp.dims(), ocp.out(), stage, "x", guess.data());
     if (stage < intervals) {
       double input = 0.0;
-      ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "u", &input);
+      ocp_nlp_out_set(ocp.config(), ocp.dims(), ocp.out(), stage, "u", &input);
     }
     // acados allocates `nlp_out` with `malloc` and does not zero it, so the
     // multipliers start as whatever was on the heap -- and the first
     // stationarity residual is then a NaN before any step has been taken. The
     // examples get away with it because they leave far less of the vector
-    // unused; a horizon with thirteen nonlinear rows per stage does not.
+    // unused; a horizon with eleven nonlinear rows per stage does not.
     std::vector<double> zeros(64U, 0.0);
-    ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "lam", zeros.data());
+    ocp_nlp_out_set(ocp.config(), ocp.dims(), ocp.out(), stage, "lam", zeros.data());
     if (stage < intervals) {
-      ocp_nlp_out_set(ocp.config_, ocp.dims_, ocp.out_, stage, "pi", zeros.data());
+      ocp_nlp_out_set(ocp.config(), ocp.dims(), ocp.out(), stage, "pi", zeros.data());
     }
   }
 
-  const int status = ocp_nlp_solve(ocp.solver_, ocp.in_, ocp.out_);
+  const int status = ocp.backend().solve(ocp.capsule());
 
   int iterations = 0;
   double solve_time = 0.0;
-  ocp_nlp_get(ocp.solver_, "sqp_iter", &iterations);
-  ocp_nlp_get(ocp.solver_, "time_tot", &solve_time);
+  ocp_nlp_get(ocp.solver(), "sqp_iter", &iterations);
+  ocp_nlp_get(ocp.solver(), "time_tot", &solve_time);
 
   if (status != ACADOS_SUCCESS) {
     // mpc.md 5.3 requirement 1, and 7's "do not emit a partial plan": what comes
@@ -1312,7 +1141,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   std::vector<double> sigma_rate(static_cast<std::size_t>(intervals) + 1U, 0.0);
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> state(static_cast<std::size_t>(kOcpStateDof), 0.0);
-    ocp_nlp_out_get(ocp.config_, ocp.dims_, ocp.out_, stage, "x", state.data());
+    ocp_nlp_out_get(ocp.config(), ocp.dims(), ocp.out(), stage, "x", state.data());
     if (!std::isfinite(state[1]) || !(state[1] > 0.0)) {
       return Result<TimingSolution>::failure(
         failure(
@@ -1390,64 +1219,61 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
   solution.nodes.reserve(static_cast<std::size_t>(intervals) + 1U);
   for (int stage = 0; stage <= intervals; ++stage) {
     std::vector<double> state(static_cast<std::size_t>(kOcpStateDof), 0.0);
-    ocp_nlp_out_get(ocp.config_, ocp.dims_, ocp.out_, stage, "x", state.data());
+    ocp_nlp_out_get(ocp.config(), ocp.dims(), ocp.out(), stage, "x", state.data());
     double input = 0.0;
     if (stage < intervals) {
-      ocp_nlp_out_get(ocp.config_, ocp.dims_, ocp.out_, stage, "u", &input);
+      ocp_nlp_out_get(ocp.config(), ocp.dims(), ocp.out(), stage, "u", &input);
     }
     const PathSample & node = nodes[static_cast<std::size_t>(stage)];
+    const crane_model::QA position = actuated(node, 0);
     const crane_model::QA slope = actuated(node, 1);
     const crane_model::QA curvature = actuated(node, 2);
 
-    std::vector<double> acceleration(static_cast<std::size_t>(crane_model::kActuatedDof), 0.0);
-    const crane_model::QA position = actuated(node, 0);
     // All six rows go into the model, because the tool link is pinned and not
     // removed; only the five the OCP constrained are reported as demand, because
     // `PeakDemand` is a fraction of a limit this solve was actually held to.
+    crane_model::QA velocity = crane_model::QA::Zero();
+    crane_model::QA acceleration = crane_model::QA::Zero();
     for (int row = 0; row < dof; ++row) {
-      acceleration[static_cast<std::size_t>(row)] =
-        curvature[row] * state[1] * state[1] + slope[row] * input;
+      velocity[row] = slope[row] * state[1];
+      acceleration[row] = curvature[row] * state[1] * state[1] + slope[row] * input;
       if (row >= planned) {
         continue;
       }
       solution.peak_demand.joint_acceleration = std::max(
         solution.peak_demand.joint_acceleration,
-        std::abs(acceleration[static_cast<std::size_t>(row)]) /
+        std::abs(acceleration[row]) /
         settings.actuation.ddq_a_max[static_cast<std::size_t>(row)]);
       solution.peak_demand.joint_velocity = std::max(
         solution.peak_demand.joint_velocity,
-        std::abs(slope[row] * state[1]) /
-        limits.axis[static_cast<std::size_t>(row)].dq_max);
+        std::abs(velocity[row]) / limits.axis[static_cast<std::size_t>(row)].dq_max);
     }
 
-    std::vector<double> state16;
-    state16.reserve(16U);
-    for (int row = 0; row < dof; ++row) {state16.push_back(position[row]);}
-    state16.push_back(state[2]);
-    state16.push_back(state[3]);
-    for (int row = 0; row < dof; ++row) {state16.push_back(slope[row] * state[1]);}
-    state16.push_back(state[4]);
-    state16.push_back(state[5]);
+    const crane_model::QU q_u(state[2], state[3]);
+    const crane_model::DQU dq_u(state[4], state[5]);
+    if (!evaluate_output(backend, position, velocity, acceleration, q_u, dq_u, payload, z)) {
+      return Result<TimingSolution>::failure(
+        failure(
+          ErrorCode::SymbolicBackendFailure,
+          "the output map of mpc 3 could not be evaluated at the solved node " +
+          std::to_string(stage)));
+    }
 
-    const std::vector<casadi::DM> outputs = graph->z(
-      std::vector<casadi::DM>{casadi::DM(state16), casadi::DM(acceleration)});
-    const std::vector<double> z = outputs[0].nonzeros();
     OcpNode record;
     record.sigma = static_cast<double>(stage) * d_sigma;
     record.sigma_rate = state[1];
     record.q_a = position;
-    record.q_u = crane_model::QU(state[2], state[3]);
-    record.dq_u = crane_model::DQU(state[4], state[5]);
+    record.q_u = q_u;
+    record.dq_u = dq_u;
     record.q_u_equilibrium = q_u_equilibrium[static_cast<std::size_t>(stage)];
     double flow = 0.0;
     for (int row = 0; row < dof; ++row) {
-      const double force =
-        z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
+      const double force = z[kOutputCylinderForce + static_cast<std::size_t>(row)];
       // The record carries all six -- the tool cylinder is still in the model and
       // what it holds is worth reading -- while the demand and constraint 7's sum
       // carry the five the constraint vector does.
-      record.dq_a[row] = slope[row] * state[1];
-      record.ddq_a[row] = acceleration[static_cast<std::size_t>(row)];
+      record.dq_a[row] = velocity[row];
+      record.ddq_a[row] = acceleration[row];
       record.cylinder_force[row] = force;
       if (row >= planned) {
         continue;
@@ -1456,7 +1282,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
         solution.peak_demand.cylinder_force,
         std::abs(force) /
         settings.actuation.cylinder_force_max[static_cast<std::size_t>(row)]);
-      flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
+      flow += z[kOutputAxisFlow + static_cast<std::size_t>(row)];
     }
     record.pump_flow = flow;
     solution.nodes.push_back(record);
