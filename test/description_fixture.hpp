@@ -120,7 +120,7 @@ inline crane_model::QA centred(const crane_planning::JointLimits & limits, const
  *
  * That did not matter while the timing was issue 038's ramp, which constrained
  * nothing. It matters now that the timing is the OCP of 5.2, and it is the same
- * shape of correction as the one `test_trajectory_timing.cpp` already carries for
+ * shape of correction as the one this fixture already carries for
  * the all-zero start: a pose the real check refuses, in a test that is not about
  * that refusal. Every case that plans a *timing* therefore starts here, and the
  * cases that only test geometry keep `centred()`.
@@ -159,13 +159,7 @@ inline crane_model::Q settled(const crane_model::Model & model, const crane_mode
   if (!equilibrium.ok()) {
     throw std::runtime_error(equilibrium.status().message);
   }
-  crane_model::Q q = crane_model::Q::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-      q_a[static_cast<Eigen::Index>(row)];
-  }
-  q.segment<2>(4) = equilibrium.value();
-  return q;
+  return crane_planning::expand(q_a, equilibrium.value());
 }
 
 inline crane_planning::PlannerContext build_context(

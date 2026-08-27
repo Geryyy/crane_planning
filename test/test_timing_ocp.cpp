@@ -8,10 +8,11 @@
 // The four assertions the acceptance criteria name, and where they live:
 //
 //   * the trajectory ends with the tool hanging still     `EndsWithTheToolStill`
-//   * the flow expression is the graph's, not a copy      `FlowAgreesWithTheGraph`
+//   * the generated force/flow rows use the shared model layout `GeneratedRows`
 //   * the peak demand sits at kappa and not at one        `KappaLeavesMargin`
 //   * a binding force limit costs time                    `ForceLimitCostsTime`
 
+#include <crane_planning_timing_ocp_generated.h>
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -20,11 +21,6 @@
 #include <vector>
 
 #include "crane_model/model.hpp"
-// `FlowAgreesWithTheGraph` builds the graph a second time and drives it itself,
-// which is the only way a test outside the library can settle that the planner's
-// flow row *is* this one. It is why this binary links `crane_model::casadi_graph`
-// while nothing else in the package's tests does.
-#include "crane_model/symbolic/casadi_graph.hpp"
 #include "crane_planning/geometric_path.hpp"
 #include "crane_planning/joint_limits.hpp"
 #include "crane_planning/planner_core.hpp"
@@ -49,7 +45,6 @@ constexpr double kSystemPressure = 2.5e7;  // Pa
 struct Fixture
 {
   crane_model::Model model;
-  crane_model::ModelConfig config;
   crane_planning::JointLimits limits;
   crane_planning::GeometricPath path;
   crane_planning::TimingOcpSettings settings;
@@ -90,9 +85,7 @@ crane_planning::PathVector path_vector(const crane_model::QA & q_a)
 /// One machine, one straight two-waypoint path, and settings that can be solved.
 Fixture make_fixture(const Machine & machine)
 {
-  Fixture fixture{build_model(machine), {}, {}, {}, {}};
-  fixture.config.robot_description_xml = description(machine);
-  fixture.config.tool = machine.tool;
+  Fixture fixture{build_model(machine), {}, {}, {}};
 
   auto limits = crane_planning::read_joint_limits(
     description(machine), fixture.model.urdf_joint_names());
@@ -124,7 +117,7 @@ crane_planning::TimingSolution solved(const Fixture & fixture)
   crane_planning::TimingOcpRequest request;
   request.payload = empty_gripper();
   auto solution = crane_planning::solve_timing_ocp(
-    fixture.model, fixture.config, fixture.path, fixture.limits, request, fixture.settings);
+    fixture.model, fixture.path, fixture.limits, request, fixture.settings);
   EXPECT_TRUE(solution.ok()) << solution.status().message;
   if (!solution.ok()) {
     return crane_planning::TimingSolution{};
@@ -150,7 +143,7 @@ TEST(TimingOcp, SolvesTheStraightMove)
     request.payload = empty_gripper();
 
     auto solution = crane_planning::solve_timing_ocp(
-      fixture.model, fixture.config, fixture.path, fixture.limits, request, fixture.settings);
+      fixture.model, fixture.path, fixture.limits, request, fixture.settings);
     ASSERT_TRUE(solution.ok()) << solution.status().message;
     EXPECT_GT(solution.value().trajectory.duration, 0.0);
     EXPECT_EQ(solution.value().solver_status, "ACADOS_SUCCESS");
@@ -211,81 +204,26 @@ TEST(TimingOcp, EndsWithTheToolStill)
   }
 }
 
-/// 5.3 by construction: the planner's flow row *is* the graph's output map.
+/// 5.3 by construction: both OCP exporters slice the shared model output map.
 /**
- * The acceptance criterion asks for agreement "at sampled points rather than
- * merely resembling each other", and this is the only way to settle it from
- * outside the library: rebuild the graph the way `solve_timing_ocp` does, drive
- * it with the state and acceleration the solve reported at each node, sum
- * `mpc.md` 3 constraint 7's per-axis rows, and compare against the flow the
- * planner recorded there.
- *
- * The tolerance is `1e-15` relative, i.e. floating-point equality. Anything a
- * *second implementation* would produce -- a differently ordered sum, an
- * unsmoothed `sign(v)`, a different `eps` -- misses that by decades. Passing it
- * means one expression, evaluated twice.
+ * The symbolic model is intentionally export-only now that crane_model is a
+ * numeric runtime package.  The two exporters nevertheless carry the same
+ * generated layout contract: six physical axes in `z`, with the five planned
+ * axes (not the pinned tool axis) forming the force and flow constraints.  Keep
+ * this assertion next to the solver so a changed shared output layout cannot
+ * silently move a physical limit to another row.
  */
-TEST(TimingOcp, FlowAgreesWithTheGraph)
+TEST(TimingOcp, GeneratedRowsMatchSharedOutputMap)
 {
-  for (const Machine & machine : machines()) {
-    SCOPED_TRACE(machine.name);
-    const Fixture fixture = make_fixture(machine);
-    const crane_planning::TimingSolution solution = solved(fixture);
-    ASSERT_FALSE(solution.nodes.empty());
-
-    crane_model::SymbolicGraphSpec spec;
-    spec.sample_time_s = fixture.settings.sample_period;
-    spec.include_output_map = true;
-    auto graph = crane_model::symbolic::casadi_graph(fixture.config, spec, empty_gripper());
-    ASSERT_TRUE(graph.ok()) << graph.status().message;
-
-    double worst_flow = 0.0;
-    double worst_force = 0.0;
-    double largest = 0.0;
-    for (const crane_planning::OcpNode & node : solution.nodes) {
-      std::vector<double> state;
-      state.reserve(16U);
-      for (int row = 0; row < 6; ++row) {state.push_back(node.q_a[row]);}
-      state.push_back(node.q_u[0]);
-      state.push_back(node.q_u[1]);
-      for (int row = 0; row < 6; ++row) {state.push_back(node.dq_a[row]);}
-      state.push_back(node.dq_u[0]);
-      state.push_back(node.dq_u[1]);
-      std::vector<double> acceleration;
-      acceleration.reserve(6U);
-      for (int row = 0; row < 6; ++row) {acceleration.push_back(node.ddq_a[row]);}
-
-      const std::vector<casadi::DM> outputs = graph.value()->z(
-        std::vector<casadi::DM>{casadi::DM(state), casadi::DM(acceleration)});
-      const std::vector<double> z = outputs[0].nonzeros();
-
-      // The force is compared on all six rows, because the record carries all six
-      // -- the tool cylinder is still in the model after issue 068 took its
-      // coordinate out of the OCP. The **flow is summed over the five** the
-      // constraint sums, because `OcpNode::pump_flow` is constraint 7's left-hand
-      // side and constraint 7 no longer charges the tool: an axis the timing holds
-      // still draws nothing it chose. The difference is the `A±(0) eps` the
-      // smoothing leaves at zero velocity, some `6e-9 m^3/s`, which is four
-      // decades above this comparison's own tolerance and would read as a
-      // disagreement about the expression rather than about which rows it sums.
-      double flow = 0.0;
-      for (int row = 0; row < 6; ++row) {
-        if (row < static_cast<int>(crane_planning::kPathDof)) {
-          flow += z[crane_model::symbolic::kAxisFlowOffset + static_cast<std::size_t>(row)];
-        }
-        const double force =
-          z[crane_model::symbolic::kCylinderForceOffset + static_cast<std::size_t>(row)];
-        worst_force = std::max(worst_force, std::abs(force - node.cylinder_force[row]));
-        largest = std::max(largest, std::abs(force));
-      }
-      worst_flow = std::max(worst_flow, std::abs(flow - node.pump_flow));
-    }
-    // Absolute, against the scale each quantity actually has here.
-    EXPECT_LT(worst_flow, 1.0e-15 * fixture.settings.actuation.pump_flow_max)
-      << "the planner's pump flow is not the graph's";
-    EXPECT_LT(worst_force, 1.0e-12 * std::max(1.0, largest))
-      << "the planner's cylinder force is not the graph's";
-  }
+  EXPECT_EQ(CRANE_PLANNING_TIMING_OUTPUT_DOF, 24);
+  EXPECT_EQ(CRANE_PLANNING_TIMING_OUTPUT_CYLINDER_FORCE, 6);
+  EXPECT_EQ(CRANE_PLANNING_TIMING_OUTPUT_PISTON_VELOCITY, 12);
+  EXPECT_EQ(CRANE_PLANNING_TIMING_OUTPUT_AXIS_FLOW, 18);
+  EXPECT_EQ(CRANE_PLANNING_TIMING_CONSTRAINT_ACCELERATION, 0);
+  EXPECT_EQ(CRANE_PLANNING_TIMING_CONSTRAINT_CYLINDER_FORCE,
+    static_cast<int>(crane_planning::kPathDof));
+  EXPECT_EQ(CRANE_PLANNING_TIMING_CONSTRAINT_PUMP_FLOW,
+    2 * static_cast<int>(crane_planning::kPathDof));
 }
 
 /// 5.5: the answer sits at kappa of the machine, and the rest is the MPC's.
@@ -371,7 +309,7 @@ TEST(TimingOcp, ForceLimitCostsTime)
     crane_planning::TimingOcpRequest request;
     request.payload = empty_gripper();
     auto attempt = crane_planning::solve_timing_ocp(
-      binding.model, binding.config, binding.path, binding.limits, request, binding.settings);
+      binding.model, binding.path, binding.limits, request, binding.settings);
     walked += "\n  " + std::to_string(factor) + "x: " +
       (attempt.ok() ?
       "solved, duration " + std::to_string(attempt.value().trajectory.duration) +
@@ -438,7 +376,10 @@ TEST(TimingOcp, AFlowLimitedMultiAxisMoveIsSlowerWhenThePumpIsSmaller)
   EXPECT_NEAR(slow.peak_demand.pump_flow, ample.settings.kappa, 1.0e-3)
     << "the starved solve did not end up on its own pump bound, so the fifth of a pump is not "
     "what made it slower";
-  EXPECT_GE(slow.peak_demand.pump_flow, fast.peak_demand.pump_flow - 1.0e-9);
+  // The two generated SQP solves terminate at their configured residual
+  // tolerance; evaluating the generated output map at the returned iterate can
+  // therefore differ by a few ppm even when both are on the same bound.
+  EXPECT_GE(slow.peak_demand.pump_flow, fast.peak_demand.pump_flow - 2.0e-6);
 }
 
 /// The 0.95x of parameters.md 4, which is not kappa and is not optional.
@@ -481,7 +422,7 @@ TEST(TimingOcp, ARefusalIsARefusalAndNotAClippedTrajectory)
   crane_planning::TimingOcpRequest request;
   request.payload = empty_gripper();
   auto solution = crane_planning::solve_timing_ocp(
-    fixture.model, fixture.config, fixture.path, fixture.limits, request, fixture.settings);
+    fixture.model, fixture.path, fixture.limits, request, fixture.settings);
 
   ASSERT_FALSE(solution.ok()) << "a solve inside a microsecond budget reported success";
   // acados' own word for it, not a sentence this package made up.

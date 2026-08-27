@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "crane_planning/joint_limits.hpp"
+#include "crane_planning/status.hpp"
 
 namespace crane_planning
 {
@@ -25,11 +26,6 @@ using crane_model::Q;
 using crane_model::QA;
 using crane_model::Result;
 using crane_model::Status;
-
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
 
 /// The frames whose motion the resolution of the check is measured on.
 /**
@@ -74,25 +70,10 @@ constexpr double kThinnestFraction = 0.5;
 /// Largest bound the sway envelope may be given, rad.
 constexpr double kMaxSwayBound = 1.5;
 
-/// The actuated projection of a canonical eight-vector.
-QA actuated(const Q & q)
-{
-  QA q_a;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] = q[static_cast<Eigen::Index>(kActuatedRows[row])];
-  }
-  return q_a;
-}
-
 /// The canonical eight of one path sample, passive pair left at zero.
 Q configuration_of(const PathSample & sample)
 {
-  Q q = Q::Zero();
-  for (std::size_t row = 0; row < kPathDof; ++row) {
-    q[static_cast<Eigen::Index>(kActuatedRows[row])] = sample.q_a[static_cast<Eigen::Index>(row)];
-  }
-  q[static_cast<Eigen::Index>(kActuatedRows[kToolRow])] = sample.q8;
-  return q;
+  return expand(sample.q_a, sample.q8);
 }
 
 bool rotation_is_a_rotation(const Eigen::Matrix3d & rotation)

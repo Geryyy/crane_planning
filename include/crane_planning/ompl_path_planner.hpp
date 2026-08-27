@@ -1,4 +1,4 @@
-// The sampling fallback of `wiki/trajectory_planning.md` 4.4 and the smoothing
+// The OMPL path planner of `wiki/trajectory_planning.md` 4.4 and the smoothing
 // 4.5 says is not optional, over the five path coordinates `q_a` of 4.1.
 //
 // # Second, and only second
@@ -108,7 +108,7 @@
 // worse answer than none, it is an answer that reads as success. The replanning
 // loop's own latency bound is issue 045's and is not this cap.
 //
-// The search samples from a `std::mt19937` seeded by `SamplingSettings::seed`
+// The search samples from a `std::mt19937` seeded by `OmplSettings::seed`
 // and from nothing else, so a fixed seed gives a fixed path: OMPL's global RNG
 // is not what this planner draws from, because it can be seeded only once per
 // process and a test that has to run second would then not be reproducible. The
@@ -116,8 +116,8 @@
 // search. A stochastic planner in an automated suite is a flaky test, and the
 // tests here fix the seed.
 
-#ifndef CRANE_PLANNING__SAMPLING_PLANNER_HPP_
-#define CRANE_PLANNING__SAMPLING_PLANNER_HPP_
+#ifndef CRANE_PLANNING__OMPL_PATH_PLANNER_HPP_
+#define CRANE_PLANNING__OMPL_PATH_PLANNER_HPP_
 
 #include <Eigen/Core>
 
@@ -144,17 +144,11 @@ namespace crane_planning
  * expects, while a sampled path spent a budget to be found and rounds whatever
  * was in the way.
  */
-enum class PathMechanism : std::uint8_t
-{
-  StructuredPrimitive = 0,  ///< 4.4's first mechanism, tried first, always
-  SamplingFallback = 1      ///< 4.4's second, reached only when the first is refused
-};
-
-[[nodiscard]] const char * mechanism_name(PathMechanism mechanism) noexcept;
-
 /// What a deployment configures about the fallback.
-struct SamplingSettings
+struct OmplSettings
 {
+  PathFitSettings fit{};
+  CollisionSettings collision{};
   /// The seed the search and the shortcut draw from. Fixed, never a clock.
   /**
    * A default that is a constant rather than a time is the point: two identical
@@ -226,10 +220,10 @@ struct StateSpaceBounds
  */
 [[nodiscard]] crane_model::Result<StateSpaceBounds> state_space_bounds(
   const JointLimits & limits, const PathVector & q_a_start, const PathVector & q_a_goal,
-  const SamplingSettings & settings);
+  const OmplSettings & settings);
 
 /// One move the fallback is asked to cover, with the primitive already refused.
-struct SamplingRequest
+struct OmplRequest
 {
   crane_model::Q q_start{crane_model::Q::Zero()};  ///< all eight, passive pair as measured
   crane_model::Q q_goal{crane_model::Q::Zero()};   ///< the endpoint issue 039 solved
@@ -247,13 +241,7 @@ struct SamplingRequest
   crane_model::Payload payload{};
   PayloadShape payload_shape{};
 
-  /// The scene the check runs against, already in `K0_mounting_base`.
-  /**
-   * Never null. A fallback exists to round something, and there is nothing to
-   * round without a scene: `plan_motion` refuses a checked plan with no scene
-   * long before it gets here, and an unchecked plan never reaches a fallback
-   * because an unchecked primitive is never blocked.
-   */
+  /// The scene to check, or null when scene collision checking is disabled.
   const crane_model::CollisionScene * collision_scene{nullptr};
 };
 
@@ -268,7 +256,7 @@ struct SamplingRequest
  * validation the search used, so the polyline this returns is one that was
  * cleared -- and the path that is *flown* is the C2 fit of it, which is not that
  * polyline, which is why 4.5 mandates the re-check afterwards and why
- * `plan_sampled_path` runs one. Handed a predicate that accepts everything this
+ * `plan_ompl_path` runs one. Handed a predicate that accepts everything this
  * is the naive corner-cut 4.5 warns about, and the re-check is what has to catch
  * it; that is a case worth testing and this signature is what makes it reachable.
  */
@@ -277,7 +265,7 @@ struct SamplingRequest
   const std::function<bool(const PathVector &, const PathVector &)> & accept);
 
 /// The fallback's answer, with what it cost and what cleared it.
-struct SamplingPlan
+struct OmplPlan
 {
   GeometricPath path{};        ///< shortcut, fitted C2, and re-checked -- in that order
   PathCheck recheck{};         ///< 4.5's re-check, on the curve that would be flown
@@ -290,7 +278,7 @@ struct SamplingPlan
 };
 
 /// The fallback, as the sentence a response carries.
-[[nodiscard]] std::string describe(const SamplingPlan & plan);
+[[nodiscard]] std::string describe(const OmplPlan & plan);
 
 /// Sample a path around what blocked the primitive, smooth it, and re-check it.
 /**
@@ -304,11 +292,10 @@ struct SamplingPlan
  * so both mechanisms are cleared on one set of numbers; `fit` is the same C2 fit
  * the primitive is built with.
  */
-[[nodiscard]] crane_model::Result<SamplingPlan> plan_sampled_path(
-  const crane_model::Model & model, const JointLimits & limits, const PathFitSettings & fit,
-  const CollisionSettings & collision, const SamplingSettings & settings,
-  const SamplingRequest & request);
+[[nodiscard]] crane_model::Result<OmplPlan> plan_ompl_path(
+  const crane_model::Model & model, const JointLimits & limits,
+  const OmplSettings & settings, const OmplRequest & request);
 
 }  // namespace crane_planning
 
-#endif  // CRANE_PLANNING__SAMPLING_PLANNER_HPP_
+#endif  // CRANE_PLANNING__OMPL_PATH_PLANNER_HPP_

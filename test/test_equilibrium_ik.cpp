@@ -60,11 +60,6 @@ constexpr double kAxisExclusion = 2.0;
  */
 constexpr int kSamples = 25;
 
-double wrap(double angle)
-{
-  return std::remainder(angle, 2.0 * M_PI);
-}
-
 double uniform(std::mt19937_64 & source, double lower, double upper)
 {
   return std::uniform_real_distribution<double>(lower, upper)(source);
@@ -73,12 +68,7 @@ double uniform(std::mt19937_64 & source, double lower, double upper)
 /// The actuated projection of a canonical eight-vector.
 crane_model::QA actuated_of(const crane_model::Q & q)
 {
-  crane_model::QA q_a;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] =
-      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])];
-  }
-  return q_a;
+  return crane_planning::actuated(q);
 }
 
 /// The canonical eight of one actuated configuration, settled at its equilibrium.
@@ -90,12 +80,7 @@ bool settled_configuration(
   if (!settled.ok()) {
     return false;
   }
-  q = crane_model::Q::Zero();
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-      q_a[static_cast<Eigen::Index>(row)];
-  }
-  q.segment<2>(4) = settled.value();
+  q = crane_planning::expand(q_a, settled.value());
   return true;
 }
 
@@ -217,7 +202,7 @@ TEST(EquilibriumIk, EveryReachableGoalComesBackAsAGenuineSteadyState)
       ASSERT_TRUE(pose.ok()) << machine.name;
       const double residual_p = (pose.value().position_m - sample.p_tcp_0).norm();
       const double residual_yaw = std::abs(
-        wrap(crane_planning::phi_z_of(pose.value().orientation) - sample.phi_z));
+        crane_planning::wrap(crane_planning::phi_z_of(pose.value().orientation) - sample.phi_z));
       EXPECT_LT(residual_p, seed.eps_pos) << machine.name;
       EXPECT_LT(residual_yaw, seed.eps_yaw) << machine.name;
 
@@ -415,8 +400,9 @@ TEST(EquilibriumIk, ThePayloadEntersTheEquilibrium)
       ASSERT_TRUE(placed.ok()) << machine.name;
       EXPECT_LT((placed.value().position_m - request.p_tcp_0).norm(), seed.eps_pos)
         << machine.name;
+      const double placed_phi_z = crane_planning::phi_z_of(placed.value().orientation);
       EXPECT_LT(
-        std::abs(wrap(crane_planning::phi_z_of(placed.value().orientation) - request.phi_z_d)),
+        std::abs(crane_planning::wrap(placed_phi_z - request.phi_z_d)),
         seed.eps_yaw) << machine.name;
     }
 

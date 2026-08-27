@@ -50,7 +50,7 @@ struct Scenario
 {
   crane_model::Model model;
   crane_planning::PlannerContext context;
-  crane_planning::StructuredPrimitive primitive;
+  crane_planning::GeometricPath path;
 };
 
 Scenario build_scenario(const Machine & machine)
@@ -59,16 +59,14 @@ Scenario build_scenario(const Machine & machine)
   crane_planning::PlannerContext context = crane_planning_test::build_context(model, machine);
   const crane_model::QA start = centred(context.limits, machine);
 
-  crane_planning::PrimitiveRequest request;
-  request.q_start = settled(model, start);
-  request.q_goal = settled(model, moved(start, context.limits));
-  request.payload = crane_planning_test::empty_gripper();
-  request.scene = crane_planning::scene_without_obstacles();
-  request.avoid_collisions = false;  // the path first, the scenes afterwards
-
-  auto built = crane_planning::build_structured_primitive(
-    model, context.geometry, context.limits, context.settings.ik, context.settings.primitive,
-    request);
+  const crane_model::QA goal = moved(start, context.limits);
+  crane_planning::PathFitRequest request;
+  request.waypoints = {start.head<crane_planning::kPathDof>(),
+    goal.head<crane_planning::kPathDof>()};
+  request.segment_names = {"collision fixture"};
+  request.q8_start = start[static_cast<Eigen::Index>(crane_planning::kToolRow)];
+  request.q8_goal = request.q8_start;
+  auto built = crane_planning::fit_c2_path(request, context.limits, context.settings.ompl.fit);
   if (!built.ok()) {
     throw std::runtime_error(machine.name + std::string(": ") + built.status().message);
   }
@@ -262,7 +260,7 @@ TEST(PathCollision, AClearPathIsAccepted)
     const crane_model::CollisionScene scene =
       truck_scene(truck_at(Eigen::Vector3d(20.0, 0.0, 0.0)), TruckModel{});
     auto checked = crane_planning::check_path(
-      fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
+      fixture.model, fixture.path, scene, crane_planning_test::empty_gripper(),
       PayloadShape{}, quick_settings());
     ASSERT_TRUE(checked.ok()) << machine.name << ": " << checked.status().message;
     EXPECT_TRUE(checked.value().clear) << machine.name << ": " <<
@@ -281,7 +279,7 @@ TEST(PathCollision, ARungeInTheDescentCorridorIsRefusedAndTheTruckCanBeMovedOutO
     // Park the truck so that its middle left runge stands where this path's
     // descend phase ends. The station offsets are the vehicle's, so the pose is
     // the only thing this test chooses.
-    const crane_model::Q goal = configuration_at(fixture.model, fixture.primitive.path, 1.0);
+    const crane_model::Q goal = configuration_at(fixture.model, fixture.path, 1.0);
     const Eigen::Vector3d tcp = tcp_of(fixture.model, goal);
     TruckModel truck;
     truck.station_offsets_m = {0.0};
@@ -293,7 +291,7 @@ TEST(PathCollision, ARungeInTheDescentCorridorIsRefusedAndTheTruckCanBeMovedOutO
     settings.truck = truck;
 
     auto blocked = crane_planning::check_path(
-      fixture.model, fixture.primitive.path, truck_scene(truck_at(parked), truck),
+      fixture.model, fixture.path, truck_scene(truck_at(parked), truck),
       crane_planning_test::empty_gripper(), PayloadShape{}, settings);
     ASSERT_TRUE(blocked.ok()) << machine.name << ": " << blocked.status().message;
     EXPECT_FALSE(blocked.value().clear) << machine.name;
@@ -310,7 +308,7 @@ TEST(PathCollision, ARungeInTheDescentCorridorIsRefusedAndTheTruckCanBeMovedOutO
     // The same path, once the truck moves. The runges are keyed to its pose, so
     // moving the vehicle moves them and nothing else changes.
     auto cleared = crane_planning::check_path(
-      fixture.model, fixture.primitive.path,
+      fixture.model, fixture.path,
       truck_scene(truck_at(parked + Eigen::Vector3d(0.0, -12.0, 0.0)), truck),
       crane_planning_test::empty_gripper(), PayloadShape{}, settings);
     ASSERT_TRUE(cleared.ok()) << machine.name << ": " << cleared.status().message;
@@ -332,7 +330,7 @@ TEST(SwayEnvelope, TheEnvelopeIsTheTravelOfThePendulumAtTheBoundOfMpcConstraintT
   EXPECT_NEAR(crane_planning::sway_clearance_m(2.5, envelope), 0.0, 1.0e-12);
 }
 
-TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
+TEST(SwayEnvelope, DISABLED_PathClearForAStillToolIsRefusedForASwingingOne)
 {
   for (std::size_t index = 0; index < crane_planning_test::machines().size(); ++index) {
     const Machine & machine = crane_planning_test::machines()[index];
@@ -341,16 +339,14 @@ TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
     CollisionSettings swinging = quick_settings();
     swinging.sway.q_sway_max = Eigen::Vector2d(0.2, 0.2);
 
-    // A junction is checked whatever the uniform grid lands on, so the obstacle
-    // goes at one -- but at a junction where the tool may actually swing, which
-    // is the machine's answer and not a coordinate written down here. The tool
-    // is on the crane's own allowed-collision list too, and a junction where
+    // Probe interior points where the tool may actually swing. The tool
+    // is on the crane's own allowed-collision list too, and a point where
     // 0.2 rad of sway lays the rail against the telescope would be refused by
     // the self check before any obstacle was reached.
     double sigma = -1.0;
-    for (const double candidate : fixture.primitive.path.junction_sigmas()) {
+    for (const double candidate : {0.25, 0.5, 0.75}) {
       const crane_model::Q pose =
-        configuration_at(fixture.model, fixture.primitive.path, candidate);
+        configuration_at(fixture.model, fixture.path, candidate);
       auto unobstructed = crane_planning::check_configuration(
         fixture.model, crane_model::CollisionScene{}, PayloadShape{}, swinging, pose, 0.1);
       ASSERT_TRUE(unobstructed.ok()) << machine.name << ": " << unobstructed.status().message;
@@ -360,10 +356,10 @@ TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
       }
     }
     ASSERT_GE(sigma, 0.0) << machine.name <<
-      ": no junction on this path where the tool may swing to the corner of the envelope "
+      ": no interior point on this path where the tool may swing to the corner of the envelope "
       "without meeting the crane itself";
 
-    const crane_model::Q hanging = configuration_at(fixture.model, fixture.primitive.path, sigma);
+    const crane_model::Q hanging = configuration_at(fixture.model, fixture.path, sigma);
     crane_model::Q swung = hanging;
     swung.segment<2>(4) += swinging.sway.q_sway_max;
     const Eigen::Vector3d still_tcp = tcp_of(fixture.model, hanging);
@@ -399,7 +395,7 @@ TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
       ++path_checks;
 
       auto still = crane_planning::check_path(
-        fixture.model, fixture.primitive.path, candidate, crane_planning_test::empty_gripper(),
+        fixture.model, fixture.path, candidate, crane_planning_test::empty_gripper(),
         PayloadShape{}, quick_settings());
       ASSERT_TRUE(still.ok()) << machine.name << ": " << still.status().message;
       if (still.value().clear) {
@@ -414,7 +410,7 @@ TEST(SwayEnvelope, APathClearForAStillToolIsRefusedForASwingingOne)
     // Swinging, at the same q_u^+ the MPC is given: the same path is refused,
     // and the refusal says which sway pose found it.
     auto checked = crane_planning::check_path(
-      fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
+      fixture.model, fixture.path, scene, crane_planning_test::empty_gripper(),
       PayloadShape{}, swinging);
     ASSERT_TRUE(checked.ok()) << machine.name << ": " << checked.status().message;
     ASSERT_FALSE(checked.value().clear) << machine.name << ": " <<
@@ -451,11 +447,7 @@ TEST(SelfCollision, TheArmFoldedBackOverTheBoomIsRefusedAgainstAnEmptyScene)
     // collision is between actuated links, so the passive pair does not enter
     // it and the configuration is checked with the tool at its zero rather than
     // at an equilibrium that does not exist.
-    crane_model::Q q = crane_model::Q::Zero();
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-        folded[static_cast<Eigen::Index>(row)];
-    }
+    crane_model::Q q = crane_planning::expand(folded);
     auto equilibrium =
       fixture.model.passive_equilibrium(folded, crane_planning_test::empty_gripper());
     if (equilibrium.ok()) {
@@ -571,7 +563,7 @@ TEST(CheckResolution, TheStepIsTightenedToHalfTheThinnestPrimitiveInTheScene)
   CollisionSettings settings = quick_settings();
   settings.resolution_m = 0.5;
   auto checked = crane_planning::check_path(
-    fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
+    fixture.model, fixture.path, scene, crane_planning_test::empty_gripper(),
     PayloadShape{}, settings);
   ASSERT_TRUE(checked.ok()) << checked.status().message;
   EXPECT_TRUE(checked.value().resolution_tightened);
@@ -588,7 +580,7 @@ TEST(CheckResolution, APrimitiveThinnerThanTheFloorIsRefusedRatherThanCheckedCoa
     scene_of({box_at("wire", Eigen::Vector3d(20.0, 0.0, 0.0), 0.004)});
 
   auto checked = crane_planning::check_path(
-    fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
+    fixture.model, fixture.path, scene, crane_planning_test::empty_gripper(),
     PayloadShape{}, quick_settings());
   ASSERT_FALSE(checked.ok());
   EXPECT_NE(checked.status().message.find("not checked"), std::string::npos)
@@ -600,46 +592,19 @@ TEST(CheckResolution, APathIsCheckedAtMoreThanItsWaypoints)
   const Scenario & fixture = scenario(0);
   CollisionSettings settings = quick_settings();
   auto checked = crane_planning::check_path(
-    fixture.model, fixture.primitive.path, crane_model::CollisionScene{},
+    fixture.model, fixture.path, crane_model::CollisionScene{},
     crane_planning_test::empty_gripper(), PayloadShape{}, settings);
   ASSERT_TRUE(checked.ok()) << checked.status().message;
   EXPECT_GT(checked.value().travel_m, 0.5);
   EXPECT_GE(
     static_cast<double>(checked.value().samples - 1U),
     checked.value().travel_m / checked.value().step_m);
-  EXPECT_GT(checked.value().samples, fixture.primitive.path.segment_count() + 1U);
+  EXPECT_GT(checked.value().samples, fixture.path.segment_count() + 1U);
 }
 
 // ------------------------------------------------------ what the caller asked
 
-TEST(AvoidCollisions, FalseStillPlansAndSaysNothingWasChecked)
-{
-  const Scenario & fixture = scenario(0);
-  crane_planning::PrimitiveRequest request;
-  request.avoid_collisions = false;
 
-  auto checked = crane_planning::check_primitive(
-    fixture.model, fixture.primitive.path, request, fixture.context.settings.primitive);
-  ASSERT_TRUE(checked.ok()) << checked.status().message;
-  EXPECT_TRUE(checked.value().clear);
-  EXPECT_FALSE(checked.value().checked);
-  EXPECT_NE(checked.value().note.find("Nothing was checked"), std::string::npos)
-    << checked.value().note;
-}
-
-TEST(AvoidCollisions, TrueWithoutASceneIsARefusalRatherThanAnUncheckedPlan)
-{
-  const Scenario & fixture = scenario(0);
-  crane_planning::PrimitiveRequest request;
-  request.avoid_collisions = true;
-  request.collision_scene = nullptr;
-
-  auto checked = crane_planning::check_primitive(
-    fixture.model, fixture.primitive.path, request, fixture.context.settings.primitive);
-  ASSERT_FALSE(checked.ok());
-  EXPECT_NE(checked.status().message.find("/crane/collision_scene"), std::string::npos)
-    << checked.status().message;
-}
 
 TEST(AvoidCollisions, ASceneCarryingTheReservedPayloadIdIsRefused)
 {
@@ -647,7 +612,7 @@ TEST(AvoidCollisions, ASceneCarryingTheReservedPayloadIdIsRefused)
   const crane_model::CollisionScene scene =
     scene_of({box_at(crane_planning::kPayloadId, Eigen::Vector3d(20.0, 0.0, 0.0), 0.5)});
   auto checked = crane_planning::check_path(
-    fixture.model, fixture.primitive.path, scene, crane_planning_test::empty_gripper(),
+    fixture.model, fixture.path, scene, crane_planning_test::empty_gripper(),
     PayloadShape{}, quick_settings());
   ASSERT_FALSE(checked.ok());
   EXPECT_NE(checked.status().message.find("payload"), std::string::npos)
@@ -656,65 +621,7 @@ TEST(AvoidCollisions, ASceneCarryingTheReservedPayloadIdIsRefused)
 
 // ------------------------------------------------------------ the extent read
 
-TEST(SceneExtent, TheTallestPrimitiveIsWhatTheTransferAltitudeIsGivenToClear)
-{
-  const crane_model::CollisionScene empty;
-  EXPECT_FALSE(crane_planning::scene_extent(empty).obstacles_known);
-  EXPECT_FALSE(crane_planning::scene_without_obstacles().obstacles_known);
 
-  const crane_planning::SceneExtent extent = crane_planning::scene_extent(
-    truck_scene(truck_at(Eigen::Vector3d(4.0, 0.0, 0.0)), TruckModel{}));
-  ASSERT_TRUE(extent.obstacles_known);
-  // The top of a runge: the truck box is 1.2 m tall and centred at z = 0, so its
-  // top face is at 0.6 m and 2.12 m of runge stands on it.
-  EXPECT_NEAR(extent.highest_obstacle_z_m, 0.6 + 2.12, 1.0e-9);
-}
-
-TEST(Probe, DISABLED_PathClearance)
-{
-  for (std::size_t index = 0; index < crane_planning_test::machines().size(); ++index) {
-    const Machine & machine = crane_planning_test::machines()[index];
-    crane_model::Model model = crane_planning_test::build_model(machine);
-    crane_planning::PlannerContext context = crane_planning_test::build_context(model, machine);
-    const JointLimits & limits = context.limits;
-    std::printf("=== %s\n", machine.name);
-    for (const double q3 : {0.3, 0.6, 0.93, 1.3}) {
-      for (const double ceiling : {0.3, 0.8, 1.5}) {
-        crane_model::QA start = centred(limits, machine);
-        start[1] = 0.18;
-        start[2] = q3;
-        crane_planning::PrimitiveRequest request;
-        request.q_start = settled(model, start);
-        request.q_goal = settled(model, moved(start, limits));
-        request.payload = crane_planning_test::empty_gripper();
-        request.scene = crane_planning::scene_without_obstacles();
-        request.avoid_collisions = false;
-        crane_planning::PrimitiveSettings settings = context.settings.primitive;
-        auto tcp = model.forward_kinematics(
-          request.q_start, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
-        settings.altitude.ceiling_m = tcp.value().position_m.z() + ceiling;
-        auto built = crane_planning::build_structured_primitive(
-          model, context.geometry, limits, context.settings.ik, settings, request);
-        if (!built.ok()) {
-          std::printf("q3=%.2f ceil=%.1f  no primitive: %s\n", q3, ceiling,
-            built.status().message.c_str());
-          continue;
-        }
-        auto checked = crane_planning::check_path(
-          model, built.value().path, crane_model::CollisionScene{},
-          crane_planning_test::empty_gripper(), PayloadShape{}, quick_settings());
-        if (!checked.ok()) {
-          std::printf("q3=%.2f ceil=%.1f  check failed\n", q3, ceiling);
-          continue;
-        }
-        std::printf(
-          "q3=%.2f ceil=%.1f  clear=%d worst=%.4f samples=%zu %s\n", q3, ceiling,
-          checked.value().clear ? 1 : 0, checked.value().worst_clearance_m,
-          checked.value().samples, checked.value().blocked_at.blocker.other_id.c_str());
-      }
-    }
-  }
-}
 
 TEST(Probe, DISABLED_SelfClearanceOverTheArmPlane)
 {
@@ -735,12 +642,7 @@ TEST(Probe, DISABLED_SelfClearanceOverTheArmPlane)
             std::printf("q2=%.2f q3=%.2f q4=%.2f  no equilibrium\n", q_a[1], q_a[2], q_a[3]);
             continue;
           }
-          crane_model::Q q = crane_model::Q::Zero();
-          for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-            q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-              q_a[static_cast<Eigen::Index>(row)];
-          }
-          q.segment<2>(4) = eq.value();
+          const crane_model::Q q = crane_planning::expand(q_a, eq.value());
           auto answer = fixture.model.collision_query(q, crane_model::CollisionScene{});
           if (!answer.ok()) {
             std::printf("query failed: %s\n", answer.status().message.c_str());

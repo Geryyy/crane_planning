@@ -21,8 +21,21 @@ extern "C" {
 
 #include "crane_planning_timing_ocp_generated.h"  // NOLINT(build/include_subdir)
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
+
+crane_model::Status check_margin_factor(double margin_factor)
+{
+  if (!(margin_factor > 0.0) || margin_factor > 1.0) {
+    return crane_model::Status{
+      crane_model::ErrorCode::InvalidArgument,
+      "speed_scale = " + std::to_string(margin_factor) + " is outside (0, 1]"};
+  }
+  return crane_model::Status{};
+}
+
 namespace
 {
 
@@ -65,11 +78,6 @@ constexpr std::array<double, static_cast<std::size_t>(kOcpConstraints)> kConstra
 constexpr std::array<std::array<int, 2>, 6> kInertiaEntries = {
   CRANE_PLANNING_TIMING_INERTIA_ENTRIES};
 
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
 /// acados' status word, as the message a refusal carries.
 std::string acados_status_word(int status)
 {
@@ -85,9 +93,9 @@ std::string acados_status_word(int status)
   }
 }
 
-// The two shapes of generated function this file calls. acados' own casadi
-// output takes `void * mem`; CasADi's takes an `int` memory token, and
-// `<tool>_output` is CasADi's.
+// The two shapes of generated function this file calls. acados' own generated
+// output takes `void * mem`; the shared model's output map takes an `int`
+// memory token.
 using CasadiFunction = int (*)(const double **, double **, int *, double *, int);
 
 /// One generated timing solver, as the handful of entry points this file uses.
@@ -390,7 +398,7 @@ double PeakDemand::worst() const noexcept
 }
 
 crane_model::Result<TimingSolution> solve_timing_ocp(
-  const crane_model::Model & model, const crane_model::ModelConfig & model_config,
+  const crane_model::Model & model,
   const GeometricPath & path, const JointLimits & limits, const TimingOcpRequest & request,
   const TimingOcpSettings & settings)
 {
@@ -457,7 +465,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       failure(ErrorCode::InvalidArgument, "Q_P^max and its planning factor must be positive"));
   }
 
-  const Backend backend = backend_for(model_config.tool);
+  const Backend backend = backend_for(model.tool());
   const std::array<double, kPayloadDof> payload = payload_block(request.payload);
 
   const int intervals = static_cast<int>(settings.intervals);
@@ -604,13 +612,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
       // The transmission at the same pose, so the message can say *why* rather
       // than only that. `J_c,ii` near zero is the usual cause and is the one a
       // reader can act on: it is a pose off the working range, not a load.
-      crane_model::Q q = crane_model::Q::Zero();
-      for (std::size_t axis = 0; axis < crane_model::kActuatedDof; ++axis) {
-        q[static_cast<Eigen::Index>(kActuatedRows[axis])] =
-          position[static_cast<Eigen::Index>(axis)];
-      }
-      q[4] = q_u_equilibrium[at][0];
-      q[5] = q_u_equilibrium[at][1];
+      const crane_model::Q q = expand(position, q_u_equilibrium[at]);
       crane_model::ChamberPressure quiescent;
       quiescent.p_a_pa.setZero();
       quiescent.p_b_pa.setZero();

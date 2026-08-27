@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -21,11 +23,6 @@ double steady_seconds()
 {
   return std::chrono::duration<double>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-std::string seconds(double value)
-{
-  return std::to_string(value) + " s";
 }
 
 }  // namespace

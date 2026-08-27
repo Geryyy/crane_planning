@@ -10,6 +10,8 @@
 
 #include <ruckig/ruckig.hpp>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -28,11 +30,6 @@ constexpr double kMinimumRate = 1.0e-9;
 /// push a target velocity a hair over its own bound and be refused for it.
 constexpr double kRateHeadroom = 1.0 + 1.0e-6;
 
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
 /// The quintic q8 rides, on the path's own parameter.
 /**
  * `wiki/trajectory_planning.md` 4.1 keeps the tool coordinate out of the path
@@ -44,7 +41,7 @@ Status failure(ErrorCode code, std::string message)
  * The quintic is the lowest-order polynomial with `h = h' = h'' = 0` at both
  * ends, so the tool coordinate is C2 in sigma and at rest where the path is,
  * matching the five that ruckig produced without pretending to share their
- * profile. `/crane/plan_grip` (issue 044) is what actually opens and closes the
+ * profile. `external grip service` (issue 044) is what actually opens and closes the
  * gripper; here q8 is normally held and this shape is then identically flat.
  */
 double tool_shape(double sigma)

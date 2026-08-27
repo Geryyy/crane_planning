@@ -1,4 +1,4 @@
-// The sampling fallback of `wiki/trajectory_planning.md` 4.4 and the smoothing
+// The OMPL path planner of `wiki/trajectory_planning.md` 4.4 and the smoothing
 // 4.5 makes mandatory -- offline, seeded, and against both machine descriptions
 // where the property under test is a property of the machine.
 //
@@ -44,7 +44,7 @@
 #include "c2_path_assertions.hpp"
 #include "crane_planning/collision.hpp"
 #include "crane_planning/planner_core.hpp"
-#include "crane_planning/sampling_planner.hpp"
+#include "crane_planning/ompl_path_planner.hpp"
 #include "description_fixture.hpp"
 
 namespace
@@ -52,10 +52,9 @@ namespace
 
 using crane_planning::CollisionSettings;
 using crane_planning::GeometricPath;
-using crane_planning::PathMechanism;
 using crane_planning::PathVector;
 using crane_planning::PayloadShape;
-using crane_planning::SamplingSettings;
+using crane_planning::OmplSettings;
 using crane_planning_test::Machine;
 
 using crane_planning_test::centred;
@@ -77,7 +76,7 @@ struct Fixture
 {
   crane_model::Model model;
   crane_planning::PlannerContext context;
-  crane_planning::StructuredPrimitive primitive;
+  crane_planning::GeometricPath reference_path;
   crane_model::Q q_start{crane_model::Q::Zero()};
   crane_model::Q q_goal{crane_model::Q::Zero()};
 };
@@ -88,22 +87,22 @@ Fixture build_fixture(const Machine & machine)
   crane_planning::PlannerContext context = crane_planning_test::build_context(model, machine);
   const crane_model::QA start = crane_planning_test::working_centred(context.limits, machine);
 
-  crane_planning::PrimitiveRequest request;
-  request.q_start = settled(model, start);
-  request.q_goal = settled(model, moved(start, context.limits));
-  request.payload = crane_planning_test::empty_gripper();
-  request.scene = crane_planning::scene_without_obstacles();
-  request.avoid_collisions = false;  // the geometry first, the scenes afterwards
-
-  auto built = crane_planning::build_structured_primitive(
-    model, context.geometry, context.limits, context.settings.ik, context.settings.primitive,
-    request);
+  const crane_model::Q q_start = settled(model, start);
+  const crane_model::Q q_goal = settled(model, moved(start, context.limits));
+  const PathVector start_path = crane_planning::path_of(q_start);
+  const PathVector goal_path = crane_planning::path_of(q_goal);
+  crane_planning::PathFitRequest request;
+  request.waypoints = {start_path, goal_path};
+  request.segment_names = {"reference chord"};
+  request.q8_start = q_start[static_cast<Eigen::Index>(
+      crane_planning::kActuatedRows[crane_planning::kToolRow])];
+  request.q8_goal = request.q8_start;
+  auto built = crane_planning::fit_c2_path(request, context.limits, context.settings.ompl.fit);
   if (!built.ok()) {
     throw std::runtime_error(machine.name + std::string(": ") + built.status().message);
   }
   return Fixture{
-    std::move(model), std::move(context), std::move(built).value(), request.q_start,
-    request.q_goal};
+    std::move(model), std::move(context), std::move(built).value(), q_start, q_goal};
 }
 
 /// Built once for the whole binary: a primitive costs two inverse-kinematics solves.
@@ -128,13 +127,14 @@ CollisionSettings quick_settings()
 }
 
 /// A search small enough for a suite and still a search.
-SamplingSettings quick_search()
+OmplSettings quick_search()
 {
-  SamplingSettings settings;
+  OmplSettings settings;
   settings.seed = kSeed;
   settings.time_budget_s = 120.0;
   settings.max_validity_checks = 400U;
   settings.shortcut_attempts = 40U;
+  settings.collision = quick_settings();
   return settings;
 }
 
@@ -184,12 +184,7 @@ Eigen::Vector3d tcp_of(const crane_model::Model & model, const crane_model::Q & 
 /// The path-space part of a canonical eight-vector.
 PathVector path_of(const crane_model::Q & q)
 {
-  PathVector q_a = PathVector::Zero();
-  for (std::size_t row = 0; row < crane_planning::kPathDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] =
-      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])];
-  }
-  return q_a;
+  return crane_planning::path_of(q);
 }
 
 /// Where the tool stands at the joint-space midpoint of the two endpoints.
@@ -240,53 +235,15 @@ crane_model::CollisionScene structure_to_round(const Fixture & scenario, double 
 }
 
 /// The fallback's request for one fixture and one scene.
-crane_planning::SamplingRequest sampling_request(
+crane_planning::OmplRequest sampling_request(
   const Fixture & scenario, const crane_model::CollisionScene & scene)
 {
-  crane_planning::SamplingRequest request;
+  crane_planning::OmplRequest request;
   request.q_start = scenario.q_start;
   request.q_goal = scenario.q_goal;
   request.payload = crane_planning_test::empty_gripper();
   request.collision_scene = &scene;
   return request;
-}
-
-/// The `/crane/plan_motion` request that asks for this fixture's own placement.
-/**
- * The goal pose is read off the model at `q_goal` rather than written down, so
- * what `plan_motion` is asked for is the placement the fixture's two endpoints
- * already describe. Both halves of 4.4's order are exercised with this one
- * request and differ only in the scene handed to it, which is what makes the
- * mechanism the scene's doing and not the request's.
- */
-crane_planning::MotionRequest motion_request(
-  const Fixture & scenario, const crane_model::CollisionScene & scene)
-{
-  crane_planning::MotionRequest request;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    request.start.q_a[static_cast<Eigen::Index>(row)] =
-      scenario.q_start[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])];
-  }
-  auto goal_pose = scenario.model.forward_kinematics(
-    scenario.q_goal, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
-  if (!goal_pose.ok()) {
-    throw std::runtime_error(goal_pose.status().message);
-  }
-  request.p_tcp_0 = goal_pose.value().position_m;
-  request.phi_z_d = crane_planning::phi_z_of(goal_pose.value().orientation);
-  request.payload = crane_planning_test::empty_gripper();
-  request.avoid_collisions = true;
-  request.scene = &scene;
-  return request;
-}
-
-/// The context both halves of 4.4's order are planned with.
-crane_planning::PlannerContext quick_context(const Fixture & scenario)
-{
-  crane_planning::PlannerContext context = scenario.context;
-  context.settings.primitive.collision = quick_settings();
-  context.settings.sampling = quick_search();
-  return context;
 }
 
 }  // namespace
@@ -381,50 +338,6 @@ TEST(SamplingStateSpace, AnEndpointOutsideTheDescriptionsRangeIsRefusedRatherTha
 
 // ------------------------------------------------- second, and only second
 
-TEST(MechanismOrder, AClearSceneIsAnsweredByThePrimitiveAndTheFallbackNeverRuns)
-{
-  // trajectory_planning 4.4's order and the reason for it: the primitive is
-  // cheap, deterministic and smooth by construction, and primitive-first is what
-  // buys deterministic latency in the common case. A fallback that ran anyway --
-  // to compare, or to "check" the primitive -- would spend exactly that, so the
-  // assertion is not only that the answer is the primitive's but that the search
-  // did not run at all.
-  const Fixture & scenario = fixture(0);
-  const crane_model::CollisionScene clear = structure_to_round(scenario, 0.4);
-  ASSERT_EQ(clear.primitives.size(), 1U);
-
-  // The same obstacle, twenty metres away: a scene that is genuinely a scene, so
-  // this is the checked common case rather than a collision-blind request.
-  crane_model::CollisionScene distant = clear;
-  distant.primitives.front().pose_in_mounting_base.translation() += Eigen::Vector3d(20.0, 0.0, 0.0);
-
-  auto planned = crane_planning::plan_motion(
-    scenario.model, quick_context(scenario), motion_request(scenario, distant));
-  ASSERT_TRUE(planned.ok()) << planned.status().message;
-
-  EXPECT_EQ(planned.value().mechanism, PathMechanism::StructuredPrimitive);
-  EXPECT_TRUE(planned.value().primitive_refusal.empty()) << planned.value().primitive_refusal;
-  // Nothing was sampled: no state was checked, no seed was drawn from, no
-  // waypoint came back.
-  EXPECT_EQ(planned.value().sampled.validity_checks, 0U);
-  EXPECT_EQ(planned.value().sampled.search_states, 0U);
-  EXPECT_EQ(planned.value().sampled.path.segment_count(), 0U);
-
-  // And the path really is the primitive's, unchanged -- the three phases of 4.4
-  // and the same q_a at every sigma, not a re-derivation that happens to agree.
-  ASSERT_EQ(planned.value().path.segment_count(), 3U);
-  ASSERT_EQ(planned.value().primitive.path.segment_count(), 3U);
-  for (std::size_t index = 0; index <= 100U; ++index) {
-    const double sigma = static_cast<double>(index) / 100.0;
-    EXPECT_LT(
-      (planned.value().path.at(sigma).q_a - planned.value().primitive.path.at(sigma).q_a).norm(),
-      1.0e-12) << "at sigma " << sigma;
-  }
-  EXPECT_TRUE(planned.value().primitive.check.checked);
-  EXPECT_TRUE(planned.value().primitive.check.clear);
-  EXPECT_NE(
-    std::string(mechanism_name(planned.value().mechanism)).find("primitive"), std::string::npos);
-}
 
 // -------------------------------------------- the search, and what bounds it
 
@@ -436,7 +349,7 @@ TEST(MechanismOrder, AClearSceneIsAnsweredByThePrimitiveAndTheFallbackNeverRuns)
 struct SampledOnce
 {
   crane_model::CollisionScene scene;
-  crane_planning::SamplingPlan plan;
+  crane_planning::OmplPlan plan;
   bool ok{false};
   std::string why;
 };
@@ -449,9 +362,8 @@ const SampledOnce & sampled_once()
     done = true;
     const Fixture & scenario = fixture(0);
     answer.scene = structure_to_round(scenario, kStructureSide);
-    auto plan = crane_planning::plan_sampled_path(
-      scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
-      quick_settings(), quick_search(), sampling_request(scenario, answer.scene));
+    auto plan = crane_planning::plan_ompl_path(
+      scenario.model, scenario.context.limits, quick_search(), sampling_request(scenario, answer.scene));
     answer.ok = plan.ok();
     answer.why = plan.status().message;
     if (plan.ok()) {
@@ -461,29 +373,13 @@ const SampledOnce & sampled_once()
   return answer;
 }
 
-TEST(SamplingFallback, ItRoundsAStructureThePrimitiveCannotAndTheAnswerIsCleared)
+TEST(OmplPlanner, ItRoundsAStructureThePrimitiveCannotAndTheAnswerIsCleared)
 {
   const Fixture & scenario = fixture(0);
   const SampledOnce & answer = sampled_once();
 
-  // The premise, verified rather than assumed: this scene really does block the
-  // primitive, which is the only thing that puts 4.4's second mechanism in play.
-  crane_planning::PrimitiveRequest blocked;
-  blocked.q_start = scenario.q_start;
-  blocked.q_goal = scenario.q_goal;
-  blocked.payload = crane_planning_test::empty_gripper();
-  blocked.avoid_collisions = true;
-  blocked.collision_scene = &answer.scene;
-  crane_planning::PrimitiveSettings settings = scenario.context.settings.primitive;
-  settings.collision = quick_settings();
-  auto primitive = crane_planning::build_structured_primitive(
-    scenario.model, scenario.context.geometry, scenario.context.limits,
-    scenario.context.settings.ik, settings, blocked);
-  ASSERT_FALSE(primitive.ok()) <<
-    "the obstacle does not block the primitive, so this proves nothing about the fallback";
-
   ASSERT_TRUE(answer.ok) << answer.why;
-  const crane_planning::SamplingPlan & plan = answer.plan;
+  const crane_planning::OmplPlan & plan = answer.plan;
 
   // A search happened, inside its allowance.
   EXPECT_GE(plan.search_states, 2U);
@@ -510,7 +406,7 @@ TEST(SamplingFallback, ItRoundsAStructureThePrimitiveCannotAndTheAnswerIsCleared
   EXPECT_NE(note.find("4.5"), std::string::npos) << note;
 }
 
-TEST(SamplingFallback, TheSmoothedPathSatisfiesTheSameC2AssertionsAsThePrimitive)
+TEST(OmplPlanner, TheSmoothedPathSatisfiesTheSameC2AssertionsAsThePrimitive)
 {
   const SampledOnce & answer = sampled_once();
   ASSERT_TRUE(answer.ok) << answer.why;
@@ -524,7 +420,7 @@ TEST(SamplingFallback, TheSmoothedPathSatisfiesTheSameC2AssertionsAsThePrimitive
   expect_at_rest_and_monotone(answer.plan.path, "sampled path");
 }
 
-TEST(SamplingFallback, TheSameSeedGivesTheSamePathTwice)
+TEST(OmplPlanner, TheSameSeedGivesTheSamePathTwice)
 {
   // A stochastic planner in an automated suite is a flaky test, which the PRD's
   // testing decisions rule out. The seed is a parameter, this fixes it, and the
@@ -535,9 +431,8 @@ TEST(SamplingFallback, TheSameSeedGivesTheSamePathTwice)
   const SampledOnce & answer = sampled_once();
   ASSERT_TRUE(answer.ok) << answer.why;
 
-  auto again = crane_planning::plan_sampled_path(
-    scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
-    quick_settings(), quick_search(), sampling_request(scenario, answer.scene));
+  auto again = crane_planning::plan_ompl_path(
+    scenario.model, scenario.context.limits, quick_search(), sampling_request(scenario, answer.scene));
   ASSERT_TRUE(again.ok()) << again.status().message;
 
   EXPECT_EQ(again.value().search_states, answer.plan.search_states);
@@ -551,17 +446,16 @@ TEST(SamplingFallback, TheSameSeedGivesTheSamePathTwice)
   }
 }
 
-TEST(SamplingFallback, AnExhaustedWallClockBudgetIsARefusalNamingItAndNotAPartialPath)
+TEST(OmplPlanner, AnExhaustedWallClockBudgetIsARefusalNamingItAndNotAPartialPath)
 {
   const Fixture & scenario = fixture(0);
   const crane_model::CollisionScene scene = structure_to_round(scenario, kStructureSide);
 
-  SamplingSettings starved = quick_search();
+  OmplSettings starved = quick_search();
   starved.time_budget_s = 1.0e-6;  // spent before the first sample is drawn
 
-  auto refused = crane_planning::plan_sampled_path(
-    scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
-    quick_settings(), starved, sampling_request(scenario, scene));
+  auto refused = crane_planning::plan_ompl_path(
+    scenario.model, scenario.context.limits, starved, sampling_request(scenario, scene));
   ASSERT_FALSE(refused.ok());
 
   // Naming the budget, and saying which mechanism it was that ran out -- a caller
@@ -571,30 +465,29 @@ TEST(SamplingFallback, AnExhaustedWallClockBudgetIsARefusalNamingItAndNotAPartia
     << refused.status().message;
   EXPECT_NE(refused.status().message.find("configurations it was allowed to check"),
     std::string::npos) << refused.status().message;
-  EXPECT_NE(refused.status().message.find("sampling fallback"), std::string::npos)
+  EXPECT_NE(refused.status().message.find("OMPL RRT-Connect"), std::string::npos)
     << refused.status().message;
   // And it is issue 045's replanning bound that this is *not*.
   EXPECT_NE(refused.status().message.find("045"), std::string::npos)
     << refused.status().message;
 }
 
-TEST(SamplingFallback, AnExhaustedCheckAllowanceIsARefusalNamingItToo)
+TEST(OmplPlanner, AnExhaustedCheckAllowanceIsARefusalNamingItToo)
 {
   const Fixture & scenario = fixture(0);
   const crane_model::CollisionScene scene = structure_to_round(scenario, kStructureSide);
 
-  SamplingSettings starved = quick_search();
+  OmplSettings starved = quick_search();
   starved.max_validity_checks = 2U;  // the search gets two configurations and no more
 
-  auto refused = crane_planning::plan_sampled_path(
-    scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
-    quick_settings(), starved, sampling_request(scenario, scene));
+  auto refused = crane_planning::plan_ompl_path(
+    scenario.model, scenario.context.limits, starved, sampling_request(scenario, scene));
   ASSERT_FALSE(refused.ok());
   EXPECT_NE(refused.status().message.find(" of the 2 "), std::string::npos)
     << refused.status().message;
 }
 
-TEST(SamplingFallback, AGoalThatIsItselfBlockedIsNotABudgetRefusal)
+TEST(OmplPlanner, AGoalThatIsItselfBlockedIsNotABudgetRefusal)
 {
   // "The machine cannot get there in the time given" and "there is nothing to get
   // to" are different answers, and only the first is about a budget.
@@ -602,9 +495,8 @@ TEST(SamplingFallback, AGoalThatIsItselfBlockedIsNotABudgetRefusal)
   const crane_model::CollisionScene scene =
     scene_of({box_at("on_the_goal", tcp_of(scenario.model, scenario.q_goal), 1.0)});
 
-  auto refused = crane_planning::plan_sampled_path(
-    scenario.model, scenario.context.limits, scenario.context.settings.primitive.fit,
-    quick_settings(), quick_search(), sampling_request(scenario, scene));
+  auto refused = crane_planning::plan_ompl_path(
+    scenario.model, scenario.context.limits, quick_search(), sampling_request(scenario, scene));
   ASSERT_FALSE(refused.ok());
   EXPECT_NE(refused.status().message.find("no budget would have helped"), std::string::npos)
     << refused.status().message;
@@ -647,7 +539,7 @@ TEST(MandatorySmoothing, TheNaiveShortcutCutsACornerIntoAnObstacleAndTheRecheckC
       crane_planning::kActuatedRows[crane_planning::kToolRow])];
   fit.q8_goal = fit.q8_start;
   auto fitted = crane_planning::fit_c2_path(
-    fit, scenario.context.limits, scenario.context.settings.primitive.fit);
+    fit, scenario.context.limits, scenario.context.settings.ompl.fit);
   ASSERT_TRUE(fitted.ok()) << fitted.status().message;
 
   // And the re-check catches it. This is the assertion the whole test exists for:
@@ -673,7 +565,7 @@ TEST(MandatorySmoothing, AValidatedShortcutKeepsTheWaypointsItCannotReplace)
   // which is what makes the fallback's own validated pass a simplification and
   // never a licence.
   const Fixture & scenario = fixture(0);
-  const std::vector<PathVector> & waypoints = scenario.primitive.path.waypoints();
+  const std::vector<PathVector> & waypoints = scenario.reference_path.waypoints();
 
   const std::vector<PathVector> kept = crane_planning::shortcut(
     waypoints, 200U, kSeed, [](const PathVector &, const PathVector &) {return false;});
@@ -691,60 +583,6 @@ TEST(MandatorySmoothing, AValidatedShortcutKeepsTheWaypointsItCannotReplace)
 
 // ------------------------------------------ the other half of 4.4's order
 
-TEST(MechanismOrder, ABlockedPrimitiveIsAnsweredByTheFallbackAndTheAnswerSaysWhichItWas)
-{
-  // The half of the order only `plan_motion` can show: the primitive is
-  // generated, checked, **refused**, and only because it was refused does the
-  // search run. The scene is the fallback's own, and the request is the one the
-  // clear-scene case above uses -- so the mechanism that answers is the scene's
-  // doing and nothing else's.
-  //
-  // What is new here is the hand-off rather than the search: that the sampled
-  // path is the geometry the trajectory was timed along and not a second one
-  // that happens to agree, that the primitive's refusal is kept beside it, and
-  // that the answer names which mechanism produced it.
-  const Fixture & scenario = fixture(0);
-  const SampledOnce & answer = sampled_once();
-  ASSERT_TRUE(answer.ok) << answer.why;
-
-  auto planned = crane_planning::plan_motion(
-    scenario.model, quick_context(scenario), motion_request(scenario, answer.scene));
-  ASSERT_TRUE(planned.ok()) << planned.status().message;
-
-  EXPECT_EQ(planned.value().mechanism, PathMechanism::SamplingFallback);
-  // The primitive was tried first, and the reason it could not be given is kept:
-  // a sampled answer on its own leaves nobody able to tell an obstacle above the
-  // transfer altitude from an arm that could not reach the column over the goal.
-  EXPECT_FALSE(planned.value().primitive_refusal.empty());
-  EXPECT_EQ(planned.value().primitive.path.segment_count(), 0U)
-    << "a primitive was accepted as well as sampled, so the order was not exclusive";
-
-  // The search really ran, and 4.5's re-check is what let its answer out.
-  EXPECT_GT(planned.value().sampled.validity_checks, 0U);
-  EXPECT_LE(planned.value().sampled.validity_checks, quick_search().max_validity_checks);
-  EXPECT_TRUE(planned.value().sampled.recheck.clear)
-    << crane_planning::describe(planned.value().sampled.recheck);
-
-  // And the path the caller is handed is that sampled path, not a re-derivation.
-  ASSERT_GT(planned.value().path.segment_count(), 0U);
-  ASSERT_EQ(planned.value().path.segment_count(), planned.value().sampled.path.segment_count());
-  for (std::size_t index = 0; index <= 100U; ++index) {
-    const double sigma = static_cast<double>(index) / 100.0;
-    EXPECT_LT(
-      (planned.value().path.at(sigma).q_a -
-      planned.value().sampled.path.at(sigma).q_a).norm(), 1.0e-12) << "at sigma " << sigma;
-  }
-  EXPECT_FALSE(planned.value().trajectory.q_a_ref.empty());
-
-  // 4.5 binds whichever producer answered, so what came out of this call is C2
-  // on exactly the terms the primitive's own path is.
-  expect_c2_everywhere(planned.value().path, "plan_motion sampled path");
-  expect_at_rest_and_monotone(planned.value().path, "plan_motion sampled path");
-
-  const std::string named = mechanism_name(planned.value().mechanism);
-  EXPECT_NE(named.find("RRT-Connect"), std::string::npos) << named;
-  EXPECT_NE(named.find("4.5"), std::string::npos) << named;
-}
 
 // ------------------------------------------------------------------ probes
 
@@ -757,11 +595,7 @@ TEST(Probe, DISABLED_WhatOneValidityCheckCosts)
   const auto began = std::chrono::steady_clock::now();
   const std::size_t runs = 20U;
   for (std::size_t run = 0; run < runs; ++run) {
-    crane_model::QA probe = crane_model::QA::Zero();
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-      probe[static_cast<Eigen::Index>(row)] =
-        q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])];
-    }
+    crane_model::QA probe = crane_planning::actuated(q);
     probe[1] += 0.001 * static_cast<double>(run);
     auto settled_at =
       scenario.model.passive_equilibrium(probe, crane_planning_test::empty_gripper());

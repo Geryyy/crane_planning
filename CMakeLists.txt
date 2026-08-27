@@ -15,16 +15,16 @@ find_package(ament_cmake REQUIRED)
 # is. If a future image drops the config, `acados_DIR` is the one variable to set
 # and this is the line that would need the hint.
 find_package(acados REQUIRED)
-# CasADi is reached through `crane_model::casadi_graph`, which carries it as an
-# INTERFACE usage requirement; naming it here is what makes that requirement
-# resolvable in the install tree, exactly as `crane_model` itself does.
-find_package(casadi REQUIRED)
+# CasADi is an export-time dependency only.  The generated C below is the only
+# CasADi output that reaches the planner binary; no live CasADi graph or bridge
+# is linked at runtime.
 find_package(Eigen3 REQUIRED)
 find_package(crane_model REQUIRED)
 find_package(crane_msgs REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
-# OMPL, for the sampling fallback of trajectory_planning §4.4.
+find_package(nav_msgs REQUIRED)
+# OMPL, the sole geometric path planner.
 # `wiki/implementation/libraries.md` §1 lists it for sampling-based path planning
 # against "RRT/PRM and their smoothing", so no RRT is written here.
 #
@@ -67,22 +67,42 @@ find_package(wood_log_msgs REQUIRED)
 # STATIC, for the reason `crane_control` records: crane_model installs a static
 # archive, and the only consumer here is an executable rather than a pluginlib
 # object, so no `--exclude-libs` workaround is needed.
+set(CRANE_PLANNING_GENERATED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated")
+set(CRANE_PLANNING_SOLVERS
+  crane_planning_timing_pzs100
+  crane_planning_timing_epsilon7040)
+set(CRANE_PLANNING_GENERATED_SOURCES "")
+set(CRANE_PLANNING_GENERATED_INCLUDES "${CRANE_PLANNING_GENERATED_DIR}")
+foreach(solver IN LISTS CRANE_PLANNING_SOLVERS)
+  file(GLOB_RECURSE generated CONFIGURE_DEPENDS
+    "${CRANE_PLANNING_GENERATED_DIR}/${solver}/*.c")
+  if(NOT generated)
+    message(FATAL_ERROR
+      "`generated/${solver}/` is empty. It is checked in, not built: run "
+      "`./scripts/export_timing_ocp.py` from ${CMAKE_CURRENT_SOURCE_DIR}.")
+  endif()
+  list(APPEND CRANE_PLANNING_GENERATED_SOURCES ${generated})
+  list(APPEND CRANE_PLANNING_GENERATED_INCLUDES
+    "${CRANE_PLANNING_GENERATED_DIR}/${solver}")
+endforeach()
+set_source_files_properties(${CRANE_PLANNING_GENERATED_SOURCES}
+  PROPERTIES COMPILE_OPTIONS "-w")
+
+add_library(crane_planning_generated_ocp STATIC ${CRANE_PLANNING_GENERATED_SOURCES})
+target_include_directories(crane_planning_generated_ocp PRIVATE ${CRANE_PLANNING_GENERATED_INCLUDES})
+target_link_libraries(crane_planning_generated_ocp PRIVATE acados)
+
 add_library(planner_core STATIC
-  src/acados_casadi_bridge.cpp
   src/arm_geometry.cpp
   src/collision.cpp
   src/equilibrium_ik.cpp
   src/geometric_path.cpp
   src/inverse_kinematics.cpp
   src/joint_limits.cpp
-  src/plan_grip.cpp
   src/planner_core.cpp
   src/replanning.cpp
-  src/sampling_planner.cpp
-  src/structured_primitive.cpp
-  src/timing_ocp.cpp
-  src/tool_axis.cpp
-  src/trajectory_timing.cpp)
+  src/ompl_path_planner.cpp
+  src/timing_ocp.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
 set_target_properties(planner_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(planner_core PUBLIC cxx_std_17)
@@ -91,7 +111,8 @@ target_include_directories(planner_core
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
   PRIVATE
-    ${urdfdom_INCLUDE_DIRS})
+    ${urdfdom_INCLUDE_DIRS}
+    ${CRANE_PLANNING_GENERATED_INCLUDES})
 # urdfdom is PRIVATE and is used for exactly one thing: the position and
 # velocity limits the description gives the six actuated joints, which the frozen
 # model API does not expose and this planner may not invent (see
@@ -101,7 +122,7 @@ target_include_directories(planner_core
 # interpolation and the clamped B-spline fit" against "spline bases,
 # boundary-condition solves", and the C² primitive of trajectory_planning §4.4 is
 # exactly a sequence of boundary-condition solves. No spline basis is written here.
-# OMPL is PRIVATE and stays PRIVATE: `sampling_planner.hpp` names no OMPL type,
+# OMPL is PRIVATE and stays PRIVATE: `ompl_path_planner.hpp` names no OMPL type,
 # so the choice of sampling planner is an implementation detail of this library
 # and not something every consumer of the planner has to compile against.
 # omplConfig.cmake's OMPL_INCLUDE_DIRS carries /usr/include and /usr/include/eigen3
@@ -109,11 +130,10 @@ target_include_directories(planner_core
 # reorders the search path, so only the root goes on and Eigen comes from
 # Eigen3::Eigen exactly as it does everywhere else here.
 target_include_directories(planner_core SYSTEM PRIVATE ${OMPL_INCLUDE_DIR})
-# acados and CasADi are both PRIVATE, and that is the same rule contract §9
-# applies to `crane_model`: `timing_ocp.hpp` names neither an `acados` nor a
-# `casadi` type, so the OCP backend is an implementation detail of this library
-# and a consumer of the planner compiles against neither. `src/acados_casadi_bridge.hpp`
-# is where they meet, and it is not installed.
+# acados is PRIVATE, and that is the same rule contract §9 applies to
+# `crane_model`: `timing_ocp.hpp` names no acados type, so the generated OCP
+# backend is an implementation detail of this library and a consumer of the
+# planner compiles against neither acados nor the generated headers.
 target_link_libraries(planner_core
   PUBLIC
     crane_model::crane_model
@@ -121,9 +141,10 @@ target_link_libraries(planner_core
     ruckig::ruckig
   PRIVATE
     acados
-    crane_model::casadi_graph
     ${OMPL_LIBRARIES}
-    urdfdom::urdfdom_model)
+    urdfdom::urdfdom_model
+  PUBLIC
+    crane_planning_generated_ocp)
 
 generate_parameter_library(crane_planner_parameters
   src/crane_planner_parameters.yaml)
@@ -148,6 +169,7 @@ target_link_libraries(planner_node
     rclcpp::rclcpp
     ${crane_msgs_TARGETS}
     ${geometry_msgs_TARGETS}
+    ${nav_msgs_TARGETS}
     ${sensor_msgs_TARGETS}
     ${std_msgs_TARGETS}
     ${timber_crane_planning_interfaces_TARGETS}
@@ -161,6 +183,19 @@ target_link_libraries(planner_node
 add_executable(crane_planner_node src/planner_main.cpp)
 target_link_libraries(crane_planner_node PRIVATE planner_node)
 
+# The offline tuning entry point for the OCP of trajectory_planning §5.2. It
+# links `planner_core` and nothing else -- no ROS, no node, no graph -- so what
+# it solves is the deployment's own `solve_timing_ocp` and not a second setup of
+# the same solver. `scripts/timing_a2b.py` drives it; see README.md.
+add_executable(crane_planning_timing_cli src/timing_cli.cpp)
+target_link_libraries(crane_planning_timing_cli PRIVATE planner_core)
+# The generated header, for one thing only: the SQP iteration cap the shipped
+# artifact allocated its statistics array for. `--max-iterations` is refused
+# above it here rather than overrunning it inside acados, and the number is read
+# off the artifact rather than restated. `test_timing_ocp` reaches it the same way.
+target_include_directories(crane_planning_timing_cli PRIVATE
+  "${CRANE_PLANNING_GENERATED_DIR}")
+
 install(
   DIRECTORY include/
   DESTINATION include)
@@ -168,16 +203,32 @@ install(
   DIRECTORY config
   DESTINATION share/${PROJECT_NAME})
 install(
-  TARGETS planner_core planner_node
+  DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME})
+# Installed without the `.py`, because `ros2 run <pkg> <name>` runs the file as
+# it is installed and README.md documents `plan_a2b`.
+install(
+  PROGRAMS scripts/plan_a2b.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME plan_a2b)
+# `scripts/timing_a2b.py` is deliberately **not** installed, for the same reason
+# `scripts/export_timing_ocp.py` is not: it reads files that exist only in a
+# source checkout -- crane_model's two checked-in machine descriptions, which are
+# that package's test fixtures and are not installed either. Copying them here
+# would be the second machine to keep current that `test/description_fixture.hpp`
+# exists to avoid. It is run from the tree; what it *drives* is installed, which
+# is the part that has to match the deployment.
+install(
+  TARGETS crane_planning_generated_ocp planner_core planner_node
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
 install(
-  TARGETS crane_planner_node
+  TARGETS crane_planner_node crane_planning_timing_cli
   RUNTIME DESTINATION lib/${PROJECT_NAME})
 
 ament_export_include_directories(include)
-ament_export_libraries(planner_core planner_node)
+ament_export_libraries(crane_planning_generated_ocp planner_core planner_node)
 ament_export_dependencies(
   crane_model
   crane_msgs
@@ -189,6 +240,7 @@ ament_export_dependencies(
   std_msgs
   timber_crane_planning_interfaces
   trajectory_msgs
+  nav_msgs
   wood_log_msgs)
 
 if(BUILD_TESTING)
@@ -233,22 +285,12 @@ if(BUILD_TESTING)
 
   # S4 as well: the timing ramp and the refusals the core owes. Plain data in,
   # plain data out.
-  ament_add_gtest(test_trajectory_timing test/test_trajectory_timing.cpp TIMEOUT 600)
-  target_link_libraries(test_trajectory_timing planner_core)
-  target_compile_definitions(test_trajectory_timing PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
   # S4 as well: the structured lift/traverse/descend primitive of
   # trajectory_planning §4.4, its C² junctions, the transfer altitude derived
   # from the scene, and the refusals it owes -- over both machine descriptions,
   # because the descend phase's clearance is the mounted tool's own reach and the
   # rail gripper and the jaw do not have the same one. Offline C++: the only
   # thing this binary links besides gtest is the planner core.
-  ament_add_gtest(test_structured_primitive test/test_structured_primitive.cpp TIMEOUT 900)
-  target_link_libraries(test_structured_primitive planner_core)
-  target_compile_definitions(test_structured_primitive PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
   # S4 as well: collision, the truck model keyed to a measured pose, the sway
   # envelope of trajectory_planning §4.3 and the self-collision of §4.2's
   # `[!todo]` — every scene built in the test rather than subscribed, so nothing
@@ -258,9 +300,8 @@ if(BUILD_TESTING)
   target_compile_definitions(test_collision PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
-  # S4 as well: the sampling fallback of trajectory_planning §4.4 and the
-  # smoothing §4.5 makes mandatory — that the fallback runs *only* when the
-  # primitive is blocked, that the state space is the five path coordinates of
+  # S4: the OMPL RRT-Connect path search and mandatory C2 smoothing over the five
+  # path coordinates of
   # §4.1 and never the passive pair, that shortcut → C² fit → re-check all three
   # run in that order, that the seed makes a run repeatable and the budget makes
   # it bounded. Offline C++ against both machine descriptions; every scene is
@@ -271,47 +312,24 @@ if(BUILD_TESTING)
   # validity check is one `Model::passive_equilibrium` plus the collision queries
   # of its sway envelope, and the fallback is judged on the same terms as the
   # primitive rather than on cheaper ones. The seeded budget is what bounds it.
-  ament_add_gtest(test_sampling_planner test/test_sampling_planner.cpp TIMEOUT 1800)
-  target_link_libraries(test_sampling_planner planner_core)
-  target_compile_definitions(test_sampling_planner PRIVATE
+  ament_add_gtest(test_ompl_path_planner test/test_ompl_path_planner.cpp TIMEOUT 1800)
+  target_link_libraries(test_ompl_path_planner planner_core)
+  target_compile_definitions(test_ompl_path_planner PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S4 as well: the path-constrained OCP of trajectory_planning §5.2 -- the sway
   # carried as a state, the force and pump-flow constraints read out of the same
-  # symbolic graph `crane_mpc` will export from, and the κ margin of §5.5.
+  # shared Python model `crane_mpc` exports from, and the κ margin of §5.5.
   # Offline C++ and deterministic: acados is a numerical solver in process, so no
   # graph, no launch and no simulator is reachable from this binary either.
-  # This one binary links `crane_model::casadi_graph` on top of `planner_core`,
-  # which keeps it PRIVATE: `FlowAgreesWithTheGraph` rebuilds the graph and
-  # evaluates its output map itself, and a test that took the planner's word for
-  # the flow would assert nothing about the two being one expression.
+  # The generated row metadata is checked directly below. The numeric model is
+  # deliberately the only crane_model API this test needs; the symbolic model
+  # lives in the export scripts, not in the runtime package.
   ament_add_gtest(test_timing_ocp test/test_timing_ocp.cpp TIMEOUT 1200)
-  target_link_libraries(test_timing_ocp planner_core crane_model::casadi_graph)
+  target_link_libraries(test_timing_ocp planner_core)
+  target_include_directories(test_timing_ocp PRIVATE
+    "${CRANE_PLANNING_GENERATED_DIR}")
   target_compile_definitions(test_timing_ocp PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the tool coordinate of `/crane/plan_grip`'s close and open --
-  # the retained cosine primitive of trajectory_planning §8 carried on the rate
-  # so it is C² at both ends, the end of the description's own range a phase
-  # drives to, the tool axis's own velocity, acceleration and pump-flow limits,
-  # and the transmission reversal issue 037's notes measured inside the 7040
-  # jaw's range. Offline C++ against both machine descriptions, and cheap: a tool
-  # phase is a cosine and three scalar bounds, with no OCP in it.
-  ament_add_gtest(test_tool_axis test/test_tool_axis.cpp TIMEOUT 600)
-  target_link_libraries(test_tool_axis planner_core)
-  target_compile_definitions(test_tool_axis PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the four phases of `crane_msgs/PlanGrip`, per phase and per tool.
-  # The two arm phases go through `plan_motion` itself, so this binary solves
-  # OCPs and is priced accordingly; the two tool phases are the cosine above.
-  # What it is really about is the three things the phases owe each other: the
-  # descend endpoint is an equilibrium solution and a descend whose endpoint has
-  # none is refused, every phase is on the arm's one time base, and no phase
-  # remembers which one ran before it.
-  ament_add_gtest(test_plan_grip test/test_plan_grip.cpp TIMEOUT 2400)
-  target_link_libraries(test_plan_grip planner_core)
-  target_compile_definitions(test_plan_grip PRIVATE
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S4 as well: replanning from a moving, swinging state and the latency bound of
@@ -330,17 +348,12 @@ if(BUILD_TESTING)
     CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
 
   # S5: the served contract of both rows the planner has in ROS 2 Interfaces §5 —
-  # `/crane/plan_motion` and `/crane/plan_grip` — on the isolated domain
+  # `/crane/plan_motion` and `/a2b_movement` — on the isolated domain
   # `verify.sh` pins. Two nodes in one in-process executor: the deployment's own
   # node object and a client, and no launch, no controller manager and no
   # simulator, because the planner claims no interface and joins no cascade.
   #
-  # The timeout was 300 s while `/crane/plan_motion` was the only row. A grip's
-  # descend and lift are `plan_motion` itself, so serving the four phases adds
-  # two more OCP solves of §5.2 at some 14 s each; 900 s is that with room, and
-  # it bounds a hang rather than budgeting a latency (§7's latency is issue 045's).
-  # The timeout was 900 s while `/crane/plan_motion` and `/crane/plan_grip` were
-  # the only rows. `a2b_movement` (ROS 2 Interfaces §9) is served here too and one
+  # `a2b_movement` (ROS 2 Interfaces §9) is served here too and one
   # of its cases plans, which is one more OCP solve of §5.2 at some 14 s; the rest
   # of them refuse, and a refusal costs nothing. 1200 s is that with room, and it
   # bounds a hang rather than budgeting a latency (§7's latency is issue 045's).

@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -22,16 +24,6 @@ using crane_model::Status;
 
 /// How far a probe steps a joint to read the sign of its bearing derivative.
 constexpr double kSignProbe = 1.0e-3;
-
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
-double wrap(double angle)
-{
-  return std::remainder(angle, 2.0 * M_PI);
-}
 
 /// The configuration a probe runs at: every coordinate zero but the telescope.
 /**

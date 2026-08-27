@@ -99,8 +99,8 @@
 //
 // # What is not here
 //
-// The sampling fallback a blocked primitive falls back to is
-// `sampling_planner.hpp`; what is here is the check both mechanisms are cleared
+// The OMPL path planner a blocked primitive falls back to is
+// `ompl_path_planner.hpp`; what is here is the check both mechanisms are cleared
 // by, and `watched_frame_travel_m` below is the resolution rule shared with it.
 // Coal's broadphase is `crane_model`'s and is issue 034's *left undone*:
 // `collision_queries` is O(links x primitives + pairs), and the shortcut above is
@@ -280,7 +280,7 @@ struct SceneResolution
 
 /// The step, and the scene validation that decides it. **The one place.**
 /**
- * Split out of `check_path` because the sampling fallback has to subdivide its
+ * Split out of `check_path` because the OMPL path planner has to subdivide its
  * motions at the same step, and a second derivation of "the resolution" is a
  * second answer waiting to drift. The rule is the file header's: the configured
  * `resolution_m`, tightened to at most half the thinnest extent anything in the
@@ -329,7 +329,7 @@ struct ConfigurationCheck
 /// How far the frames this file watches move between two configurations, m.
 /**
  * The quantity `resolution_m` is measured in, exposed because the sampling
- * fallback of `sampling_planner.hpp` has to subdivide its motions at the **same**
+ * fallback of `ompl_path_planner.hpp` has to subdivide its motions at the **same**
  * stated resolution -- a fallback validated at its endpoints and a primitive
  * sampled every `resolution_m` would not be cleared on the same terms, which is
  * the whole point of reusing this check.

@@ -10,6 +10,8 @@
 #include <string>
 #include <utility>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -28,7 +30,7 @@ using crane_model::Status;
  * Seven of the eight: q1 to q4, the passive pair q5 and q6, and the rotator q7.
  * q8 is the tool coordinate and is held where the machine has it --
  * `wiki/trajectory_planning.md` 4.1 keeps it off the path, and what opens and
- * closes the gripper is `/crane/plan_grip`, which is issue 044.
+ * closes the gripper is `external grip service`, which is issue 044.
  *
  * The passive rows are decision variables and not an inner solve. That is the
  * whole difference between this route and the semi-analytic one: `g_u(q) = 0`
@@ -140,26 +142,6 @@ constexpr double kCentringScale = 1.0e-3;
  */
 constexpr double kStepTolerance = 1.0e-7;
 
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
-double wrap(double angle)
-{
-  return std::remainder(angle, 2.0 * M_PI);
-}
-
-/// The actuated projection of a canonical eight-vector.
-QA actuated(const Q & q)
-{
-  QA q_a;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] = q[static_cast<Eigen::Index>(kActuatedRows[row])];
-  }
-  return q_a;
-}
-
 /// Everything one configuration is judged by, and what it cost to find out.
 struct Evaluation
 {
@@ -258,30 +240,6 @@ double merit(const IkSettings & seed, const IkRequest & request, const Evaluatio
     (evaluation.p_tcp - request.p_tcp_0).norm() / seed.eps_pos,
     std::abs(wrap(evaluation.phi_z - request.phi_z_d)) / seed.eps_yaw);
 }
-
-bool inside(const AxisLimit & axis, double value)
-{
-  return !axis.bounded || (value >= axis.lower && value <= axis.upper);
-}
-
-/// Whether every actuated row of a configuration is inside the description's range.
-/**
- * The passive pair is not checked here and has no row in `JointLimits`, which
- * reads the six actuated axes only. It does not need one: `g_u(q) = 0` is what
- * decides where the passive joints sit, and a range on a joint nothing actuates
- * is a statement about how far the tool may swing rather than a bound the
- * endpoint may be chosen inside.
- */
-bool within_limits(const JointLimits & limits, const Q & q)
-{
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    if (!inside(limits.axis[row], q[static_cast<Eigen::Index>(kActuatedRows[row])])) {
-      return false;
-    }
-  }
-  return true;
-}
-
 /// Put a trial configuration back onto `g_u(q) = 0` before it is judged.
 /**
  * The Gauss-Newton step satisfies the constraint only to first order, so a trial
@@ -365,7 +323,7 @@ Status seed_configuration(
     }
   }
   q[0] = std::atan2(request.p_tcp_0.y(), request.p_tcp_0.x());
-  if (!inside(limits.axis[0], q[0])) {
+  if (!limits.axis[0].contains(q[0])) {
     q[0] = limits.axis[0].centre();
   }
   q[7] = request.q8;
@@ -394,7 +352,7 @@ crane_model::Result<IkSolution> solve_equilibrium_constrained_ik(
     return Result<IkSolution>::failure(
       failure(ErrorCode::NonFiniteInput, "the goal pose is not finite"));
   }
-  if (!inside(limits.axis[5], request.q8)) {
+  if (!limits.axis[5].contains(request.q8)) {
     return Result<IkSolution>::failure(
       failure(
         ErrorCode::InvalidArgument,
@@ -546,7 +504,7 @@ crane_model::Result<IkSolution> solve_equilibrium_constrained_ik(
       for (Eigen::Index column = 0; column < kFreeCount; ++column) {
         trial[kFreeRows[static_cast<std::size_t>(column)]] += scale * step[column];
       }
-      if (within_limits(limits, trial)) {
+      if (limits.contains(trial)) {
         double trial_g = 0.0;
         Status status = restore(model, request.payload, passive_block, trial, trial_g);
         if (!status.ok()) {
@@ -668,7 +626,7 @@ crane_model::Result<IkSolution> solve_equilibrium_constrained_ik(
         "equilibrium does not settle into -- the tool standing up rather than hanging. "
         "trajectory_planning 6 asks for a genuine steady state, and this is not one"));
   }
-  if (!within_limits(limits, q)) {
+  if (!limits.contains(q)) {
     return Result<IkSolution>::failure(
       failure(
         ErrorCode::InvalidArgument,

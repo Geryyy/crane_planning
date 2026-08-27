@@ -8,6 +8,8 @@
 #include <string>
 #include <utility>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -15,11 +17,6 @@ namespace
 
 using crane_model::ErrorCode;
 using crane_model::Status;
-
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
 
 }  // namespace
 

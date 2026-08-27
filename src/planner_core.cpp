@@ -6,6 +6,8 @@
 #include <string>
 #include <utility>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -16,11 +18,6 @@ using crane_model::Frame;
 using crane_model::Q;
 using crane_model::Result;
 using crane_model::Status;
-
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
 
 }  // namespace
 
@@ -52,7 +49,6 @@ crane_model::Result<PlannerContext> build_planner(
   context.geometry = std::move(geometry).value();
   context.settings = settings;
   context.settings.timing.actuation.cylinder_force_max = forces.value();
-  context.model_config = model_config;
   return Result<PlannerContext>::success(std::move(context));
 }
 
@@ -126,7 +122,7 @@ crane_model::Result<MotionPlan> plan_motion(
   goal.phi_z_d = request.phi_z_d;
   // The tool coordinate is held where the machine has it. q8 is not a path
   // variable (trajectory_planning 4.1); what opens and closes the gripper is
-  // `/crane/plan_grip`.
+  // `external grip service`.
   goal.q8 = request.start.q_a[static_cast<Eigen::Index>(kToolRow)];
   goal.payload = request.payload;
   // The clearance half of robot_model 2.2 step 3's redundancy score, which is a
@@ -170,19 +166,14 @@ crane_model::Result<MotionPlan> plan_motion(
   const crane_model::QU q_u_start =
     passive_known ? request.start.passive.q_u : settled_start.value();
 
-  PrimitiveRequest primitive;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    primitive.q_start[static_cast<Eigen::Index>(kActuatedRows[row])] =
-      request.start.q_a[static_cast<Eigen::Index>(row)];
-  }
-  primitive.q_start[4] = q_u_start[0];
-  primitive.q_start[5] = q_u_start[1];
+  OmplRequest geometry;
+  geometry.q_start = expand(request.start.q_a, q_u_start);
   // The measured rate over the five path coordinates of 4.1, as the first
   // segment's own boundary condition. The tool row is not among them and is
   // checked separately below: q8 rides a quintic that is flat at both ends, so no
   // path this fit produces can carry a moving tool axis.
   for (std::size_t row = 0; row < kPathDof; ++row) {
-    primitive.dq_start[static_cast<Eigen::Index>(row)] =
+    geometry.dq_start[static_cast<Eigen::Index>(row)] =
       request.start.dq_a[static_cast<Eigen::Index>(row)];
   }
   if (std::abs(request.start.dq_a[static_cast<Eigen::Index>(kToolRow)]) > at_rest.at_rest_dq_a) {
@@ -194,80 +185,22 @@ crane_model::Result<MotionPlan> plan_motion(
         " rad/s or m/s. trajectory_planning 4.1 keeps q8 out of the path variables and it rides a "
         "shape that is flat at both ends, so no path this planner fits can leave its start with "
         "the tool moving -- and emitting one that reads as continuous while it is not is the "
-        "defect 7 asks continuity to be a boundary condition against. Close or open the gripper "
-        "through /crane/plan_grip and re-plan from the phase's own end"));
+        "defect 7 asks continuity to be a boundary condition against. Wait for the tool axis to "
+        "stop before planning the arm motion"));
   }
-  primitive.q_goal = plan.endpoint.q;
-  primitive.payload = request.payload;
-  primitive.payload_shape = request.payload_shape;
-  primitive.avoid_collisions = request.avoid_collisions;
-  // The scene, once, for both the transfer altitude and the check. Without one
-  // the altitude clears the two endpoints and says so, and the check either was
-  // not asked for or has already been refused above.
-  primitive.collision_scene = request.scene;
-  primitive.scene = scene_without_obstacles();
+  geometry.q_goal = plan.endpoint.q;
+  geometry.payload = request.payload;
+  geometry.payload_shape = request.payload_shape;
+  geometry.collision_scene = request.avoid_collisions ? request.scene : nullptr;
 
-  // trajectory_planning 4.4's order, and the whole of it: generate the
-  // primitive, check it, accept it if clear -- and only then, and only because it
-  // was not, sample. Nothing below runs the fallback beside the primitive or to
-  // compare with it; 4.4's [!important] says the deterministic common case is
-  // what primitive-first buys, and a fallback that runs anyway spends it.
-  auto built = build_structured_primitive(
-    model, context.geometry, context.limits, context.settings.ik, context.settings.primitive,
-    primitive);
-  if (built.ok()) {
-    plan.mechanism = PathMechanism::StructuredPrimitive;
-    plan.primitive = std::move(built).value();
-    plan.path = plan.primitive.path;
-  } else {
-    plan.primitive_refusal = built.status().message;
-
-    // There is a fallback only when there is something to sample around. A
-    // collision-blind request never gets here -- an unchecked primitive is never
-    // blocked -- and a checked request without a scene was refused at the top of
-    // this function, so what is left is a primitive that could not be *built*
-    // for a request nobody asked to be checked. Sampling that would be sampling
-    // against nothing.
-    if (!request.avoid_collisions || request.scene == nullptr) {
-      return Result<MotionPlan>::failure(built.status());
-    }
-
-    {
-      Status status = clock.charge("the structured primitive of trajectory_planning 4.4");
-      if (!status.ok()) {
-        return Result<MotionPlan>::failure(std::move(status));
-      }
-    }
-
-    SamplingRequest sampling;
-    sampling.q_start = primitive.q_start;
-    sampling.q_goal = primitive.q_goal;
-    sampling.dq_start = primitive.dq_start;
-    sampling.payload = request.payload;
-    sampling.payload_shape = request.payload_shape;
-    sampling.collision_scene = request.scene;
-
-    auto sampled = plan_sampled_path(
-      model, context.limits, context.settings.primitive.fit,
-      context.settings.primitive.collision, context.settings.sampling, sampling);
-    if (!sampled.ok()) {
-      // Both refusals, in the order they happened. A caller told only that the
-      // search timed out cannot tell whether the primitive was blocked by a
-      // runge or was never reachable at all.
-      return Result<MotionPlan>::failure(
-        failure(
-          sampled.status().code,
-          plan.primitive_refusal + ". So the fallback ran, and " + sampled.status().message));
-    }
-    plan.mechanism = PathMechanism::SamplingFallback;
-    plan.sampled = std::move(sampled).value();
-    plan.path = plan.sampled.path;
+  auto searched = plan_ompl_path(model, context.limits, context.settings.ompl, geometry);
+  if (!searched.ok()) {
+    return Result<MotionPlan>::failure(searched.status());
   }
+  plan.geometry = std::move(searched).value();
+  plan.path = plan.geometry.path;
   {
-    Status status = clock.charge(
-      plan.mechanism == PathMechanism::SamplingFallback ?
-      "the sampling fallback of 4.4 and the C2 smoothing 4.5 makes mandatory" :
-      "the structured primitive of trajectory_planning 4.4");
+    Status status = clock.charge("OMPL RRT-Connect and C2 path fitting");
     if (!status.ok()) {
       return Result<MotionPlan>::failure(std::move(status));
     }
@@ -365,7 +298,7 @@ crane_model::Result<MotionPlan> plan_motion(
   timing_settings.max_wall_clock =
     std::min(timing_settings.max_wall_clock, clock.remaining());
   auto solved = solve_timing_ocp(
-    model, context.model_config, plan.path, context.limits, timing, timing_settings);
+    model, plan.path, context.limits, timing, timing_settings);
   if (!solved.ok()) {
     // The budget is charged first, so a solve that ran out of time is reported as
     // the budget firing rather than as acados' timeout -- 7 asks for the bound to
@@ -396,12 +329,7 @@ crane_model::Result<MotionPlan> plan_motion(
     if (!settled.ok()) {
       return Result<MotionPlan>::failure(settled.status());
     }
-    Q q = Q::Zero();
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-      q[static_cast<Eigen::Index>(kActuatedRows[row])] = q_a[static_cast<Eigen::Index>(row)];
-    }
-    q[4] = settled.value()[0];
-    q[5] = settled.value()[1];
+    const Q q = expand(q_a, settled.value());
     auto pose = model.forward_kinematics(q, Frame::MountingBase, Frame::Tcp);
     if (!pose.ok()) {
       return Result<MotionPlan>::failure(pose.status());

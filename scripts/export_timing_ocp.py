@@ -3,7 +3,7 @@
 Write the path-constrained OCP of `wiki/trajectory_planning.md` §5.2 as a generated solver.
 
 This is `docs/features/cbs-ocp-python/grill.md` D1 and D8 for `crane_planning`, and
-it is the second and last consumer of the C++ symbolic graph: the problem is
+it is the second and last consumer of the old C++ symbolic implementation: the problem is
 *defined* here, in Python, over `crane_model/scripts/crane_symbolic.py`, and
 *shipped* as generated C under `generated/`.
 
@@ -335,9 +335,7 @@ def build_ocp(description_xml: str, tool: str, hydraulics: dict) -> tuple:
         force[axis] / scale[CONSTRAINT_CYLINDER_FORCE + axis]
         for axis in cs.K_PLANNED_AXES
     ]
-    rows.append(
-        ca.sum1(flow[: cs.K_PLANNED_DOF]) / scale[CONSTRAINT_PUMP_FLOW]
-    )
+    rows.append(ca.sum1(flow[: cs.K_PLANNED_DOF]) / scale[CONSTRAINT_PUMP_FLOW])
     constraint = ca.vertcat(*rows)
     acados_model.con_h_expr_0 = constraint
     acados_model.con_h_expr = constraint

@@ -107,13 +107,7 @@ std::vector<Case> reachable_poses(
     if (!settled.ok()) {
       continue;
     }
-    crane_model::Q q = crane_model::Q::Zero();
-    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-      q[static_cast<Eigen::Index>(crane_planning::kActuatedRows[row])] =
-        sample.q_a[static_cast<Eigen::Index>(row)];
-    }
-    q[4] = settled.value()[0];
-    q[5] = settled.value()[1];
+    const crane_model::Q q = crane_planning::expand(sample.q_a, settled.value());
     auto pose = model.forward_kinematics(
       q, crane_model::Frame::MountingBase, crane_model::Frame::Tcp);
     if (!pose.ok()) {

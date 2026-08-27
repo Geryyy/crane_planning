@@ -1,4 +1,4 @@
-#include "crane_planning/sampling_planner.hpp"
+#include "crane_planning/ompl_path_planner.hpp"
 
 #include <ompl/base/MotionValidator.h>
 #include <ompl/base/PlannerStatus.h>
@@ -27,6 +27,8 @@
 #include <utility>
 #include <vector>
 
+#include "crane_planning/status.hpp"
+
 namespace crane_planning
 {
 namespace
@@ -50,19 +52,12 @@ using crane_model::Status;
  */
 constexpr double kMaxSubdivisions = 4096.0;
 
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
 /// A refusal that says which of 4.4's two mechanisms it came from.
 Status refuse(ErrorCode code, const std::string & why)
 {
   return failure(
     code,
-    "the sampling fallback of trajectory_planning 4.4 could not produce a path: " + why +
-    ". The structured primitive was generated and checked first and was not accepted, which is "
-    "the only reason the fallback ran at all");
+    "OMPL RRT-Connect could not produce a path: " + why);
 }
 
 double coordinate(const ob::State * state, std::size_t row)
@@ -91,38 +86,6 @@ void write_state(const PathVector & q_a, ob::State * state)
   for (std::size_t row = 0; row < kPathDof; ++row) {
     set_coordinate(state, row, q_a[static_cast<Eigen::Index>(row)]);
   }
-}
-
-/// The path-space part of a canonical eight-vector.
-PathVector path_of(const Q & q)
-{
-  PathVector q_a = PathVector::Zero();
-  for (std::size_t row = 0; row < kPathDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] = q[static_cast<Eigen::Index>(kActuatedRows[row])];
-  }
-  return q_a;
-}
-
-/// The canonical eight of one path vector, tool held, passive pair left at zero.
-Q configuration_of(const PathVector & q_a, double q8)
-{
-  Q q = Q::Zero();
-  for (std::size_t row = 0; row < kPathDof; ++row) {
-    q[static_cast<Eigen::Index>(kActuatedRows[row])] = q_a[static_cast<Eigen::Index>(row)];
-  }
-  q[static_cast<Eigen::Index>(kActuatedRows[kToolRow])] = q8;
-  return q;
-}
-
-/// The actuated six of one path vector, tool held.
-crane_model::QA actuated_of(const PathVector & q_a, double q8)
-{
-  crane_model::QA actuated = crane_model::QA::Zero();
-  for (std::size_t row = 0; row < kPathDof; ++row) {
-    actuated[static_cast<Eigen::Index>(row)] = q_a[static_cast<Eigen::Index>(row)];
-  }
-  actuated[static_cast<Eigen::Index>(kToolRow)] = q8;
-  return actuated;
 }
 
 /// A uniform sampler over the bounds, drawing from a seed and from nothing else.
@@ -220,7 +183,7 @@ public:
 
     // q5 and q6 are dynamics outputs and never path variables (4.1), so they are
     // solved at every configuration and never interpolated.
-    auto settled = model_.passive_equilibrium(actuated_of(q_a, q8_), payload_);
+    auto settled = model_.passive_equilibrium(actuated(q_a, q8_), payload_);
     if (!settled.ok()) {
       // A configuration whose passive subsystem has no steady state is not one to
       // plan through. It is not a failure of the check either -- the arm folded
@@ -228,7 +191,7 @@ public:
       // machine is asked to pass through.
       return false;
     }
-    Q q = configuration_of(q_a, q8_);
+    Q q = expand(q_a, q8_);
     q.segment<2>(4) = settled.value();
 
     auto checked = check_configuration(model_, scene_, shape_, settings_, q, step_m_);
@@ -333,7 +296,7 @@ private:
   std::size_t subdivisions(const ob::State * s1, const ob::State * s2) const
   {
     auto travel = watched_frame_travel_m(
-      model_, configuration_of(vector_of(s1), q8_), configuration_of(vector_of(s2), q8_));
+      model_, expand(vector_of(s1), q8_), expand(vector_of(s2), q8_));
     if (!travel.ok()) {
       status_ = travel.status();
       return 0U;
@@ -360,29 +323,11 @@ private:
   double step_m_;
   mutable Status status_{};
 };
-
-std::string seconds(double value)
-{
-  return std::to_string(value) + " s";
-}
-
 }  // namespace
-
-const char * mechanism_name(PathMechanism mechanism) noexcept
-{
-  switch (mechanism) {
-    case PathMechanism::StructuredPrimitive:
-      return "the structured lift/traverse/descend primitive of trajectory_planning 4.4";
-    case PathMechanism::SamplingFallback:
-      return "the RRT-Connect sampling fallback of trajectory_planning 4.4, smoothed and "
-             "re-checked per 4.5";
-  }
-  return "an unknown mechanism";
-}
 
 crane_model::Result<StateSpaceBounds> state_space_bounds(
   const JointLimits & limits, const PathVector & q_a_start, const PathVector & q_a_goal,
-  const SamplingSettings & settings)
+  const OmplSettings & settings)
 {
   if (!q_a_start.allFinite() || !q_a_goal.allFinite()) {
     return Result<StateSpaceBounds>::failure(
@@ -470,11 +415,10 @@ std::vector<PathVector> shortcut(
   return kept;
 }
 
-std::string describe(const SamplingPlan & plan)
+std::string describe(const OmplPlan & plan)
 {
   std::string text =
-    "the structured primitive of trajectory_planning 4.4 was refused, so the sampling fallback "
-    "of that section answered: RRT-Connect over the five path coordinates of 4.1 -- never the "
+    "OMPL RRT-Connect over the five path coordinates of 4.1 -- never the "
     "passive pair -- returned " + std::to_string(plan.search_states) +
     " waypoints after " + std::to_string(plan.validity_checks) + " configurations checked in " +
     seconds(plan.search_s) + " from seed " + std::to_string(plan.seed) +
@@ -488,27 +432,22 @@ std::string describe(const SamplingPlan & plan)
   return text;
 }
 
-crane_model::Result<SamplingPlan> plan_sampled_path(
-  const crane_model::Model & model, const JointLimits & limits, const PathFitSettings & fit,
-  const CollisionSettings & collision, const SamplingSettings & settings,
-  const SamplingRequest & request)
+crane_model::Result<OmplPlan> plan_ompl_path(
+  const crane_model::Model & model, const JointLimits & limits,
+  const OmplSettings & settings, const OmplRequest & request)
 {
-  if (request.collision_scene == nullptr) {
-    return Result<SamplingPlan>::failure(
-      refuse(
-        ErrorCode::NotReady,
-        "no scene has been received on /crane/collision_scene, and there is nothing to sample a "
-        "way round without one"));
-  }
+  const crane_model::CollisionScene empty_scene{};
+  const crane_model::CollisionScene & scene =
+    request.collision_scene == nullptr ? empty_scene : *request.collision_scene;
   if (!request.q_start.allFinite() || !request.q_goal.allFinite()) {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(ErrorCode::NonFiniteInput, "an endpoint configuration is not finite"));
   }
   if (!(settings.time_budget_s > 0.0) || !std::isfinite(settings.time_budget_s) ||
     settings.max_validity_checks < 2U || !(settings.extension_span >= 0.0) ||
     !std::isfinite(settings.extension_span))
   {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         ErrorCode::InvalidArgument,
         "a search needs a positive wall-clock budget, an allowance of at least two configurations "
@@ -518,13 +457,12 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
   const double q8_start = request.q_start[static_cast<Eigen::Index>(kActuatedRows[kToolRow])];
   const double q8_goal = request.q_goal[static_cast<Eigen::Index>(kActuatedRows[kToolRow])];
   if (std::abs(q8_goal - q8_start) > 1.0e-9) {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         ErrorCode::InvalidArgument,
         "the tool coordinate is asked to move from " + std::to_string(q8_start) + " to " +
         std::to_string(q8_goal) +
-        ". 4.1 says q8 is not a path variable, so this search holds it; what opens and closes the "
-        "gripper is /crane/plan_grip, which is issue 044"));
+        ". q8 is not a path variable, so this search holds it fixed"));
   }
 
   const PathVector start = path_of(request.q_start);
@@ -532,13 +470,13 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
 
   auto bounds = state_space_bounds(limits, start, goal, settings);
   if (!bounds.ok()) {
-    return Result<SamplingPlan>::failure(refuse(bounds.status().code, bounds.status().message));
+    return Result<OmplPlan>::failure(refuse(bounds.status().code, bounds.status().message));
   }
   // The step, taken from the same place `check_path` takes it, so the search and
   // the re-check resolve the scene identically.
-  auto resolution = resolve_scene(*request.collision_scene, request.payload_shape, collision);
+  auto resolution = resolve_scene(scene, request.payload_shape, settings.collision);
   if (!resolution.ok()) {
-    return Result<SamplingPlan>::failure(resolution.status());
+    return Result<OmplPlan>::failure(resolution.status());
   }
   const double step_m = resolution.value().step_m;
 
@@ -566,8 +504,8 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
 
   auto space_information = std::make_shared<ob::SpaceInformation>(space);
   auto validity = std::make_shared<ConfigurationValidity>(
-    space_information, model, *request.collision_scene, request.payload, request.payload_shape,
-    collision, q8_start, step_m);
+    space_information, model, scene, request.payload, request.payload_shape,
+    settings.collision, q8_start, step_m);
   // Two, for the two endpoints, before the search's own allowance is opened.
   // `max_validity_checks` is a cap on what the *search* may look at, and a
   // deployment that set it to two would otherwise be told its budget ran out when
@@ -597,15 +535,15 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
     };
   if (!validity->isValid(start_state.get())) {
     if (!validity->status().ok()) {
-      return Result<SamplingPlan>::failure(validity->status());
+      return Result<OmplPlan>::failure(validity->status());
     }
-    return Result<SamplingPlan>::failure(endpoint_refusal("start"));
+    return Result<OmplPlan>::failure(endpoint_refusal("start"));
   }
   if (!validity->isValid(goal_state.get())) {
     if (!validity->status().ok()) {
-      return Result<SamplingPlan>::failure(validity->status());
+      return Result<OmplPlan>::failure(validity->status());
     }
-    return Result<SamplingPlan>::failure(endpoint_refusal("goal"));
+    return Result<OmplPlan>::failure(endpoint_refusal("goal"));
   }
 
   const std::size_t endpoint_checks = validity->checks();
@@ -640,23 +578,23 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
     });
   const ob::PlannerStatus outcome = planner->solve(budget);
 
-  SamplingPlan plan;
+  OmplPlan plan;
   plan.seed = settings.seed;
   plan.search_s = elapsed();
   plan.validity_checks = validity->checks() - endpoint_checks;
 
   if (!validity->status().ok()) {
-    return Result<SamplingPlan>::failure(validity->status());
+    return Result<OmplPlan>::failure(validity->status());
   }
   if (!motion->status().ok()) {
-    return Result<SamplingPlan>::failure(motion->status());
+    return Result<OmplPlan>::failure(motion->status());
   }
   if (outcome != ob::PlannerStatus::EXACT_SOLUTION) {
     // An approximate solution is refused with the rest. A path that stops short
     // of the goal is not a worse answer than none; it is an answer that reads as
     // success, and stage 2 would time the machine straight into whatever the
     // search had not got round yet.
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         ErrorCode::NotReady,
         std::string("RRT-Connect came back with '") + outcome.asString() + "' after " +
@@ -670,7 +608,7 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
 
   auto solution = std::static_pointer_cast<og::PathGeometric>(problem->getSolutionPath());
   if (!solution || solution->getStateCount() < 2U) {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         ErrorCode::NotReady,
         "the search reported a solution and produced no path with two ends to it"));
@@ -700,10 +638,10 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
   plan.smoothed_states = smoothed.size();
   plan.shortcut_checks = validity->checks() - after_search;
   if (!validity->status().ok()) {
-    return Result<SamplingPlan>::failure(validity->status());
+    return Result<OmplPlan>::failure(validity->status());
   }
   if (!motion->status().ok()) {
-    return Result<SamplingPlan>::failure(motion->status());
+    return Result<OmplPlan>::failure(motion->status());
   }
 
   // 4.5, step two: the same C2 fit the primitive is built with, so both producers
@@ -719,9 +657,9 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
   // 7's measured start, on the fallback's first segment. The shortcut may have
   // dropped the waypoints after it, never the one the machine is standing at.
   fitted.start_rate = request.dq_start;
-  auto path = fit_c2_path(fitted, limits, fit);
+  auto path = fit_c2_path(fitted, limits, settings.fit);
   if (!path.ok()) {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         path.status().code,
         "the C2 fit that 4.5 makes mandatory refused the sampled polyline: " +
@@ -735,14 +673,14 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
   // shortcut replaced detours by their chords and the fit is not those chords,
   // so what the search cleared is not what would be flown.
   auto rechecked = check_path(
-    model, plan.path, *request.collision_scene, request.payload, request.payload_shape,
-    collision);
+    model, plan.path, scene, request.payload, request.payload_shape,
+    settings.collision);
   if (!rechecked.ok()) {
-    return Result<SamplingPlan>::failure(rechecked.status());
+    return Result<OmplPlan>::failure(rechecked.status());
   }
   plan.recheck = std::move(rechecked).value();
   if (!plan.recheck.clear) {
-    return Result<SamplingPlan>::failure(
+    return Result<OmplPlan>::failure(
       refuse(
         ErrorCode::InvalidArgument,
         "the smoothed path is blocked where the sampled one was clear, which is the case 4.5's "
@@ -751,7 +689,7 @@ crane_model::Result<SamplingPlan> plan_sampled_path(
         "flown is not the polyline that was cleared. " + describe(plan.recheck)));
   }
 
-  return Result<SamplingPlan>::success(std::move(plan));
+  return Result<OmplPlan>::success(std::move(plan));
 }
 
 }  // namespace crane_planning

@@ -12,55 +12,6 @@ crane_planner:
     validation:
       one_of<>: [["pzs100", "epsilon7040"]]
 
-  gripper_closed_end:
-    type: string
-    default_value: "lower"
-    read_only: true
-    description: "Which end of the range the description gives the tool axis is a
-      **closed** gripper. /crane/plan_grip's PHASE_CLOSE drives q8 to it and
-      PHASE_OPEN drives q8 to the other one, and the description carries neither:
-      it states the range and the velocity limit and says nothing about which way
-      the tool runs.
-      **Measured on the 7040, assumed on the PZS100.** Issue 037's notes probed
-      jaw_stroke(q8).ratio across theta10_outer_jaw_joint's own 0 ... 3.15 rad and
-      record that the cylinder retracts as the outer jaw opens, with the ratio
-      negative at q8 = 0 -- so that range starts at the jaws together and `lower`
-      is measured. The PZS100's q9_left_rail_joint runs 0.2 ... 0.7 m and nothing
-      in this workspace records which way its rails travel; `lower` is the reading
-      a rail pair that opens outward from a 0.2 m minimum has, and
-      wiki/implementation/commissioning_prerequisites.md item 4 already owns that
-      axis as human work. A deployment that measures its own tool replaces this
-      rather than patching the planner."
-    validation:
-      one_of<>: [["lower", "upper"]]
-
-  gripper_transmission_samples:
-    type: int
-    default_value: 65
-    read_only: true
-    description: "How densely J_c,GR is probed across one close or open phase's
-      travel. The 7040's jaw ratio is a smooth four-bar function of q8 alone and
-      **reverses sign inside the joint's own range** -- issue 037's notes measured
-      the crossing at q8 ~= 0.29 rad -- and at the crossing the cylinder moves the
-      jaw through no distance at all, so the axis is not controllable there. A
-      phase whose travel spans it is refused naming it. This is the grid the sign
-      change is bracketed on before it is bisected, so it is a resolution and not
-      a convergence criterion. The PZS100's rail cylinder is one-to-one with q8
-      and nothing crosses there."
-    validation:
-      gt_eq<>: [2]
-
-  gripper_transmission_floor:
-    type: double
-    default_value: 1.0e-3
-    read_only: true
-    description: "|J_c,GR| at or below which the tool axis counts as toggled,
-      m/rad or m/m. A ratio of exactly zero is the crossing above; a ratio a
-      thousandth of the way to it is an axis whose cylinder has to travel a
-      millimetre to turn the jaw through a radian, which no valve resolves. Both
-      are the same refusal for the same reason."
-    validation:
-      gt<>: [0.0]
 
   eps_pos:
     type: double
@@ -212,35 +163,6 @@ crane_planner:
       validation:
         gt<>: [0.0]
 
-  transfer_altitude_floor:
-    type: double_array
-    default_value: []
-    read_only: true
-    description: "An optional floor on the transfer altitude the structured
-      primitive of wiki/trajectory_planning.md 4.4 lifts to, m in
-      K0_mounting_base. Empty means no floor, and empty is the default, because
-      4.4 read against 9's open items says the altitude comes from the scene: it
-      is derived from the two endpoints raised by the mounted tool's own reach,
-      and from the obstacle extent once issue 041 supplies one. A floor may only
-      raise that derivation and can therefore never be the answer -- with no
-      endpoints there is no altitude here at all, whatever this says. A
-      deployment sets it when the site has a known minimum transit height the
-      endpoints do not imply. At most one element."
-    validation:
-      size_lt<>: [2]
-
-  transfer_altitude_ceiling:
-    type: double_array
-    default_value: []
-    read_only: true
-    description: "An optional ceiling on the same derivation, m in
-      K0_mounting_base, empty by default. It may only lower the derived altitude.
-      Set below both endpoints it makes the primitive impossible rather than
-      short, and the lift phase is then refused by name -- the primitive is
-      refused, never deformed, because a lift that does not clear what it was
-      derived to clear is worse than no plan at all. At most one element."
-    validation:
-      size_lt<>: [2]
 
   path_rate_headroom:
     type: double
@@ -282,11 +204,11 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
-  sampling_seed:
+  ompl_seed:
     type: int
     default_value: 20420042
     read_only: true
-    description: "The seed the sampling fallback of wiki/trajectory_planning.md
+    description: "The seed the sole OMPL planner of wiki/trajectory_planning.md
       4.4 draws every sample and every shortcut pair from. **A constant, and
       never a clock.** A stochastic planner in an automated suite is the
       flaky-test failure the PRD's testing decisions rule out, so this makes two
@@ -299,7 +221,7 @@ crane_planner:
     validation:
       gt_eq<>: [0]
 
-  sampling_time_budget:
+  ompl_time_budget:
     type: double
     default_value: 5.0
     read_only: true
@@ -313,7 +235,7 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
-  sampling_max_validity_checks:
+  ompl_max_validity_checks:
     type: int
     default_value: 4000
     read_only: true
@@ -329,7 +251,7 @@ crane_planner:
     validation:
       gt_eq<>: [2]
 
-  sampling_extension_span:
+  ompl_extension_span:
     type: double
     default_value: 2.0
     read_only: true
@@ -357,7 +279,7 @@ crane_planner:
     validation:
       gt_eq<>: [0]
 
-  sampling_unbounded_margin:
+  ompl_unbounded_margin:
     type: double
     default_value: 3.141592653589793
     read_only: true
@@ -384,15 +306,6 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
-  min_duration:
-    type: double
-    default_value: 0.5
-    read_only: true
-    description: "Floor on the traversal time, s. Without it a goal a few
-      millimetres away would be handed over in microseconds, and a reference
-      shorter than the loop it is tracked by is a step, not a trajectory."
-    validation:
-      gt<>: [0.0]
 
   q_sway_max:
     type: double_array
@@ -691,7 +604,226 @@ crane_planner:
       request on crane_msgs/PlanMotion, it touches the velocity bound alone, and
       no value of it raises this."
     validation:
-      bounds<>: [0.0, 1.0]
+      # (0, 1], matching solve_timing_ocp's own precondition. Zero is not a
+      # cautious margin, it is no authority at all.
+      bounds<>: [1.0e-12, 1.0]
+
+  # ---------------------------------------------------------------------------
+  # The rest of the OCP of wiki/trajectory_planning.md 5.2
+  # ---------------------------------------------------------------------------
+  #
+  # **Why these are parameters at all.** They used to be the defaults on
+  # `TimingOcpSettings` and nothing else, so tuning the OCP meant editing a C++
+  # header and rebuilding, and `scripts/timing_a2b.py` -- which is the tool the
+  # tuning is actually done with -- carried its own copy of every one of them.
+  # Two copies of a number that has to agree is one copy too many. These are the
+  # single place they are written down: the node reads them here and the offline
+  # runner passes them to `crane_planning_timing_cli`, which defaults every one
+  # of them from the same struct.
+  #
+  # They are read_only for the reason every other solve setting here is: a
+  # weight that can be changed under a running planner makes two plans issued a
+  # second apart incomparable.
+  ocp:
+    intervals:
+      type: int
+      default_value: 40
+      read_only: true
+      description: "Shooting intervals over sigma in [0, 1]. The grid the
+        constraints of mpc 3 are actually imposed on, so it buys feasibility
+        resolution rather than accuracy: a coarse grid can step over a force
+        peak between two nodes. It also sets the solve cost, which is roughly
+        linear in it. Four is the fewest that has an interior at all."
+      validation:
+        bounds<>: [4, 400]
+    sway_weight:
+      type: double
+      default_value: 2.0
+      read_only: true
+      description: "Q_dot_u of 5.2's sway-energy regulariser, per passive
+        coordinate, and the same weight on the terminal cost. It trades traversal
+        time against how hard the timing works to keep the load still: raising it
+        buys a quieter load and a slower move. **A design value** -- 5.2 names the
+        term and not its weight, and no recording measures what an operator would
+        accept. It is the first knob to reach for when a plan swings."
+      validation:
+        gt_eq<>: [0.0]
+    input_weight:
+      type: double
+      default_value: 1.0e-3
+      read_only: true
+      description: "Regularisation on sigma_ddot. **Not a limit** -- the limit is
+        sigma_accel_max below. It is small on purpose: large enough that the
+        input is not free and the SQP has something to descend on where the
+        traversal-time term is flat, small enough that it does not buy time back
+        from the objective. Zero is allowed and leaves the input unregularised."
+      validation:
+        gt_eq<>: [0.0]
+    sigma_rate_min:
+      type: double
+      default_value: 0.02
+      read_only: true
+      description: "Floor on sigma_dot. A numerical bound and not a machine
+        number: the objective carries 1/sigma_dot, so a rate reaching zero makes
+        the integrand singular. What the machine feels is q_a'(sigma) sigma_dot
+        and that is bounded by the joint velocity limits off the description."
+      validation:
+        gt<>: [0.0]
+    sigma_rate_max:
+      type: double
+      default_value: 2.0
+      read_only: true
+      description: "Ceiling on sigma_dot, and numerical for the mirror-image
+        reason. At the two endpoints the path is stationary -- q_a' and q_a''
+        both vanish -- so no joint limit constrains the rate there at all and
+        something has to. Must be above sigma_rate_min."
+      validation:
+        gt<>: [0.0]
+    sigma_accel_max:
+      type: double
+      default_value: 20.0
+      read_only: true
+      description: "Box on sigma_ddot, the OCP's input. Numerical, like the rate
+        box: the physical accelerations are bounded by ddq_a_max below, and this
+        keeps the input finite where q_a' vanishes and no physical row binds it."
+      validation:
+        gt<>: [0.0]
+    dq_sway_max:
+      type: double_array
+      default_value: [1.0, 0.5]
+      read_only: true
+      description: "dq_u^+ of wiki/mpc.md 3 constraint 4, rad/s, over
+        [tip, tilt] -- the index order crane_msgs/PendulumState publishes in.
+        The rate half of the sway box; the position half is the top-level
+        q_sway_max, which the collision envelope of trajectory_planning 4.3
+        shares and which is therefore not repeated here. **A design value**, on
+        the same footing as q_sway_max: it is the rate a 2.5 m pendulum reaches
+        at that swing."
+      validation:
+        fixed_size<>: [2]
+        # Strictly positive. A zero here is not a tight bound, it is a zero-width
+        # box on the dq_u rows at every interior stage -- exactly the singular log
+        # barrier the start_resolution windows below exist to avoid -- and unlike
+        # the other limits the solver has no check of its own for it.
+        element_bounds<>: [1.0e-12, 10.0]
+    ddq_a_max:
+      type: double_array
+      default_value: [0.5, 0.7, 0.5, 1.0, 6.0, 2.0]
+      read_only: true
+      description: "ddq^max of wiki/implementation/parameters.md 3, over the six
+        actuated coordinates in canonical order (slew, boom, arm, telescope,
+        rotator, tool). The description carries position and velocity limits and
+        **not** acceleration ones, which is why these are written down here and
+        the other two are not. The OCP bounds the five path rows; the sixth is
+        the tool and is pinned rather than timed, so its entry is carried for
+        shape and never binds. **A design value.**"
+      validation:
+        fixed_size<>: [6]
+        # Strictly positive, not merely non-negative: solve_timing_ocp refuses a
+        # zero acceleration limit by name, and a bound that admits zero moves
+        # that refusal from bringup to the first plan request. The floor is the
+        # smallest positive number this validator can express.
+        element_bounds<>: [1.0e-12, 1000.0]
+    max_wall_clock:
+      type: double
+      default_value: 12.0
+      read_only: true
+      description: "The share of trajectory_planning 7's latency the solve may
+        spend, s, enforced inside acados rather than in a caller's timeout. Sized
+        against what a solve costs rather than round -- a straight move converges
+        in some 4 s here -- because a bound is only a bound if the ordinary case
+        clears it on a slower machine. plan_motion lowers it to whatever
+        latency_budget has left when the solve opens, so the two cannot disagree
+        about which of them fired."
+      validation:
+        gt<>: [0.0]
+    max_iterations:
+      type: int
+      default_value: 250
+      read_only: true
+      description: "SQP iteration cap. Hitting it is a refusal carrying acados'
+        own status word, never a clipped trajectory. **The one setting the
+        generated artifact caps rather than carries**: acados sizes the SQP
+        statistics array from it at code generation, so raising it past what the
+        shipped solver allocated is a re-export
+        (`./scripts/export_timing_ocp.py`) and not a setting. The bound below is
+        that allocation."
+      validation:
+        bounds<>: [1, 250]
+    tolerance_stationarity:
+      type: double
+      default_value: 1.0e-4
+      read_only: true
+      description: "When the SQP's stationarity residual is small enough to stop.
+        Separate from the feasibility tolerance on purpose: this residual is in
+        the units of the objective's gradient, which carries 1/sigma_dot and its
+        square root, so it is a couple of decades larger than the constraint
+        residuals for the same quality of answer. Asking it for 1e-6 spends the
+        whole iteration budget polishing a trajectory that stopped changing."
+      validation:
+        gt<>: [0.0]
+    tolerance_feasibility:
+      type: double
+      default_value: 1.0e-6
+      read_only: true
+      description: "The equality, inequality and complementarity tolerances,
+        which share a value. These residuals are in the units of the constraints
+        -- rad/s^2, newtons, m^3/s -- and 1e-6 there is far below anything the
+        machine can be commanded at."
+      validation:
+        gt<>: [0.0]
+    levenberg_marquardt:
+      type: double
+      default_value: 1.0e-2
+      read_only: true
+      description: "Levenberg-Marquardt term on the Gauss-Newton Hessian. **Not
+        a taste.** The traversal-time term is 1/sigma_dot, whose curvature falls
+        as the rate rises, so the Hessian is nearly flat exactly where the
+        optimum is and an unregularised step leaves the region the model is valid
+        on. Lowering it is the second thing to try when a solve reports
+        ACADOS_QP_FAILURE; raising it slows convergence rather than breaking it."
+      validation:
+        gt_eq<>: [0.0]
+
+  start_resolution:
+    q_u:
+      type: double
+      default_value: 1.0e-2
+      read_only: true
+      description: "How wide a window stage 0's measured sway angle is held
+        inside, rad. **A solver number first and a measurement number second.**
+        A zero-width box is where an interior-point method breaks down and HPIPM
+        is no exception: with every stage-0 row pinned exactly, solves come back
+        ACADOS_QP_FAILURE on the first QP. 1e-3 still fails and 1e-2 converges,
+        by sweep. That 1e-3 is also the gyro quantiser's own scale is what makes
+        it a trap -- the sensor-resolution argument gives a number an order of
+        magnitude too small to be the fix. The window costs what it says: a
+        minimum-time objective spends slack, so the initial condition is honoured
+        to this tolerance and not exactly."
+      validation:
+        gt<>: [0.0]
+    dq_u:
+      type: double
+      default_value: 1.0e-2
+      read_only: true
+      description: "The same window on the measured sway rate, rad/s, for the
+        same reason and measured the same way."
+      validation:
+        gt<>: [0.0]
+    sigma_rate_fraction:
+      type: double
+      default_value: 2.0e-2
+      read_only: true
+      description: "The window on the pinned sigma_dot(0), as a **fraction** of
+        the pinned rate itself. Relative and not absolute because sigma_dot is a
+        path rate and its scale is the path's. In the machine's own terms it is
+        directly the fraction by which the first emitted joint velocity may
+        differ from the measured one, since dq_a(0) = q_a'(0) sigma_dot(0). Both
+        edges stand off: with the box's lower edge on the measurement the first
+        QP returns a NaN, and opening only that edge converges to a rate below
+        the measurement, which is not the boundary condition 7 asked for."
+      validation:
+        gt<>: [0.0]
 
   pump_flow_max:
     type: double
@@ -718,7 +850,7 @@ crane_planner:
       separate, larger reservation applied to every limit. The two multiply and
       neither substitutes for the other."
     validation:
-      bounds<>: [0.0, 1.0]
+      bounds<>: [1.0e-12, 1.0]
 
   system_pressure_pa:
     type: double

@@ -9,9 +9,10 @@
 // interfaces (ROS 2 Interfaces 3.2) and which controller holds that claim is the
 // supervisor's decision alone (5). So this node:
 //
-//   * publishes on exactly one topic, `/crane/reference`, which is a *reference*
-//     and not a command -- ROS 2 Interfaces 4 gives that row to the planner and
-//     it has had no producer until now;
+//   * publishes `/crane/reference`, which is a *reference* and not a command,
+//     plus the visual-only TCP geometry of each adopted reference on
+//     `/crane_planner/planned_path` -- ROS 2 Interfaces 4 gives the reference
+//     row to the planner and it has had no producer until now;
 //   * holds no `controller_manager` client of any kind, so it cannot move a
 //     claim even indirectly;
 //   * writes no command interface, because it is not a controller and no spawner
@@ -44,10 +45,9 @@
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_msgs/msg/payload_estimate.hpp"
 #include "crane_msgs/msg/pendulum_state.hpp"
-#include "crane_msgs/srv/plan_grip.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
-#include "crane_planning/plan_grip.hpp"
 #include "crane_planning/planner_core.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/joint_state.hpp"
 #include "std_msgs/msg/string.hpp"
@@ -64,9 +64,9 @@ namespace crane_planning
  */
 inline constexpr char kPlanMotionService[] = "/crane/plan_motion";
 
-/// The second service of 5, which 10 keeps separate while the task layer migrates.
-inline constexpr char kPlanGripService[] = "/crane/plan_grip";
 inline constexpr char kReferenceTopic[] = "/crane/reference";
+/// The TCP geometry of the last adopted plan, for operator visualization only.
+inline constexpr char kPlannedPathTopic[] = "/crane_planner/planned_path";
 inline constexpr char kJointStatesTopic[] = "/joint_states";
 inline constexpr char kCollisionSceneTopic[] = "/crane/collision_scene";
 
@@ -148,16 +148,6 @@ public:
   void plan(
     const crane_msgs::srv::PlanMotion::Request & request,
     crane_msgs::srv::PlanMotion::Response & response);
-
-  /// One `/crane/plan_grip` phase, answered. Public for the same reason `plan` is.
-  /**
-   * It holds no state between calls and none about which phase ran last: the
-   * start of every phase is the newest `/joint_states`, so the task layer
-   * sequences the four by moving the machine and re-measuring.
-   */
-  void grip(
-    const crane_msgs::srv::PlanGrip::Request & request,
-    crane_msgs::srv::PlanGrip::Response & response);
 
   /// One `a2b_movement` request, answered through the native planning path.
   /**
@@ -297,9 +287,8 @@ private:
   rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
   rclcpp::Subscription<crane_msgs::msg::PayloadEstimate>::SharedPtr payload_estimate_subscription_;
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
+  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr planned_path_;
   rclcpp::Service<crane_msgs::srv::PlanMotion>::SharedPtr plan_motion_;
-  rclcpp::Service<crane_msgs::srv::PlanGrip>::SharedPtr plan_grip_;
-
   /// The retained row of 9, served by the same node and answered by `plan`.
   rclcpp::Service<timber_crane_planning_interfaces::srv::CalcMovement>::SharedPtr a2b_movement_;
 };

@@ -12,6 +12,7 @@
 
 #include "crane_planning/collision.hpp"
 #include "crane_planning/redundancy.hpp"
+#include "crane_planning/status.hpp"
 
 namespace crane_planning
 {
@@ -56,26 +57,6 @@ constexpr double kDeficitWeight = 1.0e4;
  * telescope is the redundancy, and 2.2 step 3 has already resolved it.
  */
 constexpr std::array<Eigen::Index, 4> kRefinedRows{{0, 1, 2, 6}};
-
-Status failure(ErrorCode code, std::string message)
-{
-  return Status{code, std::move(message)};
-}
-
-double wrap(double angle)
-{
-  return std::remainder(angle, 2.0 * M_PI);
-}
-
-/// The actuated projection of a canonical eight-vector.
-QA actuated(const Q & q)
-{
-  QA q_a;
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    q_a[static_cast<Eigen::Index>(row)] = q[static_cast<Eigen::Index>(kActuatedRows[row])];
-  }
-  return q_a;
-}
 
 /// One candidate of the step-3 search, before it has been checked against FK.
 struct Closure
@@ -158,17 +139,6 @@ double clearance_score(
   return clearance.weights.clearance *
          clearance_penalty(distance.value(), clearance.weights.clearance_reference_m);
 }
-
-bool inside(const AxisLimit & axis, double value)
-{
-  return !axis.bounded || (value >= axis.lower && value <= axis.upper);
-}
-
-double clamp_to(const AxisLimit & axis, double value)
-{
-  return axis.bounded ? std::min(axis.upper, std::max(axis.lower, value)) : value;
-}
-
 /// How many whole turns either way a representative is looked for.
 constexpr int kTurns = 2;
 
@@ -197,7 +167,7 @@ double representative(const AxisLimit & axis, double angle)
   double best_distance = std::numeric_limits<double>::infinity();
   for (int turn = -kTurns; turn <= kTurns; ++turn) {
     const double candidate = angle + static_cast<double>(turn) * 2.0 * M_PI;
-    if (!inside(axis, candidate)) {
+    if (!axis.contains(candidate)) {
       continue;
     }
     const double distance = std::abs(candidate - axis.centre());
@@ -240,7 +210,7 @@ ClosureFailure solve_closure(
   const ClearanceContext & clearance, Closure & out)
 {
   const double q1 = representative(limits.axis[0], std::atan2(p_wrist_0.y(), p_wrist_0.x()));
-  if (!inside(limits.axis[0], q1)) {
+  if (!limits.axis[0].contains(q1)) {
     return ClosureFailure::Azimuth;
   }
   Q q = Q::Zero();
@@ -306,7 +276,7 @@ ClosureFailure solve_closure(
       candidate.q4 = q4;
       candidate.branch = branch;
       candidate.deficit = std::abs(reach - closable);
-      if (!inside(limits.axis[1], candidate.q2) || !inside(limits.axis[2], candidate.q3)) {
+      if (!limits.axis[1].contains(candidate.q2) || !limits.axis[2].contains(candidate.q3)) {
         continue;
       }
       // 2.2 step 3's score, both halves of it: joint-range centring and
@@ -406,17 +376,6 @@ Q nominal_configuration(const JointLimits & limits, double q8)
   return q;
 }
 
-/// Whether every actuated row of a configuration is inside the description's range.
-bool within_limits(const JointLimits & limits, const Q & q)
-{
-  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    if (!inside(limits.axis[row], q[static_cast<Eigen::Index>(kActuatedRows[row])])) {
-      return false;
-    }
-  }
-  return true;
-}
-
 /// The Jacobian polish, on the same settled map the acceptance test is measured on.
 /**
  * 2.2's own admission is that steps 3 and 4 are a scalar search and a fixed
@@ -477,7 +436,7 @@ Status refine(
       for (std::size_t column = 0; column < kRefinedRows.size(); ++column) {
         trial[kRefinedRows[column]] += scale * step[static_cast<Eigen::Index>(column)];
       }
-      if (within_limits(limits, trial)) {
+      if (limits.contains(trial)) {
         Placement candidate;
         const Status status = settle(model, request.payload, trial, candidate, calls);
         if (!status.ok()) {
@@ -520,7 +479,7 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
     return Result<IkSolution>::failure(
       failure(ErrorCode::NonFiniteInput, "the goal pose is not finite"));
   }
-  if (!inside(limits.axis[5], request.q8)) {
+  if (!limits.axis[5].contains(request.q8)) {
     return Result<IkSolution>::failure(
       failure(
         ErrorCode::InvalidArgument,
@@ -644,7 +603,7 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
     // Clamped, because a rotator range the description states is a range the
     // solution has to be inside anyway; letting the correction walk out of it and
     // refusing at the end would throw away the reachable part of the goal.
-    q7 = clamp_to(limits.axis[4], q7 - yaw_error / sensitivity);
+    q7 = limits.axis[4].clamp(q7 - yaw_error / sensitivity);
     q[6] = q7;
     status = settle(model, request.payload, q, placement, calls);
     if (!status.ok()) {
@@ -735,7 +694,7 @@ crane_model::Result<IkSolution> solve_inverse_kinematics(
         " rad of yaw residual against eps_yaw = " + std::to_string(settings.eps_yaw) + " rad" +
         unreachable));
   }
-  if (!within_limits(limits, best.q)) {
+  if (!limits.contains(best.q)) {
     return Result<IkSolution>::failure(
       failure(
         ErrorCode::InvalidArgument,

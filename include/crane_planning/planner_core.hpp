@@ -6,7 +6,8 @@
 // `wiki/robot_model.md` 2.2 followed by the structured lift/traverse/descend
 // primitive of `trajectory_planning` 4.4, built `C2` in sigma; the timing stage
 // is the path-constrained optimal control problem of 5.2, solved with acados
-// over `crane_model`'s symbolic graph -- the sway carried as a state, the
+// over the checked-in solver generated from the shared Python model -- the sway
+// carried as a state, the
 // cylinder force and pump flow constrained out of the same expressions
 // `crane_mpc` will use, and the kappa margin of 5.5 held back for the
 // controller. The scaled ramp it replaced is still in the package, as the
@@ -40,8 +41,8 @@
 // is why it is an order rather than a choice: a sampling planner is stochastic
 // and its runtime is not bounded, so primitive-first is what gives deterministic
 // latency in the common case and leaves completeness to the rare one. The
-// fallback of `sampling_planner.hpp` therefore runs only after
-// `build_structured_primitive` has been asked and refused -- never beside it, and
+// fallback of `ompl_path_planner.hpp` therefore runs only after
+// `OMPL path search` has been asked and refused -- never beside it, and
 // never to compare the two.
 //
 // Which one answered travels out on `MotionPlan::mechanism`, because a caller
@@ -69,11 +70,8 @@
 #include "crane_planning/inverse_kinematics.hpp"
 #include "crane_planning/joint_limits.hpp"
 #include "crane_planning/replanning.hpp"
-#include "crane_planning/sampling_planner.hpp"
-#include "crane_planning/structured_primitive.hpp"
+#include "crane_planning/ompl_path_planner.hpp"
 #include "crane_planning/timing_ocp.hpp"
-#include "crane_planning/tool_axis.hpp"
-#include "crane_planning/trajectory_timing.hpp"
 
 namespace crane_planning
 {
@@ -83,27 +81,8 @@ struct PlannerSettings
 {
   IkSettings ik{};
   EquilibriumIkSettings equilibrium{};
-  PrimitiveSettings primitive{};
-  SamplingSettings sampling{};      ///< the fallback of 4.4, reached only when the primitive is not
-  RampSettings ramp{};
-
-  /// The path-constrained OCP of 5.2, which is what times every plan.
-  /**
-   * `RampSettings` above no longer times anything a caller receives. It is kept
-   * because `scaled_ramp` and `scaled_ramp_along_path` are still the thing the
-   * timing tests pose the OCP against -- a ramp is the answer the machine would
-   * give with no dynamics in the loop, and the difference is what carrying the
-   * sway bought.
-   */
+  OmplSettings ompl{};
   TimingOcpSettings timing{};
-
-  /// The mounted tool's own axis, which `/crane/plan_grip`'s close and open drive.
-  /**
-   * Separate from `timing` because it is a property of the *tool* and not of the
-   * solve: which end of the description's range is a closed gripper, and how the
-   * transmission behaves across the travel. See `tool_axis.hpp`.
-   */
-  ToolAxisSettings tool_axis{};
 
   /// The hydraulic relief setting the cylinder force limit is derived from, Pa.
   /**
@@ -135,17 +114,6 @@ struct PlannerContext
   ArmGeometry geometry{};
   JointLimits limits{};
   PlannerSettings settings{};
-
-  /// The config the model was built from, kept because the OCP needs it.
-  /**
-   * `crane_model::symbolic::casadi_graph` takes a `ModelConfig` and not a
-   * `Model`: the model keeps its parse behind a private pimpl and its header is
-   * frozen, so there is no route from a `const Model &` to what it parsed. Issue
-   * 035's notes record that as structural rather than incidental. Holding the
-   * config here is what lets `plan_motion` build the graph for the same machine
-   * the `Model` describes instead of re-deriving one.
-   */
-  crane_model::ModelConfig model_config{};
 };
 
 /// Derive the context from one model and the config it was built from.
@@ -202,17 +170,9 @@ struct MotionPlan
   std::vector<crane_model::Pose> tcp_path{};  ///< for visualization only
   IkSolution endpoint{};
 
-  /// The geometry the trajectory was timed along, whichever mechanism produced it.
+  /// The C2 geometry the trajectory was timed along.
   GeometricPath path{};
-
-  /// Which of 4.4's two mechanisms that was. Never inferred, always carried.
-  PathMechanism mechanism{PathMechanism::StructuredPrimitive};
-
-  /// The primitive, when it was accepted. `mechanism` says whether it was.
-  StructuredPrimitive primitive{};
-
-  /// The sampled path, when the primitive was not. Same condition, other branch.
-  SamplingPlan sampled{};
+  OmplPlan geometry{};
 
   /// 7's initial condition, as it was actually posed to the OCP.
   /**
@@ -229,14 +189,6 @@ struct MotionPlan
   /// What each stage of this plan cost, against 7's budget. See `replanning.hpp`.
   std::vector<StageTiming> stages{};
 
-  /// Why the primitive was refused, when it was. Empty when it was accepted.
-  /**
-   * Kept rather than dropped because it is half of what a caller needs: a
-   * sampled answer without the reason the deterministic one could not be given
-   * leaves nobody able to tell an obstacle above the transfer altitude from an
-   * arm that could not reach the column above the goal.
-   */
-  std::string primitive_refusal{};
 };
 
 /// Plan one move, or refuse it and say what could not be done.

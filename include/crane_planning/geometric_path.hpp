@@ -59,14 +59,6 @@
 namespace crane_planning
 {
 
-/// The five path coordinates of `wiki/trajectory_planning.md` 4.1, as a vector.
-/**
- * `q_a = (q1, q2, q3, q4, q7)`. q8 is not in here on purpose: 4.1 says in as
- * many words that the tool coordinate is not a path variable. It rides the same
- * sigma and is carried on `PathSample` beside these five.
- */
-using PathVector = Eigen::Matrix<double, kPathDof, 1>;
-
 /// The path and its first two derivatives at one sigma.
 struct PathSample
 {
@@ -168,7 +160,7 @@ struct PathFitSettings
    * A segment whose waypoints coincide has a zero chord and therefore a zero
    * reference span, which ruckig cannot be asked for. It is given this instead,
    * so a degenerate segment is a very short one rather than a refusal — the
-   * primitive of `structured_primitive.hpp` produces one whenever the start is
+   * primitive of `ompl_path_planner.hpp` produces one whenever the start is
    * already at the transfer altitude.
    */
   double min_span{1.0e-3};

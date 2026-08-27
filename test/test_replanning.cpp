@@ -65,8 +65,8 @@ constexpr double kSeamRelativeTolerance = 0.15;
 
 /// How far into the first plan's rate profile the seam is taken.
 /**
- * Early in the lift, and the number is not decorative. A re-plan builds a **fresh**
- * structured primitive from the seam configuration, and that path's own start
+ * Early in the lift, and the number is not decorative. A re-plan searches a **fresh**
+ * path from the seam configuration, and that path's own start
  * region has a speed of its own: `q_a''(0) = 0` by construction, so stage 0's
  * acceleration row reads `|q_a'(0) sigma_ddot| <= kappa ddq^max` and bounds how
  * fast the solve may shed path rate over the first interval. A seam taken where
@@ -87,7 +87,7 @@ constexpr double kSeamSpeedFraction = 0.01;
  * probe and a cylinder-force derivation, and none of those is what is under test.
  * Only the PZS100 is exercised: every case below solves the OCP of 5.2 at some
  * seconds a plan, the second machine differs in the tool's reach rather than in
- * anything this issue changed, and `test_plan_grip.cpp` and `test_timing_ocp.cpp`
+ * anything this issue changed, and `test_plan_motion_service.cpp` and `test_timing_ocp.cpp`
  * already run both.
  */
 struct Fixture
@@ -218,7 +218,7 @@ TEST(Replanning, AReplanFromRestStillMeetsItsStartAtRest)
   ASSERT_FALSE(plan.stages.empty());
   const std::vector<std::string> expected{
     "the endpoint IK of robot_model 2.2",
-    "the structured primitive of trajectory_planning 4.4",
+    "OMPL RRT-Connect and C2 path fitting",
     "the path-constrained OCP of trajectory_planning 5.2",
     "the visualisation path"};
   std::vector<std::string> charged;
@@ -459,8 +459,8 @@ TEST(Replanning, TheBudgetFiresInThePlannerAndNamesTheStageThatOverran)
   auto later = crane_planning::plan_motion(
     fixture().model, budgeted(8.0, 5.0), request_from(at_rest(fixture().start)), &second);
   ASSERT_FALSE(later.ok());
-  EXPECT_EQ(second.overrun(), "the structured primitive of trajectory_planning 4.4");
-  EXPECT_NE(later.status().message.find("structured primitive"), std::string::npos)
+  EXPECT_EQ(second.overrun(), "OMPL RRT-Connect and C2 path fitting");
+  EXPECT_NE(later.status().message.find("OMPL RRT-Connect"), std::string::npos)
     << later.status().message;
   ASSERT_EQ(second.stages().size(), 2U);
   EXPECT_NEAR(second.stages().front().had_s, 8.0, 1.0e-12);

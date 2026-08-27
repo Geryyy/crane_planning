@@ -1,6 +1,6 @@
 // Stage 2 of `wiki/trajectory_planning.md` as 5.2 specifies it: the
 // path-constrained optimal control problem that carries the sway, solved with
-// acados over `crane_model`'s CasADi graph.
+// acados over the checked-in solver generated from the shared Python model.
 //
 // # Why an OCP and not retiming
 //
@@ -20,9 +20,8 @@
 //
 // with the passive rows of 5.2,
 // `ddq_u = -M_uu^-1 (M_ua ddq_a(sigma, sigma_dot, u) + h_u)`, taken from
-// `crane_model::symbolic::CasadiGraph::passive_rows` -- the same graph
-// `crane_mpc` exports its own model from, so there is one dynamics
-// implementation in the system and not two.
+// the shared Python model's passive rows -- the same model `crane_mpc` exports
+// its own solver from, so there is one dynamics implementation in the system.
 //
 // **The independent variable is sigma, not time.** 5.2 writes the traversal-time
 // objective as `int_0^1 dsigma / sigma_dot`, which is already an integral over
@@ -37,16 +36,15 @@
 // # What is shared with the MPC, and why that is the point
 //
 // The force and flow expressions are **not restated here**. They are read out of
-// the graph's output map `z`, which is where `wiki/mpc.md` 3 constraints 6 and 7
+// the generated output map `z`, which is where `wiki/mpc.md` 3 constraints 6 and 7
 // live, including the smoothing 3.1 requires -- `A^{+-}(v) sqrt(v^2 + eps^2)`
-// with a `tanh` of width `eps_v`, already compiled into the graph. 5.3's
+// with a `tanh` of width `eps_v`, already compiled into the generated artifact. 5.3's
 // **"a reference the MPC would reject is a planner bug"** then holds by
 // construction rather than by agreement between two implementations.
 //
 // # The tool coordinate is not timed here, and the tool link is not removed
 //
-// 4.1 already says `q8` is **not a path variable** and `tool_axis.hpp` is the
-// primitive that drives it on the arm's own clock. This OCP takes the same view
+// 4.1 already says `q8` is **not a path variable**. This OCP takes the same view
 // one step further: the tool is opened and closed by the low-level
 // velocity/position controller, so no timing chosen here can move it, and it
 // therefore has **no row in the constraint vector** -- not in the acceleration
@@ -83,10 +81,20 @@
 #include "crane_model/model.hpp"
 #include "crane_planning/geometric_path.hpp"
 #include "crane_planning/joint_limits.hpp"
-#include "crane_planning/trajectory_timing.hpp"
 
 namespace crane_planning
 {
+
+struct TimedTrajectory
+{
+  std::vector<double> time_from_start;
+  std::vector<crane_model::QA> q_a_ref;
+  std::vector<crane_model::DQA> dq_a_ref;
+  double duration{};
+  double limiting_fraction{};
+};
+
+[[nodiscard]] crane_model::Status check_margin_factor(double margin_factor);
 
 /// The machine's actuation limits, unscaled. `kappa` is applied to these.
 /**
@@ -96,10 +104,8 @@ namespace crane_planning
  * 3 and 4, and the cylinder force limit that no existing planner enforces
  * (`wiki/trajectory_planning.md` 3).
  *
- * Both per-axis rows are six long, because the machine has six axes and
- * `tool_axis.hpp` reads the tool's own entries out of this same struct. The OCP
- * bounds the five path coordinates; `[kToolRow]` of each is carried for that other
- * consumer and is not a bound this solve imposes.
+ * Both per-axis rows are six long because the full machine model has six
+ * actuated axes. The OCP bounds the five path coordinates and pins the tool row.
  */
 struct ActuationLimits
 {
@@ -109,7 +115,7 @@ struct ActuationLimits
 
   /// `F_i^max`, newtons, the right-hand side of mpc.md 3 constraint 6.
   /**
-   * The constraint the graph's output map states is `|F_cyl,i| <= F_i^max`, with
+   * The constraint the generated output map states is `|F_cyl,i| <= F_i^max`, with
    * `F_cyl = tau_a,i / J_c,ii` -- so the configuration dependence of
    * `|tau_i| <= J_c,ii F_i^max` is carried by the transmission and the number
    * here is a plain cylinder force.
@@ -290,14 +296,14 @@ struct PeakDemand
  * The trajectory is resampled onto a uniform time grid and carries the six
  * actuated rows only, which is what a reference is. This is the solve itself:
  * the sway states 5.2 carries and the two constrained quantities read off the
- * graph's output map, at the nodes the constraints were actually imposed at.
+ * generated output map, at the nodes the constraints were actually imposed at.
  *
  * It exists so that the two things this issue's acceptance turns on are
  * *checkable from outside* rather than only believed. 5.4's terminal condition
  * is a statement about `q_u` and `dq_u`, which a six-row reference cannot show;
- * and "the planner's flow is the graph's flow, not a second copy of it" is a
- * claim a test can only settle by re-evaluating the graph at the same points and
- * comparing. Both are what `test_timing_ocp.cpp` does with this.
+ * and "the planner's flow is the shared model's flow, not a second copy of it"
+ * is a claim guarded by the generated row-layout contract in
+ * `test_timing_ocp.cpp`.
  */
 struct OcpNode
 {
@@ -403,17 +409,16 @@ derive_cylinder_force_limits(const crane_model::Model & model, double system_pre
 
 /// Solve 5.2's OCP along `path`, or refuse and say what the solver said.
 /**
- * `model_config` is the one `model` was built from: the CasADi graph is built by
- * `crane_model::symbolic::casadi_graph`, which takes a `ModelConfig` and not a
- * `Model` because the model keeps its parse behind a private pimpl and its
- * header is frozen.
+ * The generated artifact is selected from the numeric model's tool identity;
+ * CasADi and the symbolic model are export-time concerns and are not present in
+ * this runtime API.
  *
  * A solve that does not converge is a failure carrying acados' own status word,
  * never a partial or clipped trajectory -- `wiki/mpc.md` 5.3 requirement 1 binds
  * the planner exactly as it binds the controller.
  */
 [[nodiscard]] crane_model::Result<TimingSolution> solve_timing_ocp(
-  const crane_model::Model & model, const crane_model::ModelConfig & model_config,
+  const crane_model::Model & model,
   const GeometricPath & path, const JointLimits & limits, const TimingOcpRequest & request,
   const TimingOcpSettings & settings);
 

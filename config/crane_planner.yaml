@@ -22,29 +22,6 @@ crane_planner:
     # canonical coordinate is, and nothing else in this file changes with it.
     tool: pzs100
 
-    # **The one fact about the mounted tool the description does not carry**, and
-    # the only entry in this file whose right value differs per machine: which end
-    # of the range the URDF gives the tool axis is a closed gripper.
-    # `/crane/plan_grip`'s PHASE_CLOSE drives q8 to it, PHASE_OPEN to the other.
-    #
-    # Measured on the 7040 -- issue 037's notes probed the jaw four-bar across
-    # `theta10_outer_jaw_joint`'s 0 ... 3.15 rad and record that the cylinder
-    # retracts as the outer jaw opens, so that range starts at the jaws together.
-    # **Assumed on the PZS100**, whose `q9_left_rail_joint` runs 0.2 ... 0.7 m
-    # with nothing in this workspace recording which way its rails travel; the
-    # entry below is the reading a rail pair opening outward from a 0.2 m minimum
-    # has, and commissioning_prerequisites.md item 4 already owns that axis. A
-    # deployment that measures its own tool replaces this line.
-    #
-    # The two numbers under it are the probe that finds the 7040 jaw's
-    # transmission reversal -- issue 037 measured it at q8 ~= 0.29 rad, well
-    # inside the joint's own range -- because at a reversal the cylinder moves the
-    # jaw through no distance at all and the axis is not controllable. A close or
-    # an open that would span it is refused naming the crossing, never clipped to
-    # it and never planned through.
-    gripper_closed_end: lower
-    gripper_transmission_samples: 65
-    gripper_transmission_floor: 1.0e-3
 
     # The acceptance test of wiki/robot_model.md 2.2, in metres and radians.
     eps_pos: 0.001
@@ -80,17 +57,6 @@ crane_planner:
       length: 1.0e-6
       bearing: 1.0e-6
 
-    # The structured lift/traverse/descend primitive of
-    # wiki/trajectory_planning.md 4.4.  **The transfer altitude is not here**, and
-    # that is the point: 9's open items ask for it to come from the scene rather
-    # than be hard-coded as the legacy planner has it, so it is derived from the
-    # two endpoints raised by the mounted tool's own reach -- a different number
-    # for the rail gripper and for the jaw, both read off the model -- and from
-    # the obstacle extent once issue 041 supplies one.  These two are the only
-    # configured say in it and both are empty: a floor may raise the derivation
-    # and a ceiling may lower it, and neither may be it.
-    transfer_altitude_floor: []
-    transfer_altitude_ceiling: []
 
     # How sigma is distributed along that path.  Shape numbers, not machine
     # limits: sigma is a path parameter and not a time, and what the machine can
@@ -103,38 +69,31 @@ crane_planner:
     path_acceleration_span: 4.0
     path_jerk_span: 4.0
 
-    # **The fallback of 4.4, and it is second on purpose.**  It runs only after
-    # the primitive above has been generated, checked and refused — 4.4's own
-    # order, and its `[!important]` is the reason: a sampling planner is
-    # stochastic with an unbounded runtime, so primitive-first is what buys
-    # deterministic latency in the common case and leaves completeness to the
-    # rare one.  RRT-Connect over the five path coordinates of 4.1 and never the
-    # passive pair, cleared by the same collision check the primitive is, then
-    # shortcut, refitted C² and re-checked as 4.5 makes mandatory.
+    # **The sole geometric search.**  RRT-Connect runs for every request over
+    # the five path coordinates and never samples the passive pair. Its result
+    # is shortcut, fitted to a C² path, and re-checked before timing; there is
+    # no structured planner or fallback branch.
     #
-    # The seed is a constant and not a clock: two identical requests against one
-    # scene give one answer, and a test gets the answer the deployment would.
-    # The two caps are the bound and both are per call — the wall clock, and the
-    # configurations the search may check, which is the half that does not depend
-    # on how fast the machine running the planner is.  Exhausting either is a
-    # refusal naming it.  The replanning loop's own latency bound is issue 045's
-    # and is not this.
-    sampling_seed: 20420042
-    sampling_time_budget: 5.0
-    sampling_max_validity_checks: 4000
-    sampling_extension_span: 2.0
+    # The seed is a constant and not a clock: identical requests against one
+    # scene are reproducible. The two caps are per call — wall clock and the
+    # number of configurations checked, the latter independent of host speed.
+    # Exhausting either is a refusal naming the exhausted budget; the overall
+    # replanning bound is charged separately by latency_budget.
+    ompl_seed: 20420042
+    ompl_time_budget: 5.0
+    ompl_max_validity_checks: 4000
+    ompl_extension_span: 2.0
     shortcut_attempts: 120
     # Half a turn either side of what the endpoints ask for, for the rotator,
     # which is a `continuous` joint and therefore has no range in the description
     # to sample from.  Every distinct pose it has is in there, because q7 and
     # q7 + 2π are the same geometry.
-    sampling_unbounded_margin: 3.141592653589793
+    ompl_unbounded_margin: 3.141592653589793
 
     # The emitted reference: 25 Hz, which is the rate the horizon is consumed at
     # (ROS 2 Interfaces 4), and a floor so that a goal a few millimetres away is
     # still a trajectory rather than a step.
     Ts: 0.04
-    min_duration: 0.5
 
     # **The admissible sway bound, and this is where it lives.**  wiki/mpc.md 3
     # constraint 3 imposes `|q_u - q_eq| <= q_u^+` as a state box, the swing

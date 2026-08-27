@@ -16,6 +16,7 @@
 #include "crane_planning/a2b_adapter.hpp"
 #include "crane_planning/crane_planner_parameters.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "trajectory_msgs/msg/joint_trajectory_point.hpp"
 
 namespace
@@ -52,19 +53,6 @@ bool passive_policy_from_string(
   return false;
 }
 
-/// Which end of the tool axis's range a deployment says is a closed gripper.
-bool tool_end_from_string(const std::string & name, crane_planning::ToolEnd & end)
-{
-  if (name == "lower") {
-    end = crane_planning::ToolEnd::Lower;
-    return true;
-  }
-  if (name == "upper") {
-    end = crane_planning::ToolEnd::Upper;
-    return true;
-  }
-  return false;
-}
 
 /// The message's shape enumeration, as `crane_model`'s.
 /**
@@ -182,59 +170,45 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.equilibrium.max_iterations =
     static_cast<std::size_t>(parameters.nlp_max_iterations);
   settings_.equilibrium.max_wall_clock_s = parameters.nlp_max_wall_clock;
-  // An empty list is "no floor" and one element is the floor. The bound is
-  // optional in the derivation itself (structured_primitive.hpp), so it is
-  // optional here too rather than being a sentinel number a reader has to know
-  // about; `size_lt<>` on the parameter is what keeps the list from carrying a
-  // second one.
-  if (!parameters.transfer_altitude_floor.empty()) {
-    settings_.primitive.altitude.floor_m = parameters.transfer_altitude_floor.front();
-  }
-  if (!parameters.transfer_altitude_ceiling.empty()) {
-    settings_.primitive.altitude.ceiling_m = parameters.transfer_altitude_ceiling.front();
-  }
-  settings_.primitive.fit.rate_headroom = parameters.path_rate_headroom;
-  settings_.primitive.fit.acceleration_span = parameters.path_acceleration_span;
-  settings_.primitive.fit.jerk_span = parameters.path_jerk_span;
+  settings_.ompl.fit.rate_headroom = parameters.path_rate_headroom;
+  settings_.ompl.fit.acceleration_span = parameters.path_acceleration_span;
+  settings_.ompl.fit.jerk_span = parameters.path_jerk_span;
 
   // The fallback of trajectory_planning 4.4, which runs only when the primitive
   // above has been generated, checked and refused. The seed is a parameter and a
   // constant: a stochastic planner answering two identical requests with two
   // different paths is not something an operator or a test can reason about.
-  settings_.sampling.seed = static_cast<std::uint32_t>(parameters.sampling_seed);
-  settings_.sampling.time_budget_s = parameters.sampling_time_budget;
-  settings_.sampling.max_validity_checks =
-    static_cast<std::size_t>(parameters.sampling_max_validity_checks);
-  settings_.sampling.extension_span = parameters.sampling_extension_span;
-  settings_.sampling.shortcut_attempts =
+  settings_.ompl.seed = static_cast<std::uint32_t>(parameters.ompl_seed);
+  settings_.ompl.time_budget_s = parameters.ompl_time_budget;
+  settings_.ompl.max_validity_checks =
+    static_cast<std::size_t>(parameters.ompl_max_validity_checks);
+  settings_.ompl.extension_span = parameters.ompl_extension_span;
+  settings_.ompl.shortcut_attempts =
     static_cast<std::size_t>(parameters.shortcut_attempts);
-  settings_.sampling.unbounded_margin_rad = parameters.sampling_unbounded_margin;
+  settings_.ompl.unbounded_margin_rad = parameters.ompl_unbounded_margin;
 
   // The sway envelope of trajectory_planning 4.3, at the bound mpc 3 constraint
   // 3 imposes. `fixed_size<>` on the parameter is what keeps this pair a pair.
-  settings_.primitive.collision.sway.q_sway_max =
+  settings_.ompl.collision.sway.q_sway_max =
     Eigen::Vector2d(parameters.q_sway_max.at(0), parameters.q_sway_max.at(1));
-  settings_.primitive.collision.resolution_m = parameters.check_resolution;
-  settings_.primitive.collision.min_resolution_m = parameters.min_check_resolution;
-  settings_.primitive.collision.max_samples =
+  settings_.ompl.collision.resolution_m = parameters.check_resolution;
+  settings_.ompl.collision.min_resolution_m = parameters.min_check_resolution;
+  settings_.ompl.collision.max_samples =
     static_cast<std::size_t>(parameters.max_check_samples);
-  settings_.primitive.collision.max_sway_samples =
+  settings_.ompl.collision.max_sway_samples =
     static_cast<std::size_t>(parameters.max_sway_samples);
   truck_.runge_dimensions_m = Eigen::Vector3d(
     parameters.truck.runge_dimensions.at(0), parameters.truck.runge_dimensions.at(1),
     parameters.truck.runge_dimensions.at(2));
   truck_.station_offsets_m = parameters.truck.runge_stations;
   truck_.bed_thickness_m = parameters.truck.bed_thickness;
-  settings_.primitive.collision.truck = truck_;
+  settings_.ompl.collision.truck = truck_;
 
   // The second half of robot_model 2.2 step 3's redundancy score. Both routes
   // spend the leftover freedom the same way, so both carry the same weights.
   settings_.ik.redundancy.clearance = parameters.clearance_weight;
   settings_.ik.redundancy.clearance_reference_m = parameters.clearance_reference;
   settings_.equilibrium.redundancy = settings_.ik.redundancy;
-
-  settings_.ramp.Ts = parameters.Ts;
-  settings_.ramp.min_duration = parameters.min_duration;
 
   // trajectory_planning 5.5 and 5.2. kappa is the deployment's reservation and
   // is deliberately not reachable from a request: `speed_scale` arrives per call
@@ -245,6 +219,38 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.timing.actuation.pump_flow_max = parameters.pump_flow_max;
   settings_.timing.actuation.pump_flow_planning_factor =
     parameters.pump_flow_planning_factor;
+
+  // The rest of 5.2's OCP. Every one of these used to be a default on
+  // `TimingOcpSettings` and reachable only by editing a header, which made the
+  // offline tuning runner's own copy of them the second place the same number
+  // lived. They are parameters now, so a tuning session ends in a config file
+  // this node reads rather than in a rebuild.
+  settings_.timing.intervals = static_cast<std::size_t>(parameters.ocp.intervals);
+  settings_.timing.sway_weight = parameters.ocp.sway_weight;
+  settings_.timing.input_weight = parameters.ocp.input_weight;
+  settings_.timing.sigma_rate_min = parameters.ocp.sigma_rate_min;
+  settings_.timing.sigma_rate_max = parameters.ocp.sigma_rate_max;
+  settings_.timing.sigma_accel_max = parameters.ocp.sigma_accel_max;
+  settings_.timing.max_wall_clock = parameters.ocp.max_wall_clock;
+  settings_.timing.max_iterations = parameters.ocp.max_iterations;
+  settings_.timing.tolerance_stationarity = parameters.ocp.tolerance_stationarity;
+  settings_.timing.tolerance_feasibility = parameters.ocp.tolerance_feasibility;
+  settings_.timing.levenberg_marquardt = parameters.ocp.levenberg_marquardt;
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    settings_.timing.actuation.ddq_a_max[row] = parameters.ocp.ddq_a_max.at(row);
+  }
+  // mpc 3 constraints 3 and 4. The position half is `q_sway_max` -- the *same*
+  // parameter the sway envelope of 4.3 clears the path over, read once here so
+  // that "any sway the MPC permits is sway the path was cleared for" holds by
+  // construction rather than by two parameters agreeing.
+  for (std::size_t row = 0; row < crane_model::kPassiveDof; ++row) {
+    settings_.timing.q_u_max[row] = parameters.q_sway_max.at(row);
+    settings_.timing.dq_u_max[row] = parameters.ocp.dq_sway_max.at(row);
+  }
+  settings_.timing.start_resolution.q_u = parameters.start_resolution.q_u;
+  settings_.timing.start_resolution.dq_u = parameters.start_resolution.dq_u;
+  settings_.timing.start_resolution.sigma_rate_fraction =
+    parameters.start_resolution.sigma_rate_fraction;
   settings_.system_pressure_pa = parameters.system_pressure_pa;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
   max_input_age_ = parameters.max_input_age;
@@ -270,22 +276,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
             parameters.passive_estimate_policy + "'");
   }
 
-  // The one fact about the mounted tool the description does not carry: which
-  // end of the range it gives the tool axis is a closed gripper. `one_of<>` on
-  // the parameter already refuses anything else, so reaching the throw means the
-  // two lists have drifted apart. `tool_axis.hpp` records what the evidence for
-  // the default is on each machine, and that it is measured on one of them and
-  // assumed on the other.
-  if (!tool_end_from_string(parameters.gripper_closed_end, settings_.tool_axis.closed_end)) {
-    throw std::runtime_error(
-            "crane_planner: unknown gripper_closed_end '" + parameters.gripper_closed_end + "'");
-  }
-  settings_.tool_axis.transmission_samples =
-    static_cast<std::size_t>(parameters.gripper_transmission_samples);
-  settings_.tool_axis.transmission_floor = parameters.gripper_transmission_floor;
-
   reference_ = create_publisher<trajectory_msgs::msg::JointTrajectory>(
     kReferenceTopic, reference_qos());
+  planned_path_ = create_publisher<nav_msgs::msg::Path>(
+    kPlannedPathTopic, reference_qos());
   joint_states_subscription_ = create_subscription<sensor_msgs::msg::JointState>(
     kJointStatesTopic, input_qos(),
     [this](sensor_msgs::msg::JointState::ConstSharedPtr message) {
@@ -321,13 +315,6 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
       crane_msgs::srv::PlanMotion::Response::SharedPtr response) {
       plan(*request, *response);
     });
-  plan_grip_ = create_service<crane_msgs::srv::PlanGrip>(
-    kPlanGripService,
-    [this](
-      crane_msgs::srv::PlanGrip::Request::SharedPtr request,
-      crane_msgs::srv::PlanGrip::Response::SharedPtr response) {
-      grip(*request, *response);
-    });
   // The compatibility row of ROS 2 Interfaces 9, on this node and not on one of
   // its own: it is an adapter over `plan` above, so a second node would be a
   // second copy of the start state, the scene and the standing reference. It
@@ -346,39 +333,21 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     "transient-local. This is the slice-5 tracer: a goal here is a placement goal, so the "
     "endpoint is the equilibrium-constrained IK of wiki/robot_model.md 2.2 -- the passive pair "
     "is a decision variable under g_u(q) = 0 rather than a pinning, so the tool arrives at rest "
-    "-- the geometry is the structured lift/traverse/descend primitive of trajectory_planning "
-    "4.4, built C2 in sigma with its transfer altitude derived from the endpoints and the tool's "
-    "own reach rather than hard-coded. "
+    "-- geometry is found by OMPL RRT-Connect over the five controllable path coordinates, "
+    "then shortcut, fitted C2 and re-checked before timing. "
     "The path is checked against %s -- the scene, the truck bed and the runges of "
     "trajectory_planning 4.2 keyed to the measured truck pose, and the crane against itself -- "
-    "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3. A primitive that is "
-    "blocked falls back to the RRT-Connect sampling planner of 4.4 over the five path coordinates "
-    "of 4.1, shortcut, refitted C2 and re-checked as 4.5 makes mandatory, from a fixed seed and "
-    "inside a per-call budget -- and which of the two answered is in every reply. The timing is "
+    "over the sway envelope of 4.3 at the q_sway_max of mpc 3 constraint 3, from a fixed seed "
+    "and inside a per-call budget. The timing is "
     "the path-constrained OCP of trajectory_planning 5.2, solved with acados over crane_model's "
-    "symbolic graph: the sway is a state, so 5.4's terminal condition makes the tool arrive "
+    "generated Python-model solver: the sway is a state, so 5.4's terminal condition makes the "
+    "tool arrive "
     "hanging still, and the cylinder force and pump flow are constrained by the same expressions "
     "mpc 3 constrains them with rather than by a second copy of them. kappa = %.2f of 5.5 is held "
     "back from every physical limit for the MPC to correct with, and a caller's speed_scale "
     "cannot reach it. A solve that does not converge is a refusal carrying the solver's own "
     "status word, never a clipped trajectory.",
     kPlanMotionService, kReferenceTopic, kCollisionSceneTopic, settings_.timing.kappa);
-
-  RCLCPP_INFO(
-    get_logger(),
-    "crane_planner: %s answers the four phases of crane_msgs/PlanGrip on the same six actuated "
-    "joints, the same stamp semantics and the same %s republication. Descend and lift are arm "
-    "motions and are planned by the very same call /crane/plan_motion is -- same endpoint, same "
-    "primitive, same collision check, same sway envelope, same kappa -- with the transfer "
-    "altitude's ceiling lowered to the phase's own endpoints so a descend goes across and down "
-    "rather than up, across and down. Close and open drive q8 alone, on the retained cosine "
-    "primitive of trajectory_planning 8 carried on the rate so it is C2 at both ends, inside the "
-    "tool axis's own velocity, acceleration and pump-flow limits, and emitted on the arm's own "
-    "sample period beside the five held path coordinates -- 4.1's one clock. The %s end of the "
-    "range the description gives the tool axis is taken to be the closed gripper. A travel that "
-    "spans a reversal of that axis's transmission ratio is refused naming the crossing, never "
-    "planned through: at the crossing the cylinder moves the tool through no distance at all.",
-    kPlanGripService, kReferenceTopic, tool_end_name(settings_.tool_axis.closed_end));
 
   RCLCPP_INFO(
     get_logger(),
@@ -612,8 +581,7 @@ bool PlannerNode::read_passive(PassiveStart & passive, std::string & why) const
     } else if (!std::isfinite(pendulum_state_->position[0]) ||
       !std::isfinite(pendulum_state_->position[1]) ||
       !std::isfinite(pendulum_state_->velocity[0]) ||
-      !std::isfinite(pendulum_state_->velocity[1]))
-    {
+      !std::isfinite(pendulum_state_->velocity[1])) {
       absence = std::string("the newest ") + kPendulumStateTopic +
         " is fresh and valid but does not carry four finite numbers";
     }
@@ -962,6 +930,11 @@ void PlannerNode::plan_with_start(
   // that was adopted: a refusal returns above without touching it.
   standing_ = trajectory;
   reference_->publish(trajectory);
+  nav_msgs::msg::Path planned_path;
+  planned_path.header.frame_id = kPlanningFrame;
+  planned_path.header.stamp = origin;
+  planned_path.poses = response.tcp_path;
+  planned_path_->publish(planned_path);
 
   response.success = true;
   // The residuals travel with the answer. wiki/implementation/style_guide.md 4
@@ -979,14 +952,9 @@ void PlannerNode::plan_with_start(
     std::to_string(motion_plan.endpoint.residual_equilibrium) +
     " rad off Model::passive_equilibrium, so the tool arrives at rest. The peak velocity is " +
     std::to_string(motion_plan.trajectory.limiting_fraction) +
-    " of the scaled limit. The geometry came from " + mechanism_name(motion_plan.mechanism) +
-    ", over " + std::to_string(motion_plan.path.segment_count()) + " segments in sigma. ";
-  // Which mechanism answered, in as many words, because a caller cannot
-  // otherwise tell a deterministic plan from a sampled one -- and 4.4's whole
-  // ordering argument is that the two are not the same product.
-  response.message += (motion_plan.mechanism == PathMechanism::SamplingFallback) ?
-    describe(motion_plan.sampled) :
-    describe(motion_plan.primitive.altitude) + ". " + motion_plan.primitive.check.note;
+    " of the scaled limit. The geometry has " +
+    std::to_string(motion_plan.path.segment_count()) + " C2 segments in sigma. " +
+    describe(motion_plan.geometry);
   // What the timing was, and what it cost the machine. `PeakDemand` is a fraction
   // of the **physical** limit, so a caller reads the margin directly rather than
   // taking on trust that kappa was applied: every number below sits at or under
@@ -994,7 +962,7 @@ void PlannerNode::plan_with_start(
   // with (trajectory_planning 5.5).
   const TimingSolution & timing = motion_plan.timing;
   response.message += ". The timing is the path-constrained OCP of trajectory_planning 5.2, "
-    "solved with acados over crane_model's symbolic graph in " +
+    "solved with the checked-in Python-model artifact in " +
     std::to_string(timing.solve_time) + " s and " + std::to_string(timing.iterations) +
     " SQP iterations (" + timing.solver_status +
     "): the sway is a state, so 5.4's terminal condition holds and the tool arrives hanging "
@@ -1020,158 +988,6 @@ void PlannerNode::plan_with_start(
   }
   if (!scene_note_.empty()) {
     response.message += ". As for the scene: " + scene_note_;
-  }
-  RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
-}
-
-void PlannerNode::grip(
-  const crane_msgs::srv::PlanGrip::Request & request,
-  crane_msgs::srv::PlanGrip::Response & response)
-{
-  response.success = false;
-  response.trajectory = trajectory_msgs::msg::JointTrajectory{};
-
-  // The same fallback `/crane/plan_motion` uses, for the same reason: a refused
-  // phase leaves the standing reference alone and says which one it is.
-  const auto refuse = [this, &response](std::string message) {
-      response.success = false;
-      response.trajectory = standing_.value_or(trajectory_msgs::msg::JointTrajectory{});
-      response.message = std::move(message) + ". " + describe_standing();
-      RCLCPP_WARN(get_logger(), "%s", response.message.c_str());
-    };
-
-  GripRequest grip_request;
-  if (!grip_phase_from_message(request.phase, grip_request.phase)) {
-    refuse(
-      "phase " + std::to_string(static_cast<int>(request.phase)) +
-      " is none of the four crane_msgs/PlanGrip defines -- PHASE_DESCEND, PHASE_CLOSE, "
-      "PHASE_OPEN, PHASE_LIFT. The .srv is frozen (PRD 15) and a fifth phase is a slice of its "
-      "own, so this is refused rather than mapped onto whichever of the four is nearest");
-    return;
-  }
-  const bool arm_phase = phase_moves_the_arm(grip_request.phase);
-
-  // The frame, on exactly the terms `/crane/plan_motion` checks it -- and only
-  // on the phases that read a pose. A close or an open moves the tool
-  // coordinate to the end of the range the description gives it and reads no
-  // goal at all, so demanding a frame of a field the phase does not use would
-  // refuse a well-formed request for a field it was right to leave empty.
-  if (arm_phase && request.goal.header.frame_id != kPlanningFrame) {
-    refuse(
-      "the goal of this " + std::string(grip_phase_name(grip_request.phase)) +
-      " phase is in frame '" + request.goal.header.frame_id + "', and this planner plans in '" +
-      std::string(kPlanningFrame) +
-      "'. ROS 2 Interfaces 5 makes the assembly planner the one element that converts world into " +
-      kPlanningFrame + "; nothing downstream of it converts, and this node does not either");
-    return;
-  }
-  if (!ready()) {
-    refuse(
-      std::string("no usable robot description has arrived on ") + kRobotDescriptionTopic +
-      " yet, so there is no model to plan against");
-    return;
-  }
-
-  MeasuredStart start;
-  std::string why;
-  if (!read_start(start, why)) {
-    refuse("no start state: " + why);
-    return;
-  }
-  if (!read_passive(start.passive, why)) {
-    refuse("no passive start state: " + why);
-    return;
-  }
-  grip_request.start = start;
-  grip_request.speed_scale = request.speed_scale;
-
-  if (arm_phase) {
-    grip_request.p_tcp_0 = Eigen::Vector3d(
-      request.goal.pose.position.x, request.goal.pose.position.y, request.goal.pose.position.z);
-    // ROS carries the quaternion scalar-last and Eigen scalar-first
-    // (wiki/nomenclature.md 5); the reorder is this boundary's job.
-    const Eigen::Quaterniond orientation(
-      request.goal.pose.orientation.w, request.goal.pose.orientation.x,
-      request.goal.pose.orientation.y, request.goal.pose.orientation.z);
-    if (!(orientation.norm() > 0.0)) {
-      refuse("the goal orientation is a zero quaternion");
-      return;
-    }
-    grip_request.phi_z_d = phi_z_of(orientation);
-    // `crane_msgs/PlanGrip` has no `avoid_collisions` row, and the frozen .srv
-    // is not amended for one (PRD 15). A grip's arm phase is the least
-    // forgiving move the machine makes -- it puts a tool between the runges --
-    // so the absent field is read as the checked plan and never as the blind
-    // one, and a request with no scene behind it is refused by `plan_motion`
-    // naming the topic.
-    grip_request.avoid_collisions = true;
-    grip_request.scene = scene_.has_value() ? &scene_.value() : nullptr;
-  }
-
-  if (!read_payload(request.payload, grip_request.payload, grip_request.payload_shape, why)) {
-    refuse(why);
-    return;
-  }
-  std::string payload_note;
-  read_payload_estimate(grip_request.payload, payload_note);
-
-  LatencyLedger ledger(settings_.latency);
-  auto solved = plan_grip(*model_, *context_, grip_request, &ledger);
-  if (!solved.ok()) {
-    std::string message = solved.status().message;
-    if (!ledger.overrun().empty()) {
-      message += ". This is the latency bound of trajectory_planning 7 firing and not the machine "
-        "refusing: nothing about the goal has been shown to be wrong";
-    }
-    if (!payload_note.empty()) {
-      message += ". As for the payload: " + payload_note;
-    }
-    if (arm_phase && !scene_note_.empty()) {
-      message += ". As for the scene: " + scene_note_;
-    }
-    refuse(std::move(message));
-    return;
-  }
-  const GripPlan & grip_plan = solved.value();
-
-  const rclcpp::Time origin(joint_states_->header.stamp);
-  response.trajectory = as_message(grip_plan.trajectory, origin);
-
-  // The reference the planner answered with, on the row ROS 2 Interfaces 4 gives
-  // it. A grip phase belongs on it for the reason trajectory_planning 4.1 gives:
-  // the MPC tracks all six actuated coordinates, so q8_ref has to have a
-  // producer while a grip is running, and the producer is this. Reached only by a
-  // phase that was adopted -- every refusal above returned without touching it.
-  standing_ = response.trajectory;
-  reference_->publish(response.trajectory);
-
-  response.success = true;
-  response.message = describe(grip_plan);
-  if (grip_plan.arm_phase) {
-    const TimingSolution & timing = grip_plan.motion.timing;
-    response.message += ". The endpoint IK closed to " +
-      std::to_string(grip_plan.motion.endpoint.residual_p) + " m and " +
-      std::to_string(grip_plan.motion.endpoint.residual_phi_z) +
-      " rad against forward kinematics, leaving the passive pair " +
-      std::to_string(grip_plan.motion.endpoint.residual_equilibrium) +
-      " rad off Model::passive_equilibrium -- so this phase ends at a genuine steady state of the "
-      "passive subsystem and not at a configuration with the passive joints pinned where they "
-      "happened to be measured. Of the physical limits the peak demand is " +
-      std::to_string(timing.peak_demand.joint_velocity) + " of joint velocity, " +
-      std::to_string(timing.peak_demand.joint_acceleration) + " of joint acceleration, " +
-      std::to_string(timing.peak_demand.cylinder_force) + " of cylinder force and " +
-      std::to_string(timing.peak_demand.pump_flow) + " of pump flow, under kappa = " +
-      std::to_string(timing.kappa) + " with speed_scale = " + std::to_string(timing.speed_scale);
-    response.message += ". " + grip_plan.motion.start_note;
-    if (!scene_note_.empty()) {
-      response.message += ". As for the scene: " + scene_note_;
-    }
-  }
-  response.message += ". " + describe(ledger) +
-    ", and this trajectory is now the one standing on " +
-    kReferenceTopic;
-  if (!payload_note.empty()) {
-    response.message += ". As for the payload: " + payload_note;
   }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }
