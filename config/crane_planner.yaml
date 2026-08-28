@@ -141,6 +141,26 @@ crane_planner:
     # whether the machine is moving is not one to plan a re-plan from.
     max_input_age: 0.5
 
+    # How old /crane/collision_scene may be and still be the world.  **Its own
+    # number, not `max_input_age`**: 0.5 s is the age of a 100 Hz measurement of
+    # a machine that moves, while the scene's rate is the world model's republish
+    # heartbeat — `collision_scene_heartbeat: 2.0` s in the perception
+    # orchestrator, which republishes on block motion *and* on that heartbeat so
+    # that an unchanged scene keeps saying so.  Ten seconds is five of those, so
+    # this fires on "the world model has stopped" and not on "nothing has moved
+    # lately".
+    #
+    # It matters because this subscription is transient-local depth 1: a scene
+    # published once is latched by the middleware and handed to every planner
+    # that starts afterwards, so without an age a dead world model reads as a
+    # live one.  Past the age the scene is never planned against; the request is
+    # *refused* when `avoid_collisions` is set — a trajectory certified clear of
+    # geometry that may have moved is a false statement, and this planner already
+    # refuses the adjacent case of `avoid_collisions` with no scene at all — and
+    # merely annotated when it is not, because a scene the request declined to
+    # use is no reason to stop a stationary site from planning.
+    max_scene_age: 10.0
+
     # **The passive half of that start state**, and what happens when it is not
     # there.  /crane/pendulum_state carries the sway at 100 Hz with a `valid`
     # flag; its 150 ms deadline is control_architecture §5.3's own row for this

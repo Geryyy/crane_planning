@@ -15,6 +15,7 @@
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_planning/a2b_adapter.hpp"
 #include "crane_planning/crane_planner_parameters.hpp"
+#include "crane_planning/scene_age.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "trajectory_msgs/msg/joint_trajectory_point.hpp"
@@ -254,6 +255,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   settings_.system_pressure_pa = parameters.system_pressure_pa;
   settings_.geometry_samples = static_cast<std::size_t>(parameters.geometry_samples);
   max_input_age_ = parameters.max_input_age;
+  max_scene_age_ = parameters.max_scene_age;
 
   // trajectory_planning 7, and the whole of issue 045. The rest thresholds decide
   // whether a request is a re-plan from a moving machine at all; the deadlines are
@@ -496,6 +498,11 @@ void PlannerNode::on_collision_scene(crane_msgs::msg::CollisionScene::ConstShare
     "legacy dimensions and keyed to that pose" :
     ". No primitive carried the reserved id 'truck', so no bed and no runges were placed";
   scene_.emplace(std::move(scene));
+  // The stamp travels with the scene and is judged at the request rather than
+  // here (`scene_age.hpp`): this subscription is transient-local, so for a
+  // latched scene this callback runs exactly once and an age computed in it
+  // would be zero forever.
+  scene_stamp_ = rclcpp::Time(message->header.stamp);
   RCLCPP_INFO(get_logger(), "%s", scene_note_.c_str());
 }
 
@@ -874,9 +881,27 @@ void PlannerNode::plan_with_start(
   std::string payload_note;
   read_payload_estimate(motion.payload, payload_note);
 
-  // The scene, if one has arrived. Whether its absence is fatal is the core's
-  // decision and depends on `avoid_collisions`, so the note travels either way.
-  motion.scene = scene_.has_value() ? &scene_.value() : nullptr;
+  // The scene, if one has arrived *and* is still the world. Whether its absence
+  // is fatal is the core's decision and depends on `avoid_collisions`, so the
+  // note travels either way; whether its age is fatal is `judge_scene`'s, for
+  // the reason written down in `scene_age.hpp`. The age is measured here and not
+  // in the callback, because the transient-local latch means the callback runs
+  // once and never again.
+  const SceneVerdict scene_verdict = judge_scene(
+    scene_.has_value(),
+    scene_.has_value() ? (now() - scene_stamp_).seconds() : 0.0,
+    max_scene_age_, request.avoid_collisions);
+  // `scene_note_` is what the last message *was*; the verdict is how old it has
+  // since become. Both reach the caller, and neither overwrites the other.
+  std::string scene_note = scene_note_;
+  if (!scene_verdict.note.empty()) {
+    scene_note += scene_note.empty() ? scene_verdict.note : ". Since then, " + scene_verdict.note;
+  }
+  if (scene_verdict.refuse) {
+    refuse("the scene this plan would have been checked against is not the world: " + scene_note);
+    return;
+  }
+  motion.scene = scene_verdict.plan_against ? &scene_.value() : nullptr;
 
   LatencyLedger ledger(settings_.latency);
   auto solved = plan_motion(*model_, *context_, motion, &ledger);
@@ -891,11 +916,11 @@ void PlannerNode::plan_with_start(
     if (!payload_note.empty()) {
       message += ". As for the payload: " + payload_note;
     }
-    if (!scene_note_.empty()) {
+    if (!scene_note.empty()) {
       // What the planner knows about the world it just refused to plan in. A
       // refusal that says "blocked" without saying which scene it was blocked
       // against leaves an operator nothing to act on.
-      message += ". As for the scene: " + scene_note_;
+      message += ". As for the scene: " + scene_note;
     }
     refuse(std::move(message));
     return;
@@ -986,8 +1011,8 @@ void PlannerNode::plan_with_start(
   if (!payload_note.empty()) {
     response.message += ". As for the payload: " + payload_note;
   }
-  if (!scene_note_.empty()) {
-    response.message += ". As for the scene: " + scene_note_;
+  if (!scene_note.empty()) {
+    response.message += ". As for the scene: " + scene_note;
   }
   RCLCPP_INFO(get_logger(), "%s", response.message.c_str());
 }

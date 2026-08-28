@@ -250,6 +250,9 @@ private:
   TruckModel truck_{};  ///< the vehicle's own geometry, keyed to the measured pose
   double max_input_age_{0.5};
 
+  /// `/crane/collision_scene`'s own freshness bound, s. See `scene_age.hpp`.
+  double max_scene_age_{10.0};
+
   /// `/crane/pendulum_state`'s own freshness deadline, s -- 5.3's table gives 150 ms.
   double pendulum_deadline_{0.15};
 
@@ -280,6 +283,15 @@ private:
   /// The newest usable scene, expanded. Absent until one arrives and converts.
   std::optional<crane_model::CollisionScene> scene_;
   std::string scene_note_;  ///< where it came from, or why the last one was refused
+
+  /// The stamp `scene_` carried, kept because the age is judged at the request.
+  /**
+   * A freshness check evaluated in the subscription callback cannot fire -- the
+   * case it exists for is the one where no callback runs again -- and for this
+   * topic that case is the normal one, because the subscription is
+   * transient-local and a latched scene arrives exactly once.
+   */
+  rclcpp::Time scene_stamp_{0, 0, RCL_ROS_TIME};
 
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_states_subscription_;

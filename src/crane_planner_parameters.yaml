@@ -478,6 +478,24 @@ crane_planner:
     validation:
       gt<>: [0.0]
 
+  max_scene_age:
+    type: double
+    default_value: 10.0
+    read_only: true
+    description: "Longest age of /crane/collision_scene that still counts as the
+      world, s, measured against the message's own header stamp. Deliberately not
+      max_input_age: that one is 0.5 s because /joint_states is a 100 Hz
+      measurement of a machine that moves, while the scene's natural rate is the
+      world model's republish heartbeat, which is seconds. The default assumes
+      the world model republishes at least every few seconds; the perception
+      orchestrator's collision_scene_heartbeat is 2.0 s, so 10 s is five
+      heartbeats and reads as 'the world model has stopped' rather than as
+      'nothing has moved lately'. Past it the scene is not planned against, and
+      the request is refused when avoid_collisions is set and annotated when it
+      is not."
+    validation:
+      gt<>: [0.0]
+
   pendulum_state_deadline:
     type: double
     default_value: 0.15

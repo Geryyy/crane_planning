@@ -530,6 +530,48 @@ TEST_F(PlanMotionService, ASceneInAnyOtherFrameIsRefusedNamingBoth)
     << response->message;
 }
 
+TEST_F(PlanMotionService, ASceneOlderThanMaxSceneAgeIsRefusedRatherThanPlannedAgainst)
+{
+  // The whole of issue 096, end to end. This subscription is transient-local
+  // depth 1, so the middleware hands a scene published once to every planner
+  // that starts afterwards, for the rest of the session -- and before 096 the
+  // node read `header.frame_id` and nothing else, so a latch of a world that had
+  // since been rebuilt read exactly like the world. Here the scene is stamped
+  // well past `max_scene_age` on arrival, which is the same thing the latch does
+  // slowly, and the answer has to say so.
+  crane_msgs::msg::CollisionScene scene;
+  scene.header.frame_id = crane_planning::kPlanningFrame;
+  scene.header.stamp = client_node_->now() - rclcpp::Duration::from_seconds(600.0);
+  collision_scene_->publish(scene);
+  publish_start();
+  settle();
+
+  auto request = collision_blind_request();
+  request->avoid_collisions = true;
+  const auto refused = call(request);
+  ASSERT_NE(refused, nullptr);
+  EXPECT_FALSE(refused->success) << refused->message;
+  EXPECT_NE(refused->message.find("max_scene_age"), std::string::npos) << refused->message;
+  EXPECT_NE(refused->message.find("transient-local"), std::string::npos) << refused->message;
+  EXPECT_TRUE(refused->trajectory.points.empty());
+
+  // ...and the other half of the decision: a caller that did not ask to avoid
+  // collisions is not stopped by a scene it was not going to use. This goal is
+  // out of reach, so the plan refuses for its own reason -- what is asserted is
+  // that the reason is not the scene's age, and that the age is still stated.
+  publish_start();
+  settle();
+  const auto warned = call(out_of_reach_request());
+  ASSERT_NE(warned, nullptr);
+  EXPECT_FALSE(warned->success);
+  EXPECT_NE(warned->message.find("max_scene_age"), std::string::npos) << warned->message;
+  EXPECT_NE(warned->message.find("avoid_collisions is clear"), std::string::npos)
+    << warned->message;
+
+  settle();
+  EXPECT_TRUE(published_.empty());
+}
+
 TEST_F(PlanMotionService, ASubscribedSceneBecomesTheTruckOfTrajectoryPlanningFourTwo)
 {
   // One primitive with the reserved id `truck`, parked well clear of this goal,

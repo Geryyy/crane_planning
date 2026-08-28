@@ -101,6 +101,7 @@ add_library(planner_core STATIC
   src/joint_limits.cpp
   src/planner_core.cpp
   src/replanning.cpp
+  src/scene_age.cpp
   src/ompl_path_planner.cpp
   src/timing_ocp.cpp)
 add_library(${PROJECT_NAME}::planner_core ALIAS planner_core)
@@ -375,6 +376,14 @@ if(BUILD_TESTING)
   # out of the two checked-in descriptions. Cheap: nothing here plans, because
   # what is under test is what the planner is *asked*, and
   # `test_plan_motion_service.cpp` is where the served row is.
+  # The freshness of `/crane/collision_scene`, offline. No node, no clock, no
+  # graph: `judge_scene` takes an age and a bound and returns what to do, so the
+  # three cases the planner has to tell apart -- never received, fresh, stale --
+  # are asserted without a middleware that would have to be made to hold a scene
+  # for ten seconds to produce one of them. Cheap: nothing here plans.
+  ament_add_gtest(test_scene_age test/test_scene_age.cpp TIMEOUT 60)
+  target_link_libraries(test_scene_age planner_core)
+
   ament_add_gtest(test_a2b_adapter test/test_a2b_adapter.cpp TIMEOUT 300)
   target_link_libraries(test_a2b_adapter
     planner_node
