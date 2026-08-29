@@ -534,7 +534,7 @@ class CranePlanner(Node):
         # The goal and the geometry are drawn **before** the solve, so that a
         # refusal leaves them on screen. "It said no" and "it said no, and here
         # is the runge it would have hit" are very different messages.
-        checked = self.planner.prepare_scene(start, shape, primitives, avoid_collisions)
+        checked = self.planner.prepare_scene(primitives, avoid_collisions)
         stamp = self.get_clock().now().to_msg()
         standing = viz.scene(checked, PLANNING_FRAME, stamp) + viz.goal(
             position_m, yaw, PLANNING_FRAME, stamp
@@ -551,7 +551,16 @@ class CranePlanner(Node):
             avoid_collisions=avoid_collisions,
             speed_scale=speed_scale,
         )
-        self._draw(standing + viz.plan(self.planner.model, plan, PLANNING_FRAME, stamp))
+        self._draw(
+            standing
+            + viz.plan(
+                self.planner.model,
+                plan,
+                PLANNING_FRAME,
+                stamp,
+                shape if avoid_collisions else None,
+            )
+        )
         trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
         path = self._path(plan)
         self.standing = trajectory

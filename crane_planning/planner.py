@@ -252,11 +252,17 @@ def payload_primitive(
     model: CraneModel, q: np.ndarray, payload_shape
 ) -> CollisionPrimitive | None:
     """
-    Return what is in the gripper, as a scene body at the K8 pose.
+    Return what is in the gripper, as a body at the K8 pose of `q`.
 
-    The frozen model collision API takes no payload, so a carried block is put
-    into the scene instead -- otherwise a plan is certified clear of everything
-    except the thing the crane is holding.
+    The model's collision API takes no payload, so a carried block is handed to
+    it as a scene body instead -- otherwise a plan is certified clear of
+    everything except the thing the crane is holding. It is marked
+    `attached_to_tool`, which is what keeps the grip itself from reading as a
+    collision and what gets the body checked against the obstacles.
+
+    **It is placed per configuration and not once.** A payload pinned at the
+    pose the machine set off from is a ghost standing in the start pose while
+    the real one rides the tool through the scene unchecked.
     """
     if payload_shape is None:
         return None
@@ -271,6 +277,7 @@ def payload_primitive(
         pose_in_mounting_base=placement,
         dimensions_m=np.asarray(dimensions, dtype=float),
         structural=False,
+        attached_to_tool=True,
     )
 
 
@@ -404,6 +411,7 @@ class Geometry:
         config: PlannerConfig,
         q_tool: float,
         payload: np.ndarray,
+        payload_shape=None,
     ):
         self.model = model
         self.equilibrium = equilibrium
@@ -411,8 +419,14 @@ class Geometry:
         self.config = config
         self.q_tool = float(q_tool)
         self.payload = payload
+        self.payload_shape = payload_shape
         self.envelope = self._envelope()
         self.step_m = self._resolution()
+
+    def bodies(self, q: np.ndarray) -> list:
+        """Return the scene at `q`, with what the tool carries placed on it."""
+        carried = payload_primitive(self.model, q, self.payload_shape)
+        return self.scene if carried is None else self.scene + [carried]
 
     def _envelope(self) -> float:
         """How far the tool can swing, in metres, at the admissible sway bound."""
@@ -448,7 +462,7 @@ class Geometry:
 
     def clearance(self, q: np.ndarray) -> float:
         """Smallest distance to anything, the machine against itself included."""
-        return float(self.model.collision_query(q, self.scene).minimum_distance_m)
+        return float(self.model.collision_query(q, self.bodies(q)).minimum_distance_m)
 
     def is_valid(self, q_a: np.ndarray) -> bool:
         """Clear at the hanging pose, and clear anywhere the tool may swing to."""
@@ -456,14 +470,15 @@ class Geometry:
             q = self.configuration(q_a)
         except (CraneModelError, PlanningError):
             return False
-        if self.clearance(q) <= 0.0:
+        bodies = self.bodies(q)
+        if float(self.model.collision_query(q, bodies).minimum_distance_m) <= 0.0:
             return False
-        if self.envelope <= 0.0 or not self.scene:
+        if self.envelope <= 0.0 or not bodies:
             return True
         scene_only = min(
             (
                 result.minimum_distance_m
-                for result in self.model.collision_queries(q, self.scene)[:-1]
+                for result in self.model.collision_queries(q, bodies)[:-1]
             ),
             default=np.inf,
         )
@@ -480,8 +495,11 @@ class Geometry:
                 swung[list(PASSIVE_INDICES)] = equilibrium + bound * np.array(
                     [tip, tilt]
                 )
+                # The payload swings with the tool, so it is re-placed too.
                 if (
-                    self.model.collision_query(swung, self.scene).minimum_distance_m
+                    self.model.collision_query(
+                        swung, self.bodies(swung)
+                    ).minimum_distance_m
                     <= 0.0
                 ):
                     return False
@@ -1294,7 +1312,7 @@ class Planner:
                 "certified against nothing is not certified"
             )
 
-        primitives = self.prepare_scene(start, payload_shape, scene, avoid_collisions)
+        primitives = self.prepare_scene(scene, avoid_collisions)
         payload_vector = payload_parameters(payload)
         geometry = Geometry(
             self.model,
@@ -1303,6 +1321,7 @@ class Planner:
             self.config,
             start.q_tool,
             payload_vector,
+            payload_shape if avoid_collisions else None,
         )
 
         goal = solve_ik(
@@ -1356,28 +1375,24 @@ class Planner:
         )
         return self._resample(geometry, path, timing, start)
 
-    def prepare_scene(
-        self, start: Start, payload_shape, scene, avoid_collisions: bool
-    ) -> list:
+    def prepare_scene(self, scene, avoid_collisions: bool) -> list:
         """
-        Return the bodies this plan is actually checked against.
+        Return the static bodies this plan is checked against.
 
         Not the same list the request carried: the reserved `truck` primitive
-        becomes a bed and six runges, and what is in the gripper is inserted as
-        a body of its own, because the frozen model collision API takes no
-        payload. Both are invisible to anyone who only sees the scene topic,
-        which is why this is a method and not a private step -- the node shows
-        it, and a refusal is far easier to read beside the geometry that caused
-        it.
+        has become a bed and six runges by the time the planner looks at it, and
+        that is invisible to anyone who only sees the scene topic. This is a
+        method and not a private step because the node draws it, and a refusal
+        is far easier to read beside the geometry that caused it.
+
+        What the tool carries is **not** here. It moves, so it is placed at each
+        configuration checked rather than pinned to the scene once.
         """
         if not avoid_collisions:
             return []
         primitives = expand_truck(list(scene or []), self.config)
         if any(primitive.id == PAYLOAD_ID for primitive in primitives):
             raise PlanningError(f"'{PAYLOAD_ID}' is a reserved scene id")
-        carried = payload_primitive(self.model, start.q, payload_shape)
-        if carried is not None:
-            primitives.append(carried)
         return primitives
 
     def _settled(

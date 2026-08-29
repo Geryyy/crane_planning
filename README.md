@@ -113,6 +113,26 @@ cannot be reached, a path that cannot be found, a path that cannot be smoothed
 inside the joint ranges and a path that cannot be timed are four different
 answers.
 
+## What the tool is carrying
+
+A payload is handed to the collision check as a body marked `attached_to_tool`,
+and that flag is two rules that only work together. It is **not** checked
+against the links that hold it -- a gripped block sits inside the gripper, which
+is what gripping is, so checking it there refuses every pose the machine can
+reach. And it **is** checked against the rest of the scene, which a scene body
+otherwise never is -- because what a carried body is for is hitting the world,
+and a payload checked only against the machine carrying it has not been checked
+at all.
+
+Which links count as holding it is read off the description, not written down: a
+body is carrying if the joint that places it is at or below the joint a payload
+mounts on. On the PZS100 that is the rotator lower part, the tool centre point
+and the two rails, and nothing else.
+
+The body is placed **at every configuration checked**, not once at the start.
+A payload pinned to the pose the machine set off from is a ghost standing in the
+start pose while the real one rides the tool through the scene unchecked.
+
 ## Seeing the plan
 
 `/crane_planner/markers` draws four things, and each answers a question the
@@ -123,9 +143,9 @@ and a plan that swings looks like it swings. The **goal**, where the request
 asked for the tool and which way round. And the **scene the planner actually
 checked against**, which is not the scene anyone published: by that point the
 reserved `truck` primitive has become a bed and six runges and what is in the
-gripper has been inserted as a body of its own. Structural bodies, perceived
-ones and the payload are three colours, because "why was this refused" is
-usually answered by which kind it hit.
+gripper is drawn where it will actually be. Structural bodies, perceived ones
+and the payload are three colours, because "why was this refused" is usually
+answered by which kind it hit.
 
 The goal and the geometry go out **before** the solve, so a refusal leaves them
 on screen: "it said no" and "it said no, and here is the runge it would have

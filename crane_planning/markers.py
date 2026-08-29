@@ -121,8 +121,8 @@ def goal(position_m, yaw: float, frame: str, stamp) -> list:
     return [marker]
 
 
-def plan(model, plan_, frame: str, stamp) -> list:
-    """Draw the path the tool takes, and the tool along it."""
+def plan(model, plan_, frame: str, stamp, payload_shape=None) -> list:
+    """Draw the path the tool takes, and the tool and its load along it."""
     path = _marker(frame, stamp, "path", 0, Marker.LINE_STRIP)
     path.scale.x = 0.04
     path.color = PATH_COLOR
@@ -139,4 +139,20 @@ def plan(model, plan_, frame: str, stamp) -> list:
         tip = model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
         tool.points.append(_point(hinge.position_m))
         tool.points.append(_point(tip.position_m))
-    return [path, tool]
+
+    # And what it is carrying, drawn where it will actually be. The payload
+    # travels with the tool, so a body drawn only at the start says nothing
+    # about the half of the path where it might hit something.
+    load = []
+    if payload_shape is not None:
+        from .planner import payload_primitive
+
+        for index, q in enumerate(plan_.q[::step]):
+            carried = payload_primitive(model, q, payload_shape)
+            if carried is None:
+                break
+            load.extend(scene([carried], frame, stamp))
+            load[-1].ns = "load"
+            load[-1].id = index
+            load[-1].color = TOOL_COLOR
+    return [path, tool, *load]
