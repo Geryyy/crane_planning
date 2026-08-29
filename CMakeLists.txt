@@ -216,8 +216,8 @@ install(
 # `scripts/export_timing_ocp.py` is not: it reads files that exist only in a
 # source checkout -- crane_model's two checked-in machine descriptions, which are
 # that package's test fixtures and are not installed either. Copying them here
-# would be the second machine to keep current that `test/description_fixture.hpp`
-# exists to avoid. It is run from the tree; what it *drives* is installed, which
+# would be a second machine to keep current. It is run from the tree; what it
+# *drives* is installed, which
 # is the part that has to match the deployment.
 install(
   TARGETS crane_planning_generated_ocp planner_core planner_node
@@ -244,154 +244,18 @@ ament_export_dependencies(
   nav_msgs
   wood_log_msgs)
 
-if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
-
-  # The machine's own descriptions, read where they live rather than copied.
-  # They are generated from src/epsilon_crane_description and checked in beside
-  # crane_model's contract test, which is what holds crane_model's compiled
-  # geometry in step with them -- so a copy here would be a second machine to
-  # keep current. Read only, one file per tool.
-  set(CRANE_PLANNING_MACHINE_DESCRIPTION_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/../crane_model/test/description"
-    CACHE PATH "Directory holding the machine descriptions the IK is exercised against")
-
-  # S4: the two-link structure the IK closes on, probed out of both machine
-  # descriptions and checked against forward kinematics. Offline C++ -- no ROS,
-  # no DDS, no simulator is linked into this binary and none is reachable from
-  # it.
-  ament_add_gtest(test_arm_geometry test/test_arm_geometry.cpp)
-  target_link_libraries(test_arm_geometry planner_core)
-  target_compile_definitions(test_arm_geometry PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the semi-analytic IK of robot_model §2.2 over a sampled set of
-  # reachable poses per tool, with the forward-kinematics residual as the oracle.
-  # Every case is generated *by* forward kinematics from a configuration the
-  # description allows, so reachability is known by construction rather than
-  # assumed.
-  ament_add_gtest(test_inverse_kinematics test/test_inverse_kinematics.cpp TIMEOUT 300)
-  target_link_libraries(test_inverse_kinematics planner_core)
-  target_compile_definitions(test_inverse_kinematics PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the equilibrium-constrained NLP of robot_model §2.2, over sampled
-  # goal poses per tool with *two* oracles -- the forward-kinematics residual of
-  # §2.2 and the equilibrium residual against Model::passive_equilibrium. Offline
-  # C++, same descriptions, no ROS.
-  ament_add_gtest(test_equilibrium_ik test/test_equilibrium_ik.cpp TIMEOUT 900)
-  target_link_libraries(test_equilibrium_ik planner_core)
-  target_compile_definitions(test_equilibrium_ik PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the timing ramp and the refusals the core owes. Plain data in,
-  # plain data out.
-  # S4 as well: the structured lift/traverse/descend primitive of
-  # trajectory_planning §4.4, its C² junctions, the transfer altitude derived
-  # from the scene, and the refusals it owes -- over both machine descriptions,
-  # because the descend phase's clearance is the mounted tool's own reach and the
-  # rail gripper and the jaw do not have the same one. Offline C++: the only
-  # thing this binary links besides gtest is the planner core.
-  # S4 as well: collision, the truck model keyed to a measured pose, the sway
-  # envelope of trajectory_planning §4.3 and the self-collision of §4.2's
-  # `[!todo]` — every scene built in the test rather than subscribed, so nothing
-  # here needs a graph. Offline C++ against both machine descriptions.
-  ament_add_gtest(test_collision test/test_collision.cpp TIMEOUT 900)
-  target_link_libraries(test_collision planner_core)
-  target_compile_definitions(test_collision PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4: the OMPL RRT-Connect path search and mandatory C2 smoothing over the five
-  # path coordinates of
-  # §4.1 and never the passive pair, that shortcut → C² fit → re-check all three
-  # run in that order, that the seed makes a run repeatable and the budget makes
-  # it bounded. Offline C++ against both machine descriptions; every scene is
-  # built in the test, and nothing here launches, links a simulator or reaches a
-  # ROS graph.
-  #
-  # It is the slowest binary in this package and deliberately so: one state
-  # validity check is one `Model::passive_equilibrium` plus the collision queries
-  # of its sway envelope, and the fallback is judged on the same terms as the
-  # primitive rather than on cheaper ones. The seeded budget is what bounds it.
-  ament_add_gtest(test_ompl_path_planner test/test_ompl_path_planner.cpp TIMEOUT 1800)
-  target_link_libraries(test_ompl_path_planner planner_core)
-  target_compile_definitions(test_ompl_path_planner PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: the path-constrained OCP of trajectory_planning §5.2 -- the sway
-  # carried as a state, the force and pump-flow constraints read out of the same
-  # shared Python model `crane_mpc` exports from, and the κ margin of §5.5.
-  # Offline C++ and deterministic: acados is a numerical solver in process, so no
-  # graph, no launch and no simulator is reachable from this binary either.
-  # The generated row metadata is checked directly below. The numeric model is
-  # deliberately the only crane_model API this test needs; the symbolic model
-  # lives in the export scripts, not in the runtime package.
-  ament_add_gtest(test_timing_ocp test/test_timing_ocp.cpp TIMEOUT 1200)
-  target_link_libraries(test_timing_ocp planner_core)
-  target_include_directories(test_timing_ocp PRIVATE
-    "${CRANE_PLANNING_GENERATED_DIR}")
-  target_compile_definitions(test_timing_ocp PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S4 as well: replanning from a moving, swinging state and the latency bound of
-  # trajectory_planning §7 — the measured start as a boundary condition on the
-  # geometry and on the OCP, continuity at the seam in position *and* velocity,
-  # the unmeasured sway bounded or refused but never assumed zero, and the budget
-  # firing in the planner rather than in a caller's timeout. Offline C++ and
-  # deterministic: the budget reads an injected clock that steps a fixed amount
-  # per reading, so no case here sleeps and none races a real clock.
-  #
-  # It solves five OCPs of §5.2 at some seconds each and is priced accordingly.
-  # One machine only, and the header says why.
-  ament_add_gtest(test_replanning test/test_replanning.cpp TIMEOUT 1200)
-  target_link_libraries(test_replanning planner_core)
-  target_compile_definitions(test_replanning PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S5: the served contract of both rows the planner has in ROS 2 Interfaces §5 —
-  # `/crane/plan_motion` and `/a2b_movement` — on the isolated domain
-  # `verify.sh` pins. Two nodes in one in-process executor: the deployment's own
-  # node object and a client, and no launch, no controller manager and no
-  # simulator, because the planner claims no interface and joins no cascade.
-  #
-  # `a2b_movement` (ROS 2 Interfaces §9) is served here too and one
-  # of its cases plans, which is one more OCP solve of §5.2 at some 14 s; the rest
-  # of them refuse, and a refusal costs nothing. 1200 s is that with room, and it
-  # bounds a hang rather than budgeting a latency (§7's latency is issue 045's).
-  ament_add_gtest(test_plan_motion_service test/test_plan_motion_service.cpp TIMEOUT 1200)
-  target_link_libraries(test_plan_motion_service
-    planner_node
-    ${crane_msgs_TARGETS}
-    ${sensor_msgs_TARGETS}
-    ${std_msgs_TARGETS}
-    ${timber_crane_planning_interfaces_TARGETS}
-    ${trajectory_msgs_TARGETS})
-  target_compile_definitions(test_plan_motion_service PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-
-  # S5 as well, and offline: the `a2b_movement` adapter of ROS 2 Interfaces §9,
-  # field by field in both directions. No node, no clock, no graph -- the two
-  # translations are message in, message out, and the one thing they read off the
-  # machine is the settled 3D offset from the tip pivot to the tool, which comes
-  # out of the two checked-in descriptions. Cheap: nothing here plans, because
-  # what is under test is what the planner is *asked*, and
-  # `test_plan_motion_service.cpp` is where the served row is.
-  # The freshness of `/crane/collision_scene`, offline. No node, no clock, no
-  # graph: `judge_scene` takes an age and a bound and returns what to do, so the
-  # three cases the planner has to tell apart -- never received, fresh, stale --
-  # are asserted without a middleware that would have to be made to hold a scene
-  # for ten seconds to produce one of them. Cheap: nothing here plans.
-  ament_add_gtest(test_scene_age test/test_scene_age.cpp TIMEOUT 60)
-  target_link_libraries(test_scene_age planner_core)
-
-  ament_add_gtest(test_a2b_adapter test/test_a2b_adapter.cpp TIMEOUT 300)
-  target_link_libraries(test_a2b_adapter
-    planner_node
-    ${crane_msgs_TARGETS}
-    ${timber_crane_planning_interfaces_TARGETS}
-    ${wood_log_msgs_TARGETS})
-  target_compile_definitions(test_a2b_adapter PRIVATE
-    CRANE_PLANNING_MACHINE_DESCRIPTION_DIR="${CRANE_PLANNING_MACHINE_DESCRIPTION_DIR}")
-endif()
+# The checked-in solver is still what `scripts/export_timing_ocp.py` writes from
+# `crane_model/scripts/crane_symbolic.py`. It runs at build time rather than as a
+# test because a stale `generated/` tree is not a failing behaviour, it is a
+# binary that solves a different problem than the source says -- and with the
+# parity tests retired this is the only thing left that ties the two together.
+# The check regenerates into a scratch tree and diffs; it costs a few seconds.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_custom_target(crane_planning_generated_is_current ALL
+  COMMAND ${Python3_EXECUTABLE}
+    "${CMAKE_CURRENT_SOURCE_DIR}/scripts/export_timing_ocp.py" --check
+  COMMENT "checking generated/ against scripts/export_timing_ocp.py"
+  VERBATIM)
+add_dependencies(crane_planning_generated_ocp crane_planning_generated_is_current)
 
 ament_package()
