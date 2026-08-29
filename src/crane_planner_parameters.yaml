@@ -312,8 +312,8 @@ crane_planner:
     default_value: [0.2, 0.2]
     read_only: true
     description: "The admissible sway bound q_u^+ of wiki/nomenclature.md 8, rad,
-      over [tip, tilt] -- the same index order crane_msgs/PendulumState publishes
-      its arrays in. **This is where that bound lives.** wiki/mpc.md 3 constraint
+      over [tip, tilt] -- the same order tip_tilt_state_broadcaster names them on
+      /joint_states. **This is where that bound lives.** wiki/mpc.md 3 constraint
       3 imposes |q_u - q_eq| <= q_u^+ as a state box and
       wiki/trajectory_planning.md 4.3 clears the path over the same box, so any
       sway the MPC permits is sway the path was cleared for by construction and
@@ -500,13 +500,14 @@ crane_planner:
     type: double
     default_value: 0.15
     read_only: true
-    description: "Freshness deadline of /crane/pendulum_state, s. The 150 ms of
+    description: "Freshness deadline of the passive pair on /joint_states, s. The 150 ms of
       wiki/control_architecture.md 5.3's own table, which is where every input a
       consumer closes on gets a deadline of its own -- a 100 Hz stream and a
       20 Hz contract do not go stale at the same age, so this is per input and
-      not one number for all of them. Past it the estimate is 'died' as opposed
-      to 'never connected', and passive_estimate_policy decides what happens
-      next."
+      not one number for all of them. Past it the measurement is 'died' as
+      opposed to 'never connected', and passive_estimate_policy decides what
+      happens next. sensor_msgs/JointState carries no validity flag, so this is
+      the only failure the source can report."
     validation:
       gt<>: [0.0]
 
@@ -526,9 +527,9 @@ crane_planner:
     type: string
     default_value: "refuse"
     read_only: true
-    description: "What this deployment does when /crane/pendulum_state is not
-      usable -- never connected, past its deadline, or reporting valid == false.
-      'refuse' returns success=false naming which of the three it was, which is
+    description: "What this deployment does when the passive pair on
+      /joint_states is not usable -- never connected, or past its deadline.
+      'refuse' returns success=false naming which of the two it was, which is
       control_architecture 5.3's row for a state a consumer closes on.
       'conservative' plans from the hanging pose of the measured actuated
       configuration and holds back conservative_sway of the sway allowance for
@@ -711,8 +712,8 @@ crane_planner:
       default_value: [1.0, 0.5]
       read_only: true
       description: "dq_u^+ of wiki/mpc.md 3 constraint 4, rad/s, over
-        [tip, tilt] -- the index order crane_msgs/PendulumState publishes in.
-        The rate half of the sway box; the position half is the top-level
+        [tip, tilt] -- the order tip_tilt_state_broadcaster names them on
+        /joint_states. The rate half of the sway box; the position half is the top-level
         q_sway_max, which the collision envelope of trajectory_planning 4.3
         shares and which is therefore not repeated here. **A design value**, on
         the same footing as q_sway_max: it is the rate a 2.5 m pendulum reaches

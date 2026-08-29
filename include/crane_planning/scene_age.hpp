@@ -3,8 +3,8 @@
 //
 // # Why the scene needs its own age at all
 //
-// The other three inputs the planner closes on -- `/joint_states`,
-// `/crane/pendulum_state`, `/crane/payload_estimate` -- are all aged against a
+// The other inputs the planner closes on -- both halves of `/joint_states` and
+// `/crane/payload_estimate` -- are all aged against a
 // deadline in `PlannerNode`. The scene was not, and it is the one input whose
 // subscription is **transient-local, depth 1**: a scene published once is latched
 // by the middleware and handed to every planner that starts afterwards, for the

@@ -39,7 +39,7 @@ bool tool_from_string(const std::string & name, crane_model::Tool & tool)
   return false;
 }
 
-/// What a deployment says to do when `/crane/pendulum_state` is not usable.
+/// What a deployment says to do when the passive pair on `/joint_states` is not usable.
 bool passive_policy_from_string(
   const std::string & name, crane_planning::PassiveEstimatePolicy & policy)
 {
@@ -285,7 +285,7 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
   joint_states_subscription_ = create_subscription<sensor_msgs::msg::JointState>(
     kJointStatesTopic, input_qos(),
     [this](sensor_msgs::msg::JointState::ConstSharedPtr message) {
-      joint_states_ = std::move(message);
+      on_joint_states(std::move(message));
     });
   robot_description_subscription_ = create_subscription<std_msgs::msg::String>(
     kRobotDescriptionTopic, robot_description_qos(),
@@ -295,16 +295,10 @@ PlannerNode::PlannerNode(const rclcpp::NodeOptions & options)
     [this](crane_msgs::msg::CollisionScene::ConstSharedPtr message) {
       on_collision_scene(message);
     });
-  // The passive half of 7's start state, and what is in the gripper. Both are
-  // kept as they arrive and judged at the request rather than in the callback:
-  // a freshness check evaluated in a subscription callback cannot fire, because
-  // the case it exists for is the one where no callback runs again
-  // (control_architecture 5.3).
-  pendulum_state_subscription_ = create_subscription<crane_msgs::msg::PendulumState>(
-    kPendulumStateTopic, input_qos(),
-    [this](crane_msgs::msg::PendulumState::ConstSharedPtr message) {
-      pendulum_state_ = std::move(message);
-    });
+  // What is in the gripper. Like both halves of the start state it is kept as it
+  // arrives and judged at the request rather than in the callback: a freshness
+  // check evaluated in a subscription callback cannot fire, because the case it
+  // exists for is the one where no callback runs again (control_architecture 5.3).
   payload_estimate_subscription_ = create_subscription<crane_msgs::msg::PayloadEstimate>(
     kPayloadEstimateTopic, payload_estimate_qos(),
     [this](crane_msgs::msg::PayloadEstimate::ConstSharedPtr message) {
@@ -393,6 +387,16 @@ void PlannerNode::on_robot_description(std_msgs::msg::String::ConstSharedPtr mes
     return;
   }
   model_.emplace(std::move(model).value());
+  {
+    const std::array<std::string, crane_model::kGeneralizedDof> & names =
+      model_->urdf_joint_names();
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      actuated_joints_[row] = names[kActuatedRows[row]];
+    }
+    for (std::size_t row = 0; row < crane_model::kPassiveDof; ++row) {
+      passive_joints_[row] = names[kPassiveRows[row]];
+    }
+  }
 
   auto context = build_planner(*model_, config, settings_);
   if (!context.ok()) {
@@ -506,6 +510,23 @@ void PlannerNode::on_collision_scene(crane_msgs::msg::CollisionScene::ConstShare
   RCLCPP_INFO(get_logger(), "%s", scene_note_.c_str());
 }
 
+void PlannerNode::on_joint_states(sensor_msgs::msg::JointState::ConstSharedPtr message)
+{
+  const auto names_any = [&message](const auto & wanted) {
+      return std::any_of(
+        wanted.begin(), wanted.end(), [&message](const std::string & joint) {
+          return !joint.empty() &&
+          std::find(message->name.begin(), message->name.end(), joint) != message->name.end();
+        });
+    };
+  if (names_any(passive_joints_)) {
+    passive_joint_states_ = message;
+  }
+  if (names_any(actuated_joints_) || actuated_joints_.front().empty()) {
+    joint_states_ = std::move(message);
+  }
+}
+
 bool PlannerNode::read_start(MeasuredStart & start, std::string & why) const
 {
   if (joint_states_ == nullptr) {
@@ -521,10 +542,8 @@ bool PlannerNode::read_start(MeasuredStart & start, std::string & why) const
     return false;
   }
 
-  const std::array<std::string, crane_model::kGeneralizedDof> & names =
-    model_->urdf_joint_names();
   for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
-    const std::string & joint = names[kActuatedRows[row]];
+    const std::string & joint = actuated_joints_[row];
     const auto found =
       std::find(joint_states_->name.begin(), joint_states_->name.end(), joint);
     if (found == joint_states_->name.end()) {
@@ -566,43 +585,52 @@ bool PlannerNode::read_passive(PassiveStart & passive, std::string & why) const
 {
   passive = PassiveStart{};
 
-  // The three absences control_architecture 5.3 asks to be told apart. "Never
-  // connected" and "died" are different things for an operator to chase, and a
-  // producer that says `valid == false` is a third thing again -- it is running,
-  // it is talking, and it is telling the truth about itself.
+  // The two absences control_architecture 5.3 asks to be told apart. "Never connected" and "died"
+  // are different things for an operator to chase. There is no third row any more:
+  // `sensor_msgs/JointState` carries no `valid` flag, so freshness is the whole test and a
+  // producer that has stopped saying anything is the only failure this source can report.
   std::string absence;
-  if (pendulum_state_ == nullptr) {
-    absence = std::string("nothing has ever been received on ") + kPendulumStateTopic +
+  crane_model::QU q_u{crane_model::QU::Zero()};
+  crane_model::DQU dq_u{crane_model::DQU::Zero()};
+  if (passive_joint_states_ == nullptr) {
+    absence = std::string("nothing carrying the passive pair has ever been received on ") +
+      kJointStatesTopic +
       " -- this is 'never connected' and not 'died': no producer has been seen at all";
   } else {
-    const double age = (now() - rclcpp::Time(pendulum_state_->header.stamp)).seconds();
+    const double age = (now() - rclcpp::Time(passive_joint_states_->header.stamp)).seconds();
     if (!(age <= pendulum_deadline_)) {
-      absence = std::string("the newest ") + kPendulumStateTopic + " is " + std::to_string(age) +
-        " s old against its own " + std::to_string(pendulum_deadline_) +
+      absence = std::string("the newest passive pair on ") + kJointStatesTopic + " is " +
+        std::to_string(age) + " s old against its own " + std::to_string(pendulum_deadline_) +
         " s deadline (control_architecture 5.3) -- this is 'died' and not 'never connected': the "
-        "estimate arrived and then stopped";
-    } else if (!pendulum_state_->valid) {
-      absence = std::string("the newest ") + kPendulumStateTopic +
-        " is fresh and reports valid == false, which is the producer's own verdict on itself and "
-        "is carried rather than restated: \"" + pendulum_state_->status + "\"";
-    } else if (!std::isfinite(pendulum_state_->position[0]) ||
-      !std::isfinite(pendulum_state_->position[1]) ||
-      !std::isfinite(pendulum_state_->velocity[0]) ||
-      !std::isfinite(pendulum_state_->velocity[1])) {
-      absence = std::string("the newest ") + kPendulumStateTopic +
-        " is fresh and valid but does not carry four finite numbers";
+        "measurement arrived and then stopped";
+    }
+    for (std::size_t row = 0; row < crane_model::kPassiveDof && absence.empty(); ++row) {
+      const std::string & joint = passive_joints_[row];
+      const auto found = std::find(
+        passive_joint_states_->name.begin(), passive_joint_states_->name.end(), joint);
+      const std::size_t index = static_cast<std::size_t>(
+        std::distance(passive_joint_states_->name.begin(), found));
+      if (found == passive_joint_states_->name.end() ||
+        index >= passive_joint_states_->position.size() ||
+        index >= passive_joint_states_->velocity.size() ||
+        !std::isfinite(passive_joint_states_->position[index]) ||
+        !std::isfinite(passive_joint_states_->velocity[index]))
+      {
+        absence = std::string("the newest passive pair on ") + kJointStatesTopic +
+          " is fresh but does not carry a finite position and velocity for " + joint;
+        break;
+      }
+      q_u[static_cast<Eigen::Index>(row)] = passive_joint_states_->position[index];
+      dq_u[static_cast<Eigen::Index>(row)] = passive_joint_states_->velocity[index];
     }
   }
 
   if (absence.empty()) {
     passive.measured = true;
-    passive.q_u = crane_model::QU(
-      pendulum_state_->position[0], pendulum_state_->position[1]);
-    passive.dq_u = crane_model::DQU(
-      pendulum_state_->velocity[0], pendulum_state_->velocity[1]);
-    passive.note = std::string("the passive pair came off ") + kPendulumStateTopic +
-      ", valid, inside its " + std::to_string(pendulum_deadline_) + " s deadline: \"" +
-      pendulum_state_->status + "\"";
+    passive.q_u = q_u;
+    passive.dq_u = dq_u;
+    passive.note = std::string("the passive pair came off ") + kJointStatesTopic + ", inside its " +
+      std::to_string(pendulum_deadline_) + " s deadline";
     return true;
   }
 

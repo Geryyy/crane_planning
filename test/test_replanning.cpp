@@ -364,7 +364,8 @@ TEST(Replanning, AnUnmeasuredSwayIsBoundedOrRefusedAndNeverAssumedZero)
   unmeasured.q_a = fixture().start;
   unmeasured.dq_a = crane_model::DQA::Zero();
   unmeasured.passive.measured = false;
-  unmeasured.passive.note = "nothing has ever been received on /crane/pendulum_state";
+  unmeasured.passive.note =
+    "nothing carrying the passive pair has ever been received on /joint_states";
   unmeasured.passive.sway_reserve_rad = 0.05;
   unmeasured.passive.sway_rate_reserve = 0.10;
 
@@ -376,7 +377,7 @@ TEST(Replanning, AnUnmeasuredSwayIsBoundedOrRefusedAndNeverAssumedZero)
   // absence rather than restating it.
   EXPECT_NE(bounded.value().start_note.find("**not** measured"), std::string::npos)
     << bounded.value().start_note;
-  EXPECT_NE(bounded.value().start_note.find("/crane/pendulum_state"), std::string::npos)
+  EXPECT_NE(bounded.value().start_note.find("/joint_states"), std::string::npos)
     << bounded.value().start_note;
   // The reservation is real and not decorative: every node stays inside the
   // *reduced* box, so sway up to the reserve can be present without leaving what
@@ -397,7 +398,7 @@ TEST(Replanning, AnUnmeasuredSwayIsBoundedOrRefusedAndNeverAssumedZero)
   ASSERT_FALSE(refused.ok());
   EXPECT_NE(refused.status().message.find("moving arm"), std::string::npos)
     << refused.status().message;
-  EXPECT_NE(refused.status().message.find("/crane/pendulum_state"), std::string::npos)
+  EXPECT_NE(refused.status().message.find("/joint_states"), std::string::npos)
     << refused.status().message;
 }
 

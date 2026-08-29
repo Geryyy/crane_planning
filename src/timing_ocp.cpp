@@ -518,7 +518,7 @@ crane_model::Result<TimingSolution> solve_timing_ocp(
 
   // 7's initial condition. The stopped start is the passive pair hanging at the
   // start configuration's own equilibrium and not moving; a measured start
-  // replaces both halves with what `/crane/pendulum_state` says. Neither is
+  // replaces both halves with what the passive pair on `/joint_states` says. Neither is
   // *assumed*: which one this is arrived on the request.
   const crane_model::QU q_u_start =
     request.start.measured ? request.start.q_u : q_u_equilibrium.front();

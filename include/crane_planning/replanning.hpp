@@ -10,8 +10,8 @@
 // step, which is exactly the situation a stall-recovery re-plan occurs in.
 //
 // `MeasuredStart` below is what replaces it. It is `(q, dq)` **as measured** over
-// all eight coordinates: the six actuated positions and rates off `/joint_states`
-// and the passive pair off `/crane/pendulum_state`. Nothing in it is defaulted
+// all eight coordinates: the six actuated positions and rates and the passive
+// pair, both off `/joint_states`. Nothing in it is defaulted
 // silently -- `passive_measured` says whether the passive half is a measurement
 // at all, and `passive_note` says why when it is not, because
 // `wiki/control_architecture.md` 5.3's rule is that no input may stop arriving
@@ -75,13 +75,11 @@ struct StartStateSettings
 
 /// The passive pair at the start, and whether it is a measurement.
 /**
- * `/crane/pendulum_state` carries position, velocity, covariances and a `valid`
- * flag at 100 Hz, and issue 019 gave it staleness detection. Whether the estimate
- * that arrived is usable is decided at the node, against the topic's own 150 ms
- * deadline of `control_architecture` 5.3 and against the `valid` flag the
- * producer sets -- the three causes behind that flag are the producer's to judge
- * inside its own cycle, and a consumer carries its `status` string rather than
- * restating it.
+ * `tip_tilt_state_broadcaster` publishes the pair on `/joint_states` at 100 Hz.
+ * Whether what arrived is usable is decided at the node, against that half's own
+ * 150 ms deadline of `control_architecture` 5.3 -- and against nothing else,
+ * because `sensor_msgs/JointState` carries no validity flag, so a producer that
+ * has stopped publishing is the only failure this source can report.
  *
  * What reaches the algorithm is this: either a measurement, or a stated absence
  * with a bound reserved for the sway that may be there anyway. It is never a

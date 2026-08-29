@@ -353,8 +353,8 @@ struct TimingSolution
  * `q_a' = 0`. That is the convention 7 calls a defect, and it is kept as the
  * answer for a machine that really is standing still.
  *
- * Present, it is the measurement: `q_u` and `dq_u` off `/crane/pendulum_state`
- * and a `sigma_rate` that reproduces the measured actuated velocity through the
+ * Present, it is the measurement: `q_u` and `dq_u` off the passive pair on
+ * `/joint_states` and a `sigma_rate` that reproduces the measured actuated velocity through the
  * path's own start slope (`start_path_rate` in `geometric_path.hpp`). The three
  * together are what make a plan issued mid-motion start where the machine is
  * rather than where it would be at rest -- and 5.4's terminal conditions are

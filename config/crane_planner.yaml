@@ -162,12 +162,13 @@ crane_planner:
     max_scene_age: 10.0
 
     # **The passive half of that start state**, and what happens when it is not
-    # there.  /crane/pendulum_state carries the sway at 100 Hz with a `valid`
-    # flag; its 150 ms deadline is control_architecture §5.3's own row for this
-    # topic and not one age shared with every input.  Past it, or with the flag
-    # down, or with nothing ever received, `refuse` is §5.3's answer for a state
-    # the planner closes on — the response names which of the three it was, so
-    # that "never connected" and "died" stay different things to chase.
+    # there.  `tip_tilt_state_broadcaster` carries the sway at 100 Hz on
+    # /joint_states; its 150 ms deadline is control_architecture §5.3's own row
+    # for this input and not one age shared with every input.  sensor_msgs/JointState
+    # has no `valid` flag, so freshness is the whole test.  Past it, or with
+    # nothing ever received, `refuse` is §5.3's answer for a state the planner
+    # closes on — the response names which of the two it was, so that "never
+    # connected" and "died" stay different things to chase.
     #
     # `conservative` is the other defined consequence: plan from the hanging pose
     # and hold back `conservative_sway` from the sway box, so sway up to the

@@ -148,8 +148,8 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         metavar=("Q1", "Q2"),
         help="measured sway angle at the seam, rad. **Absolute passive "
-        "coordinates**, as /crane/pendulum_state publishes them and as the node "
-        "passes them -- not an offset from the hanging pose. They must lie inside "
+        "coordinates**, as the passive pair on /joint_states carries them and as "
+        "the node passes them -- not an offset from the hanging pose. They must lie inside "
         "q_u_max of the equilibrium at the start pose, which the node CSV's "
         "q_eq_sway_* columns report.",
     )

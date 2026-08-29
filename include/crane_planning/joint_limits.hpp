@@ -53,6 +53,9 @@ namespace crane_planning
 inline constexpr std::array<std::size_t, crane_model::kActuatedDof> kActuatedRows{
   {0, 1, 2, 3, 6, 7}};
 
+/// The two passive coordinates as rows of the same canonical eight: tip, then tilt.
+inline constexpr std::array<std::size_t, crane_model::kPassiveDof> kPassiveRows{{4, 5}};
+
 /// The rows of `kActuatedRows` the geometric path runs over.
 /**
  * `wiki/trajectory_planning.md` 4.1: planning happens over

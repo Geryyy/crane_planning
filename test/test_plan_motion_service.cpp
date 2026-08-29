@@ -38,7 +38,6 @@
 #include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_msgs/msg/payload_estimate.hpp"
-#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "crane_planning/a2b_adapter.hpp"
@@ -75,6 +74,9 @@ using trajectory_msgs::msg::JointTrajectory;
  * *test* waits before calling a missing answer a failure.
  */
 constexpr double kBudget = 60.0;
+
+/// How many callbacks `drain()` lets through between the two halves of one `/joint_states` cycle.
+constexpr int kDrainSpins = 20;
 
 /// The domain this binary runs on: one step off the one it was given, so that
 /// the suites colcon runs beside it cannot see this fixture's `/joint_states`
@@ -152,12 +154,14 @@ protected:
       [this](JointTrajectory::ConstSharedPtr message) {published_.push_back(*message);});
     joint_states_ = client_node_->create_publisher<JointState>(
       crane_planning::kJointStatesTopic, crane_planning::input_qos());
+    // A second publisher for the passive half, because there are two broadcasters: one publisher
+    // with a depth-1 history would drop whichever of the two partial messages it wrote first.
+    passive_joint_states_ = client_node_->create_publisher<JointState>(
+      crane_planning::kJointStatesTopic, crane_planning::input_qos());
     robot_description_ = client_node_->create_publisher<std_msgs::msg::String>(
       crane_planning::kRobotDescriptionTopic, crane_planning::robot_description_qos());
     collision_scene_ = client_node_->create_publisher<crane_msgs::msg::CollisionScene>(
       crane_planning::kCollisionSceneTopic, crane_planning::collision_scene_qos());
-    pendulum_state_ = client_node_->create_publisher<crane_msgs::msg::PendulumState>(
-      crane_planning::kPendulumStateTopic, crane_planning::input_qos());
     payload_estimate_ = client_node_->create_publisher<crane_msgs::msg::PayloadEstimate>(
       crane_planning::kPayloadEstimateTopic, crane_planning::payload_estimate_qos());
 
@@ -184,6 +188,21 @@ protected:
     executor_.remove_node(planner_);
   }
 
+  /// Let every callback that is already queued run, without waiting on a predicate.
+  /**
+   * The two halves of `/joint_states` are two partial messages on one topic, and the input QoS is
+   * `KeepLast(1)` on the *subscription* as well as on the publisher. Published back to back with
+   * nothing spun in between, the second evicts the first and the planner is left holding one half.
+   * The deployment never sees that because its executor is spinning between the two broadcasters'
+   * 100 Hz writes; this stands in for that.
+   */
+  void drain()
+  {
+    for (int i = 0; i < kDrainSpins; ++i) {
+      executor_.spin_once(std::chrono::milliseconds(1));
+    }
+  }
+
   bool spin_until(const std::function<bool()> & done)
   {
     const auto deadline =
@@ -197,7 +216,7 @@ protected:
     return done();
   }
 
-  /// Publish one `/joint_states` and one `/crane/pendulum_state`, at rest.
+  /// Publish both halves of `/joint_states` -- the actuated six and the passive pair -- at rest.
   /**
    * Both, because both are the start state `wiki/trajectory_planning.md` 7 asks
    * for and the node refuses a request that is missing either. The velocities are
@@ -218,6 +237,7 @@ protected:
     const std::vector<double> & positions, const std::vector<double> & velocities)
   {
     publish_joints(positions, velocities);
+    drain();
 
     // The sway the tool really has at that configuration, measured off the model
     // rather than written as zero: the tool hangs where gravity puts it, and a
@@ -232,32 +252,49 @@ protected:
     publish_pendulum(settled.value(), crane_model::DQU::Zero());
   }
 
-  /// `/joint_states` alone -- the half of the start state the encoders carry.
+  /// The actuated half alone, as `joint_state_broadcaster` publishes it.
+  /**
+   * `positions` and `velocities` are indexed over the canonical eight, as
+   * `start_positions()` is; only the six actuated rows go out, because the two
+   * halves of `/joint_states` are two separate partial messages and the passive
+   * one comes from `publish_pendulum`. An empty `velocities` publishes no
+   * `velocity` array at all.
+   */
   void publish_joints(
     const std::vector<double> & positions, const std::vector<double> & velocities)
   {
     JointState joints;
     joints.header.stamp = client_node_->now();
-    joints.name.assign(
-      model_->urdf_joint_names().begin(), model_->urdf_joint_names().end());
-    joints.position = positions;
-    joints.velocity = velocities;
+    const std::array<std::string, crane_model::kGeneralizedDof> & names =
+      model_->urdf_joint_names();
+    for (const std::size_t row : crane_planning::kActuatedRows) {
+      joints.name.push_back(names[row]);
+      joints.position.push_back(positions[row]);
+      if (!velocities.empty()) {
+        joints.velocity.push_back(velocities[row]);
+      }
+    }
     start_stamp_ = joints.header.stamp;
+    last_joints_ = joints;
     joint_states_->publish(joints);
   }
 
-  /// One `/crane/pendulum_state`, at the sway and the rate the caller asks for.
+  /// The passive half alone, as `tip_tilt_state_broadcaster` publishes it.
   void publish_pendulum(
-    const crane_model::QU & q_u, const crane_model::DQU & dq_u, bool valid = true,
-    double age_s = 0.0)
+    const crane_model::QU & q_u, const crane_model::DQU & dq_u, double age_s = 0.0)
   {
-    crane_msgs::msg::PendulumState pendulum;
-    pendulum.header.stamp = client_node_->now() - rclcpp::Duration::from_seconds(age_s);
-    pendulum.position = {q_u[0], q_u[1]};
-    pendulum.velocity = {dq_u[0], dq_u[1]};
-    pendulum.valid = valid;
-    pendulum.status = valid ? "all IMUs healthy and refreshing" : "IMU1x is degraded";
-    pendulum_state_->publish(pendulum);
+    JointState passive;
+    passive.header.stamp = client_node_->now() - rclcpp::Duration::from_seconds(age_s);
+    const std::array<std::string, crane_model::kGeneralizedDof> & names =
+      model_->urdf_joint_names();
+    for (const std::size_t row : crane_planning::kPassiveRows) {
+      passive.name.push_back(names[row]);
+    }
+    passive.position = {q_u[0], q_u[1]};
+    passive.velocity = {dq_u[0], dq_u[1]};
+    last_passive_ = passive;
+    last_passive_age_s_ = age_s;
+    passive_joint_states_->publish(passive);
   }
 
   /// One `/crane/payload_estimate`, at the mass and validity the caller asks for.
@@ -305,7 +342,7 @@ protected:
    * It is also what makes a *second* request in one case read the state published
    * just before it. `call` only spins while the service is not yet ready, so by
    * the second call it spins not at all before sending -- and a case that changes
-   * `/crane/pendulum_state` between two requests would otherwise be racing its own
+   * the passive half between two requests would otherwise be racing its own
    * publication against its own request.
    */
   void settle()
@@ -324,7 +361,7 @@ protected:
     return std::move(limits).value();
   }
 
-  /// One actuated configuration as the eight positions `/joint_states` carries.
+  /// One actuated configuration as the eight canonical positions the fixture indexes over.
   static std::vector<double> positions_of(const crane_model::QA & q_a)
   {
     std::vector<double> positions(
@@ -377,9 +414,36 @@ protected:
   }
 
   /// One request over the wire, answered inside the budget.
+  /// Both halves again, at this instant, as the two broadcasters would have them.
+  /**
+   * `settle()` spends up to a quarter of a second of wall clock, which is longer than the passive
+   * pair's own 150 ms deadline. The deployment does not have that problem because both halves
+   * stream at 100 Hz; a fixture that published each once would have every case refused for a
+   * staleness it did not mean to pose. The deliberate age a case asked `publish_pendulum` for is
+   * preserved, so a case that *does* mean to age the passive half still ages it.
+   */
+  void refresh_start()
+  {
+    if (last_joints_.has_value()) {
+      last_joints_->header.stamp = client_node_->now();
+      // The re-sent message *is* the start the answer will be stamped with, so the expectation
+      // moves with it rather than staying on the copy this overwrote.
+      start_stamp_ = last_joints_->header.stamp;
+      joint_states_->publish(*last_joints_);
+      drain();
+    }
+    if (last_passive_.has_value()) {
+      last_passive_->header.stamp =
+        client_node_->now() - rclcpp::Duration::from_seconds(last_passive_age_s_);
+      passive_joint_states_->publish(*last_passive_);
+      drain();
+    }
+  }
+
   PlanMotion::Response::SharedPtr call(const PlanMotion::Request::SharedPtr & request)
   {
     EXPECT_TRUE(spin_until([this]() {return client_->service_is_ready();}));
+    refresh_start();
     auto future = client_->async_send_request(request);
     const bool answered = spin_until(
       [&future]() {
@@ -429,7 +493,7 @@ protected:
 
     // The real concrete-block feasibility caller fills q0. Use a settled version
     // of this fixture's ordinary start so this request likewise needs no live
-    // `/joint_states` or `/crane/pendulum_state` to describe its probe state.
+    // `/joint_states` to describe its probe state.
     crane_model::QA q_a_start;
     for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
       q_a_start[static_cast<Eigen::Index>(row)] =
@@ -464,9 +528,13 @@ protected:
   rclcpp::Client<CalcMovement>::SharedPtr a2b_client_;
   rclcpp::Subscription<JointTrajectory>::SharedPtr reference_;
   rclcpp::Publisher<JointState>::SharedPtr joint_states_;
+  rclcpp::Publisher<JointState>::SharedPtr passive_joint_states_;
+  /// The newest of each half, kept so `refresh_start` can send them again unchanged.
+  std::optional<JointState> last_joints_;
+  std::optional<JointState> last_passive_;
+  double last_passive_age_s_{0.0};
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr robot_description_;
   rclcpp::Publisher<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_;
-  rclcpp::Publisher<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_;
   rclcpp::Publisher<crane_msgs::msg::PayloadEstimate>::SharedPtr payload_estimate_;
   std::vector<JointTrajectory> published_;
   std::optional<crane_model::Model> model_;
@@ -664,42 +732,30 @@ TEST_F(PlanMotionService, AJointStateWithoutVelocitiesIsRefusedRatherThanReadAsA
   EXPECT_TRUE(published_.empty());
 }
 
-TEST_F(PlanMotionService, AnUnusablePendulumStateIsRefusedNamingWhichOfTheThreeAbsencesItWas)
+TEST_F(PlanMotionService, AnUnusablePassiveStateIsRefusedNamingWhichOfTheTwoAbsencesItWas)
 {
   // `wiki/control_architecture.md` 5.3: no input may stop arriving without a
   // defined consequence, and "never connected" and "died" are different things
   // for an operator to chase. This deployment's `passive_estimate_policy` is
   // `refuse`, which is 5.3's row for a state the planner closes on -- and the
-  // consequence that is ruled out in all three cases is the silent zero, because
+  // consequence that is ruled out in both cases is the silent zero, because
   // an unknown sway is not a still one.
   //
-  // The three arrive in the order they can: nothing has been received at all,
-  // then a producer that says `valid == false` about itself, then one that
-  // arrived and stopped.
+  // There are two and not three: `sensor_msgs/JointState` carries no validity
+  // flag, so a producer that has stopped publishing is the only failure this
+  // source can report.
   publish_joints(start_positions(), std::vector<double>(start_positions().size(), 0.0));
   settle();
   const auto never = call(collision_blind_request());
   ASSERT_NE(never, nullptr);
   EXPECT_FALSE(never->success);
-  EXPECT_NE(never->message.find(crane_planning::kPendulumStateTopic), std::string::npos)
+  EXPECT_NE(never->message.find(crane_planning::kJointStatesTopic), std::string::npos)
     << never->message;
   EXPECT_NE(never->message.find("never connected"), std::string::npos) << never->message;
 
-  // The producer is running, is talking, and is telling the truth about itself.
-  // Its own `status` is carried rather than restated: the three causes behind the
-  // flag are the broadcaster's to judge inside its own cycle.
-  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), false);
-  settle();
-  const auto not_valid = call(collision_blind_request());
-  ASSERT_NE(not_valid, nullptr);
-  EXPECT_FALSE(not_valid->success);
-  EXPECT_NE(not_valid->message.find("valid == false"), std::string::npos) << not_valid->message;
-  EXPECT_NE(not_valid->message.find("IMU1x is degraded"), std::string::npos)
-    << not_valid->message;
-
   // Past its own 150 ms deadline, which is the row `control_architecture` 5.3's
-  // table gives this topic and not one age shared with every other input.
-  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), true, 1.0);
+  // table gives this input and not one age shared with every other one.
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), 1.0);
   settle();
   const auto stale = call(collision_blind_request());
   ASSERT_NE(stale, nullptr);
@@ -881,7 +937,7 @@ TEST_F(PlanMotionService, ARefusedReplanLeavesTheStandingReferenceAloneAndReport
   // Now the passive estimate goes away mid-execution, which is the situation a
   // stall-recovery re-plan is issued in and the one 7's `[!warning]` is about.
   publish_start();
-  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), false);
+  publish_pendulum(crane_model::QU::Zero(), crane_model::DQU::Zero(), 1.0);
   settle();
   const auto refused = call(collision_blind_request());
   ASSERT_NE(refused, nullptr);

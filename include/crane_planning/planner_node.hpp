@@ -35,6 +35,7 @@
 #ifndef CRANE_PLANNING__PLANNER_NODE_HPP_
 #define CRANE_PLANNING__PLANNER_NODE_HPP_
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -44,7 +45,6 @@
 #include "crane_msgs/msg/collision_scene.hpp"
 #include "crane_msgs/msg/payload.hpp"
 #include "crane_msgs/msg/payload_estimate.hpp"
-#include "crane_msgs/msg/pendulum_state.hpp"
 #include "crane_msgs/srv/plan_motion.hpp"
 #include "crane_planning/planner_core.hpp"
 #include "nav_msgs/msg/path.hpp"
@@ -67,11 +67,12 @@ inline constexpr char kPlanMotionService[] = "/crane/plan_motion";
 inline constexpr char kReferenceTopic[] = "/crane/reference";
 /// The TCP geometry of the last adopted plan, for operator visualization only.
 inline constexpr char kPlannedPathTopic[] = "/crane_planner/planned_path";
+/// Both halves of the start state `wiki/trajectory_planning.md` 7 asks for: the actuated six from
+/// `joint_state_broadcaster` and the passive pair from `tip_tilt_state_broadcaster`, in separate
+/// partial messages that are cached by joint name.
 inline constexpr char kJointStatesTopic[] = "/joint_states";
 inline constexpr char kCollisionSceneTopic[] = "/crane/collision_scene";
 
-/// The passive half of the start state `wiki/trajectory_planning.md` 7 asks for.
-inline constexpr char kPendulumStateTopic[] = "/crane/pendulum_state";
 
 /// What is in the gripper, when the estimator says it knows (4).
 inline constexpr char kPayloadEstimateTopic[] = "/crane/payload_estimate";
@@ -112,7 +113,7 @@ inline constexpr char kPlanningFrame[] = "K0_mounting_base";
 /// The description, latched by `robot_state_publisher`.
 [[nodiscard]] rclcpp::QoS robot_description_qos();
 
-/// What this deployment does when `/crane/pendulum_state` is not usable.
+/// What this deployment does when the passive pair on `/joint_states` is not usable.
 /**
  * The acceptance criterion offers exactly two, and `control_architecture` 5.3 is
  * why there is no third: an input that stops arriving must end in a **defined**
@@ -190,6 +191,18 @@ private:
 
   void on_robot_description(std_msgs::msg::String::ConstSharedPtr message);
 
+  /// Route one `/joint_states` message to the half whose joints it names.
+  /**
+   * The topic carries partial messages, so the newest message is not the newest
+   * state: `joint_state_broadcaster` names the actuated six and
+   * `tip_tilt_state_broadcaster` the passive pair, each at its own instant. A
+   * message that names either passive joint is the passive half; anything else
+   * is the actuated one. Until the description has arrived the names are not
+   * known and everything is read as actuated, which is the state in which
+   * nothing is planned anyway.
+   */
+  void on_joint_states(sensor_msgs::msg::JointState::ConstSharedPtr message);
+
   /// The six actuated rows of one trajectory as `trajectory_msgs`, with 1's stamp.
   [[nodiscard]] trajectory_msgs::msg::JointTrajectory as_message(
     const TimedTrajectory & trajectory, const rclcpp::Time & origin) const;
@@ -224,7 +237,7 @@ private:
   /// The passive half of the start, or the policy's answer to its absence.
   /**
    * Returns false only when the policy is `Refuse` and the estimate is not
-   * usable; `why` then names which of the three absences it was. Under
+   * usable; `why` then names which of the two absences it was. Under
    * `Conservative` it always returns true and fills `start.note` with what was
    * assumed and what was reserved for it.
    */
@@ -253,7 +266,7 @@ private:
   /// `/crane/collision_scene`'s own freshness bound, s. See `scene_age.hpp`.
   double max_scene_age_{10.0};
 
-  /// `/crane/pendulum_state`'s own freshness deadline, s -- 5.3's table gives 150 ms.
+  /// The passive pair's own freshness deadline, s -- 5.3's table gives 150 ms.
   double pendulum_deadline_{0.15};
 
   /// `/crane/payload_estimate`'s, s. Not in 5.3's table, because the supervisor
@@ -268,7 +281,18 @@ private:
   std::optional<PlannerContext> context_;
 
   sensor_msgs::msg::JointState::ConstSharedPtr joint_states_;
-  crane_msgs::msg::PendulumState::ConstSharedPtr pendulum_state_;
+
+  /// The newest `/joint_states` that named the passive pair, kept apart from the actuated one.
+  /**
+   * The two producers publish partial messages on one topic, so the halves cannot share a slot:
+   * the newest message is whichever broadcaster spoke last, and aging the actuated read against a
+   * passive message would report a freshness that is not that half's.
+   */
+  sensor_msgs::msg::JointState::ConstSharedPtr passive_joint_states_;
+
+  /// The joint names, from the description. Empty until the model is built.
+  std::array<std::string, crane_model::kActuatedDof> actuated_joints_{};
+  std::array<std::string, crane_model::kPassiveDof> passive_joints_{};
   crane_msgs::msg::PayloadEstimate::ConstSharedPtr payload_estimate_;
 
   /// The last trajectory this node actually adopted, and its stamp.
@@ -296,7 +320,6 @@ private:
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_description_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_states_subscription_;
   rclcpp::Subscription<crane_msgs::msg::CollisionScene>::SharedPtr collision_scene_subscription_;
-  rclcpp::Subscription<crane_msgs::msg::PendulumState>::SharedPtr pendulum_state_subscription_;
   rclcpp::Subscription<crane_msgs::msg::PayloadEstimate>::SharedPtr payload_estimate_subscription_;
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr reference_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr planned_path_;

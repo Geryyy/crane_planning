@@ -154,11 +154,11 @@ crane_model::Result<MotionPlan> plan_motion(
   MotionPlan plan;
   plan.endpoint = std::move(endpoint).value();
 
-  // The start as all eight coordinates. The passive pair is what
-  // `/crane/pendulum_state` measured, or -- for a machine standing still with no
-  // usable estimate -- where the tool hangs at the measured actuated
-  // configuration, which is the stopped-start convention of 7 and is now the
-  // stated branch rather than the only one.
+  // The start as all eight coordinates. The passive pair is what was measured
+  // off `/joint_states`, or -- for a machine standing still with no usable
+  // measurement -- where the tool hangs at the measured actuated configuration,
+  // which is the stopped-start convention of 7 and is now the stated branch
+  // rather than the only one.
   auto settled_start = model.passive_equilibrium(request.start.q_a, request.payload);
   if (!settled_start.ok()) {
     return Result<MotionPlan>::failure(settled_start.status());
