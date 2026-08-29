@@ -31,6 +31,16 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>trajectory_msgs</depend>
+  <!-- The retained `a2b_movement` contract (`CalcMovement.srv`) and the message
+       package its payload fields are made of. These are retained-tree interface
+       packages, not new third-party dependencies: they are the `.srv` and
+       `.msg` definitions the timber stack already ships, and serving them is
+       what makes this node a drop-in replacement for the legacy A2B planner.
+       `wood_log_msgs` is named although no import here reaches it directly,
+       because `CalcMovement` embeds `LogShape` and `Log[]` and an interface
+       dependency that is only transitive is one a manifest walk cannot see. -->
+  <depend>timber_crane_planning_interfaces</depend>
+  <depend>wood_log_msgs</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>

@@ -20,7 +20,13 @@ from collections import deque
 
 import numpy as np
 import rclpy
-from crane_model import ACTUATED_INDICES, Payload, Tool, canonical_joints
+from crane_model import (
+    ACTUATED_INDICES,
+    GENERALIZED_DOF,
+    Payload,
+    Tool,
+    canonical_joints,
+)
 from crane_msgs.msg import CollisionScene, PayloadEstimate
 from crane_msgs.srv import PlanMotion
 from geometry_msgs.msg import PoseStamped
@@ -31,6 +37,14 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
+from timber_crane_planning_interfaces.srv import CalcMovement
+
+from .a2b import (
+    A2B_MOVEMENT_SERVICE,
+    translate_payload,
+    translate_request,
+    translate_start,
+)
 from .planner import (
     PASSIVE_INDICES,
     PLANNED_INDICES,
@@ -46,6 +60,18 @@ from .planner import (
 PLAN_MOTION_SERVICE = "/crane/plan_motion"
 REFERENCE_TOPIC = "/crane/reference"
 PLANNED_PATH_TOPIC = "/crane_planner/planned_path"
+#: The Cartesian path the legacy A2B server published beside its service
+#: answer, on the name it published it: relative, from a node in the root
+#: namespace, so that an operator's RViz shows the same thing it always did.
+#:
+#: The legacy server also latched the trajectory itself on `joint_trajectory`,
+#: and that one is **deliberately not carried over**. Nothing in the workspace
+#: subscribes to it -- the trajectory controller listens on its own
+#: `~/joint_trajectory` -- so it is a debug artefact, and publishing it would
+#: give this node a second `JointTrajectory` publisher. That count is what the
+#: launch contract reads as evidence that the planner cannot be a second
+#: command producer, and spending it on a topic nobody reads is a bad trade.
+LEGACY_TCP_PATH_TOPIC = "tcp_path"
 JOINT_STATES_TOPIC = "/joint_states"
 COLLISION_SCENE_TOPIC = "/crane/collision_scene"
 PAYLOAD_ESTIMATE_TOPIC = "/crane/payload_estimate"
@@ -95,8 +121,14 @@ class CranePlanner(Node):
         self.create_subscription(
             String, ROBOT_DESCRIPTION_TOPIC, self._description, latched()
         )
+        # Depth 10 and not 1: `/joint_states` carries **two** partial messages
+        # from two producers, published back to back. A depth-1 queue can drop
+        # one of them for good -- the second overwrites the first before the
+        # subscription is served -- and the planner then never sees a state
+        # carrying the actuated six. The legacy A2B server read this topic at
+        # depth 5 for the same reason.
         self.create_subscription(
-            JointState, JOINT_STATES_TOPIC, self._joint_states, volatile()
+            JointState, JOINT_STATES_TOPIC, self._joint_states, volatile(10)
         )
         self.create_subscription(
             CollisionScene, COLLISION_SCENE_TOPIC, self._collision_scene, latched()
@@ -108,7 +140,11 @@ class CranePlanner(Node):
             JointTrajectory, REFERENCE_TOPIC, latched()
         )
         self.planned_path = self.create_publisher(Path, PLANNED_PATH_TOPIC, latched())
+        self.legacy_tcp_path = self.create_publisher(Path, LEGACY_TCP_PATH_TOPIC, 10)
         self.create_service(PlanMotion, PLAN_MOTION_SERVICE, self._plan)
+        # The retained timber contract, on the same node and over the same
+        # planner: one adapter, no second set of limits.
+        self.create_service(CalcMovement, A2B_MOVEMENT_SERVICE, self._a2b)
         self.get_logger().info(f"waiting for {ROBOT_DESCRIPTION_TOPIC}")
 
     # -- parameters -----------------------------------------------------------
@@ -273,9 +309,16 @@ class CranePlanner(Node):
                 "deadline: the sway the plan would have to close on is stale"
             )
         names = list(passive.name)
-        for index in PASSIVE_INDICES:
-            q[index] = passive.position[names.index(self.joint_names[index])]
-        return Start(q=q, dq_a=dq_a)
+        dq_u = np.zeros(len(PASSIVE_INDICES))
+        for slot, index in enumerate(PASSIVE_INDICES):
+            where = names.index(self.joint_names[index])
+            q[index] = passive.position[where]
+            # A broadcaster that publishes the sway without its rate leaves the
+            # OCP no boundary condition for it; zero is the honest reading only
+            # when the array is genuinely absent.
+            if passive.velocity:
+                dq_u[slot] = passive.velocity[where]
+        return Start(q=q, dq_a=dq_a, dq_u=dq_u)
 
     def _primitives(self, avoid_collisions: bool) -> list:
         if self.scene is None:
@@ -377,15 +420,13 @@ class CranePlanner(Node):
             return response
 
         try:
-            start = self._start()
-            primitives = self._primitives(request.avoid_collisions)
-            payload, shape = self._payload(request.payload)
             orientation = request.goal.pose.orientation
             rotation = pin.Quaternion(
                 orientation.w, orientation.x, orientation.y, orientation.z
             ).toRotationMatrix()
-            plan = self.planner.plan(
-                start,
+            payload, shape = self._payload(request.payload)
+            plan, trajectory, path = self._run(
+                self._start(),
                 np.array(
                     [
                         request.goal.pose.position.x,
@@ -394,11 +435,10 @@ class CranePlanner(Node):
                     ]
                 ),
                 float(np.arctan2(rotation[1, 0], rotation[0, 0])),
-                payload=payload if payload.valid else None,
-                payload_shape=shape,
-                scene=primitives,
-                avoid_collisions=request.avoid_collisions,
-                speed_scale=request.speed_scale,
+                payload if payload.valid else None,
+                shape,
+                request.avoid_collisions,
+                request.speed_scale,
             )
         except PlanningError as refusal:
             response.success = False
@@ -406,31 +446,122 @@ class CranePlanner(Node):
             self.get_logger().warn(response.message)
             return response
 
-        trajectory = self._trajectory(plan, self.start_stamp)
-        path = self._path(plan)
-        self.standing = trajectory
-        self.reference.publish(trajectory)
-        self.planned_path.publish(path)
         response.success = True
         response.message = plan.message
         response.trajectory = trajectory
         response.tcp_path = path.poses
-        self.get_logger().info(plan.message)
         return response
 
-    def _trajectory(self, plan, stamp) -> JointTrajectory:
+    def _a2b(self, request, response):
         """
-        Build the actuated six, in canonical order, on the measurement's own clock.
+        Answer the retained `a2b_movement` contract over the same planner.
+
+        Nothing here plans: `crane_planning.a2b` maps the request onto the
+        native call and this runs it, so the two services share one start
+        state, one scene, one kappa and one reference publication.
+
+        `CalcMovement.Response` has **no message field**, so a refusal cannot
+        say why in the answer. It goes to the log, and the trajectory is left
+        empty rather than carrying whatever is still standing -- a caller could
+        not tell those two apart, and the legacy server left it empty too.
+        """
+        response.success = False
+        response.trajectory = JointTrajectory()
+        response.tcp_path = []
+        if self.planner is None:
+            self.get_logger().warn(
+                f"a2b_movement refused: no robot description has arrived on "
+                f"{ROBOT_DESCRIPTION_TOPIC}"
+            )
+            return response
+
+        try:
+            # The payload first, because the offset from the tip pivot to the
+            # tool is read at the pose the tool hangs at *with it on*.
+            payload, _shape = translate_payload(request)
+            start = translate_start(request)
+            if start is None:
+                start = self._start()
+            else:
+                # A supplied feasibility state, not a measurement: it is stamped
+                # now, because there is no measurement whose clock to use.
+                self.start_stamp = self.get_clock().now().to_msg()
+            offset = self.planner.tip_to_tcp_offset(
+                payload, request.phi_tool_n, start.q_tool
+            )
+            goal = translate_request(request, offset)
+            plan, _trajectory, path = self._run(
+                start,
+                goal.position_m,
+                goal.yaw,
+                goal.payload,
+                goal.payload_shape,
+                goal.avoid_collisions,
+                goal.speed_scale,
+            )
+        except PlanningError as refusal:
+            self.get_logger().warn(f"a2b_movement refused: {refusal}")
+            return response
+
+        # The canonical eight, because that is what the trajectory controller
+        # this answer is fed to is configured with. The passive pair costs
+        # nothing to supply -- the OCP solved for it -- and it is the sway the
+        # plan actually claims rather than the pose the tool would settle to.
+        legacy = self._trajectory(plan, self.start_stamp, range(GENERALIZED_DOF))
+        # `publish_path` gates the topic and nothing else: the answer carries
+        # `tcp_path` either way, exactly as the legacy server answered it.
+        if request.publish_path:
+            self.legacy_tcp_path.publish(path)
+
+        response.success = True
+        response.trajectory = legacy
+        response.tcp_path = path.poses
+        return response
+
+    def _run(
+        self, start, position_m, yaw, payload, shape, avoid_collisions, speed_scale
+    ):
+        """Plan, publish the reference and the operator path, and stand by it."""
+        plan = self.planner.plan(
+            start,
+            position_m,
+            yaw,
+            payload=payload,
+            payload_shape=shape,
+            scene=self._primitives(avoid_collisions),
+            avoid_collisions=avoid_collisions,
+            speed_scale=speed_scale,
+        )
+        trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
+        path = self._path(plan)
+        self.standing = trajectory
+        self.reference.publish(trajectory)
+        self.planned_path.publish(path)
+        self.get_logger().info(plan.message)
+        return plan, trajectory, path
+
+    def _trajectory(self, plan, stamp, indices) -> JointTrajectory:
+        """
+        Build a trajectory over `indices` of the canonical eight.
+
+        Two callers want two widths, and the difference is not cosmetic. The
+        native reference carries the **actuated six**, which is what
+        `crane_velocity_controller` claims. The retained `a2b_movement` answer
+        carries the **canonical eight**, because the trajectory controller that
+        consumes it is configured with the passive tip and tilt joints as state
+        -- it commands six and tracks eight, and a goal naming only six is a
+        goal it rejects.
 
         `header.frame_id` is empty on purpose: joint space has no frame.
         """
         trajectory = JointTrajectory()
         trajectory.header.stamp = stamp
-        trajectory.joint_names = [self.joint_names[index] for index in ACTUATED_INDICES]
-        for when, position, velocity in zip(plan.time, plan.q_a, plan.dq_a):
+        trajectory.joint_names = [self.joint_names[index] for index in indices]
+        columns = list(indices)
+        for when, position, velocity in zip(plan.time, plan.q, plan.dq):
             point = JointTrajectoryPoint()
-            point.positions = [float(value) for value in position]
-            point.velocities = [float(value) for value in velocity]
+            point.positions = [float(value) for value in position[columns]]
+            point.velocities = [float(value) for value in velocity[columns]]
             point.time_from_start.sec = int(when)
             point.time_from_start.nanosec = int((when - int(when)) * 1e9)
             trajectory.points.append(point)

@@ -89,9 +89,11 @@ turn out to be unreachable.
 
 | | |
 |---|---|
-| service | `/crane/plan_motion` (`crane_msgs/PlanMotion`) |
+| services | `/crane/plan_motion` (`crane_msgs/PlanMotion`) |
+| | `/a2b_movement` (`timber_crane_planning_interfaces/CalcMovement`) |
 | publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
+| | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's own name, for RViz |
 | subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
 | frame | `K0_mounting_base` for every goal and every published pose; nothing is converted |
 
@@ -109,6 +111,42 @@ Every refusal names itself and leaves the standing reference alone: a goal that
 cannot be reached, a path that cannot be found, a path that cannot be smoothed
 inside the joint ranges and a path that cannot be timed are four different
 answers.
+
+## The `a2b_movement` compatibility service
+
+`/a2b_movement` is served as a drop-in replacement for the legacy
+`a2b_ilqr_server`. It is an **adapter, not a second planner**: `a2b.py` maps the
+`CalcMovement` request onto the native call and `node.py` runs it, so both
+services share one start state, one scene, one kappa and one
+`/crane/reference` publication.
+
+| `CalcMovement` | native | rule |
+|---|---|---|
+| `y_n` | goal position | the **tip pivot K5**, plus the settled tip-to-tool offset read out of the model |
+| (no field) | goal frame | `K0_mounting_base`, asserted and never converted |
+| `phi_tool_n` | goal yaw | about K0's z |
+| `slow_down` | speed scale | `1 / slow_down`; a divider below 1 is refused |
+| `carries_log`, `log_carrying`, `m_log`, `s_log_8`, `coll_shape`, `p_cyl_8` | payload | a tapered log becomes its *enclosing* cylinder, not the legacy mean radius |
+| `check_log_collision`, `check_gripper_collision` | one collision flag | they must agree while a log is carried |
+| `q0`, `q0_dot` | explicit start | all eight canonical rows; the all-zero default means "use the measurement" |
+| `publish_path` | -- | gates the `tcp_path` topic; the answer carries `tcp_path` either way |
+| `t_end`, `v_d_tip`, `logs_scene` | -- | refused unless empty, each by name |
+
+**The answer carries the canonical eight**, not the actuated six: the
+`trajectory_controller_a2b` this trajectory is fed to is configured with the
+passive tip and tilt joints among its `joints` -- it commands six and tracks
+eight -- so a goal naming only six is a goal it rejects. The passive columns
+carry the sway the OCP *planned*, which costs nothing because the OCP solves for
+it anyway, and is what the trajectory actually claims: on the way to the goal the
+tool is swinging.
+
+Three things the legacy server published that this does not: the
+`path_marker` / `target_marker` / `collision_marker_array` RViz overlays, the
+`plot_subplot` (`plotter_msgs`) trace, and the latched `joint_trajectory` copy.
+Nothing in the workspace subscribes to any of them. `joint_trajectory` is left
+out on purpose rather than merely unimplemented: it would give this node a
+second `JointTrajectory` publisher, and that count is what the launch contract
+reads as evidence that the planner cannot be a second command producer.
 
 ## Build and run
 

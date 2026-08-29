@@ -302,6 +302,11 @@ class Equilibrium:
     #: Samples per axis in the cold-start scan. Five over the pi of tip range
     #: puts a sample well inside the hanging well.
     SAMPLES = 5
+    #: How far outside the description's passive range an answer may land and
+    #: still be that range's own edge. At a canonical pose the tool hangs
+    #: *exactly* on the tip limit, and Newton reaches it from below by two ulps;
+    #: a bare comparison then refuses the pose the machine is actually in.
+    RANGE_TOLERANCE = 1.0e-6
 
     def __init__(self, model: symbolic_model.CraneSymbolicModel, limits: Limits):
         q_a = ca.SX.sym("q_a", PLANNED_DOF)
@@ -365,9 +370,11 @@ class Equilibrium:
             except np.linalg.LinAlgError:
                 return None
             if np.linalg.norm(residual) <= self.RESIDUAL_NM:
-                if np.any(q_u < self._lower) or np.any(q_u > self._upper):
+                if np.any(q_u < self._lower - self.RANGE_TOLERANCE) or np.any(
+                    q_u > self._upper + self.RANGE_TOLERANCE
+                ):
                     return None
-                return q_u
+                return np.clip(q_u, self._lower, self._upper)
             q_u = q_u - np.linalg.solve(factor.T, np.linalg.solve(factor, residual))
             if not np.all(np.isfinite(q_u)):
                 return None
@@ -512,6 +519,11 @@ class Geometry:
 def yaw_of(rotation: np.ndarray) -> float:
     """Return the rotation about K0 z, which is the whole of what a goal fixes."""
     return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+
+
+def _wrap(angle: float) -> float:
+    """Fold an angle difference into (-pi, pi]."""
+    return float(np.arctan2(np.sin(angle), np.cos(angle)))
 
 
 def solve_ik(
@@ -891,7 +903,7 @@ class TimingOcp:
         """
         rate = np.abs(blocks[:, 5:10])
         allowed = self.config.kappa * speed_scale * self.limits.dq_max
-        ceiling = np.full(len(blocks), self.config.sigma_rate_max)
+        ceiling = np.full(len(blocks), speed_scale * self.config.sigma_rate_max)
         for node in range(len(blocks)):
             moving = rate[node] > 1.0e-9
             if np.any(moving):
@@ -907,6 +919,8 @@ class TimingOcp:
         equilibrium: np.ndarray,
         payload: np.ndarray,
         sigma_dot_start: float | None,
+        accel_max: np.ndarray,
+        flow_max: float,
     ) -> np.ndarray:
         """
         Build a path-rate profile that is already close to admissible.
@@ -923,7 +937,7 @@ class TimingOcp:
         """
         guess = ceiling.copy()
         curvature = np.abs(blocks[:, 10:15])
-        allowed = self.config.kappa * self.config.ddq_a_max
+        allowed = self.config.kappa * accel_max
         for node in range(len(blocks)):
             turning = curvature[node] > 1.0e-9
             if np.any(turning):
@@ -940,7 +954,7 @@ class TimingOcp:
             )
             return max(
                 float(np.max(force)),
-                float(abs(float(flow))) / (self.config.kappa * self.limits.flow_max),
+                float(abs(float(flow))) / (self.config.kappa * flow_max),
             )
 
         floor = 2.0 * self.config.sigma_rate_min
@@ -989,6 +1003,20 @@ class TimingOcp:
         nodes = np.linspace(0.0, 1.0, intervals + 1)
         blocks = self._blocks(path, q_tool, nodes)
         middles = self._blocks(path, q_tool, nodes[:-1] + 0.5 * span)
+        # What a speed scale scales. It is the caller's own divider on the
+        # machine's allowance, so it takes every *rate* budget with it: joint
+        # velocity, the path rate itself, and the pump. Acceleration goes with
+        # its square, because along a fixed path `ddq_a` is quadratic in the
+        # rate. The cylinder force allowance is deliberately untouched --
+        # gravity does not slow down, and a lift that needs the force standing
+        # still needs it at half speed too.
+        #
+        # Scaling the pump is what makes the divider mean anything on this
+        # machine: these moves are flow-limited long before they are
+        # velocity-limited, so a scale that only touched the joint speeds would
+        # hand a caller asking for half speed the very same trajectory back.
+        accel_max = speed_scale**2 * config.ddq_a_max
+        flow_max = speed_scale * self.limits.flow_max
         ceiling = self._ceiling(blocks, speed_scale)
         if sigma_dot_start is not None and sigma_dot_start > ceiling[0]:
             raise PlanningError(
@@ -1057,13 +1085,11 @@ class TimingOcp:
             here = state[:, node]
             input_ = control[min(node, intervals - 1)]
             ddq_a, force, flow = self.demand(here, input_, blocks[node], payload_vector)
-            allowed = config.kappa * config.ddq_a_max
+            allowed = config.kappa * accel_max
             opti.subject_to(opti.bounded(-allowed, ddq_a, allowed))
             allowed = config.kappa * self.limits.force_max
             opti.subject_to(opti.bounded(-allowed, force, allowed))
-            opti.subject_to(
-                opti.bounded(0.0, flow, config.kappa * self.limits.flow_max)
-            )
+            opti.subject_to(opti.bounded(0.0, flow, config.kappa * flow_max))
 
         opti.subject_to(
             opti.bounded(-config.sigma_accel_max, control, config.sigma_accel_max)
@@ -1094,7 +1120,13 @@ class TimingOcp:
 
         opti.minimize(cost)
         guess = self._guess(
-            blocks, ceiling, equilibrium, payload_vector, sigma_dot_start
+            blocks,
+            ceiling,
+            equilibrium,
+            payload_vector,
+            sigma_dot_start,
+            accel_max,
+            flow_max,
         )
         opti.set_initial(sigma_dot, guess)
         opti.set_initial(q_u, equilibrium.T)
@@ -1169,6 +1201,7 @@ class Start:
 
     q: np.ndarray  # the canonical eight
     dq_a: np.ndarray  # the planned five
+    dq_u: np.ndarray = field(default_factory=lambda: np.zeros(2))  # the sway rate
     passive_measured: bool = True
 
     @property
@@ -1189,8 +1222,8 @@ class Plan:
     """A trajectory, the geometry it was found on, and how it was arrived at."""
 
     time: np.ndarray
-    q_a: np.ndarray  # actuated six, resampled at Ts
-    dq_a: np.ndarray
+    q: np.ndarray  # the canonical eight, resampled at Ts, one row per sample
+    dq: np.ndarray
     tcp: np.ndarray  # tool position in K0_mounting_base, one row per sample
     timing: Timing
     message: str
@@ -1198,6 +1231,15 @@ class Plan:
     @property
     def duration(self) -> float:
         return float(self.time[-1])
+
+    @property
+    def q_a(self) -> np.ndarray:
+        """The actuated six, which is what the native reference carries."""
+        return self.q[:, list(ACTUATED_INDICES)]
+
+    @property
+    def dq_a(self) -> np.ndarray:
+        return self.dq[:, list(ACTUATED_INDICES)]
 
 
 class Planner:
@@ -1294,11 +1336,20 @@ class Planner:
             ]
         )
         q_u_start = start.q_u if start.passive_measured else equilibrium[0]
-        dq_u_start = np.zeros(2)
+        dq_u_start = (
+            np.asarray(start.dq_u, dtype=float)
+            if start.passive_measured
+            else np.zeros(2)
+        )
         if np.any(np.abs(q_u_start - equilibrium[0]) > self.config.q_sway_max):
             raise PlanningError(
                 "the tool is swinging further than the admissible sway bound, so "
                 "there is no plan that keeps it inside one"
+            )
+        if np.any(np.abs(dq_u_start) > self.config.dq_sway_max):
+            raise PlanningError(
+                "the tool is swinging faster than the admissible sway rate, so there is "
+                "no plan that starts from it"
             )
 
         timing = self.ocp.solve(
@@ -1313,6 +1364,71 @@ class Planner:
         )
         return self._resample(geometry, path, timing, start)
 
+    def _settled(
+        self, q_a: np.ndarray, q_tool: float, payload: np.ndarray
+    ) -> np.ndarray:
+        """Return the canonical eight at `q_a` with the passive pair hanging."""
+        q = np.zeros(GENERALIZED_DOF)
+        q[list(PLANNED_INDICES)] = q_a
+        q[TOOL_INDEX] = q_tool
+        q[list(PASSIVE_INDICES)] = self.equilibrium.solve(q_a, q_tool, payload)
+        return q
+
+    def _tcp_yaw(self, q: np.ndarray) -> float:
+        pose = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
+        return yaw_of(
+            pin.XYZQUATToSE3(
+                np.concatenate([pose.position_m, pose.orientation_xyzw])
+            ).rotation
+        )
+
+    def tip_to_tcp_offset(
+        self, payload: Payload | None, yaw: float, q_tool: float
+    ) -> np.ndarray:
+        """
+        Where the tool hangs relative to the tip pivot K5, for one payload and yaw.
+
+        The retained `a2b_movement` goal names the pivot and the native goal
+        names the tool, so the adapter needs the vector between them. It is read
+        out of the model at the hanging equilibrium and never written down: the
+        PZS100's rail gripper and the 7040's jaw do not hang at the same offset,
+        and a centre of mass off the tool axis changes it again.
+
+        The two passive joints make the settled offset independent of the boom
+        and telescope pose -- once the pendulum is settled, only rotation about
+        gravity moves this vector. So the description's own yaw convention is
+        measured at a canonical pose, the slew is turned by the difference, the
+        pendulum is settled again, and the result is *checked* to carry the
+        requested yaw rather than assumed to.
+        """
+        if not (np.isfinite(yaw) and np.isfinite(q_tool)):
+            raise PlanningError(
+                "`phi_tool_n` or the tool coordinate q8 is not finite, so the hanging "
+                "tip-to-tool offset cannot be evaluated"
+            )
+        vector = payload_parameters(payload)
+        q_a = np.zeros(PLANNED_DOF)
+        canonical = self._settled(q_a, q_tool, vector)
+        q_a[0] = _wrap(yaw - self._tcp_yaw(canonical))
+        q = self._settled(q_a, q_tool, vector)
+
+        error = _wrap(self._tcp_yaw(q) - yaw)
+        if abs(error) > 1.0e-9:
+            raise PlanningError(
+                f"the settled pose used to translate `y_n` misses `phi_tool_n` by "
+                f"{error:.3e} rad, so its tip-to-tool offset cannot be applied without "
+                "approximation"
+            )
+        tip = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TIP)
+        tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
+        offset = tcp.position_m - tip.position_m
+        if not (np.all(np.isfinite(offset)) and np.linalg.norm(offset) > 0.0):
+            raise PlanningError(
+                "the description produced no finite non-zero offset from the tip pivot to "
+                "the tool centre point, so `y_n` cannot be placed on the native tool goal"
+            )
+        return offset
+
     def _resample(self, geometry, path, timing, start: Start) -> Plan:
         """
         Put the answer on the emitted reference's own clock.
@@ -1322,6 +1438,12 @@ class Planner:
         time the solve produced, and the joint rates are re-derived from
         `q_a'(sigma) sigma_dot` there rather than interpolated -- interpolating a
         derivative and its integral separately is how the two stop agreeing.
+
+        The passive pair is carried too, and it is the sway the OCP **planned**
+        rather than the pose the tool would settle to. It costs nothing -- the
+        OCP solves for it either way -- and it is what the trajectory actually
+        claims: on the way to the goal the tool is swinging, and a consumer
+        tracking the passive joints as state wants the swing, not the rest pose.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
@@ -1330,21 +1452,23 @@ class Planner:
         sigma = np.interp(stamps, timing.time, timing.sigma)
         rate = np.interp(stamps, timing.time, timing.sigma_dot)
 
-        q_a = np.empty((len(stamps), len(ACTUATED_INDICES)))
-        dq_a = np.empty_like(q_a)
-        q_a[:, :PLANNED_DOF] = path.position(sigma)
-        q_a[:, PLANNED_DOF] = start.q_tool
-        dq_a[:, :PLANNED_DOF] = path.rate(sigma) * rate[:, None]
-        dq_a[:, PLANNED_DOF] = 0.0
+        q = np.zeros((len(stamps), GENERALIZED_DOF))
+        dq = np.zeros_like(q)
+        q[:, list(PLANNED_INDICES)] = path.position(sigma)
+        q[:, TOOL_INDEX] = start.q_tool
+        dq[:, list(PLANNED_INDICES)] = path.rate(sigma) * rate[:, None]
+        for slot, index in enumerate(PASSIVE_INDICES):
+            q[:, index] = np.interp(stamps, timing.time, timing.q_u[:, slot])
+            dq[:, index] = np.interp(stamps, timing.time, timing.dq_u[:, slot])
 
+        # The tool where the plan says it is, sway included -- not where it
+        # would hang if the machine stopped at each sample.
         tcp = np.array(
             [
                 geometry.model.forward_kinematics(
-                    geometry.configuration(row[:PLANNED_DOF]),
-                    Frame.MOUNTING_BASE,
-                    Frame.TCP,
+                    row, Frame.MOUNTING_BASE, Frame.TCP
                 ).position_m
-                for row in q_a
+                for row in q
             ]
         )
         message = (
@@ -1355,9 +1479,7 @@ class Planner:
             f"and peak pump draw {np.max(timing.pump_flow) / self.limits.flow_max:.2f} "
             f"of the physical limit, at kappa = {self.config.kappa}"
         )
-        return Plan(
-            time=stamps, q_a=q_a, dq_a=dq_a, tcp=tcp, timing=timing, message=message
-        )
+        return Plan(time=stamps, q=q, dq=dq, tcp=tcp, timing=timing, message=message)
 
 
 def payload_parameters(payload: Payload | None) -> np.ndarray:
