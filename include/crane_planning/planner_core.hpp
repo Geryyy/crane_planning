@@ -90,7 +90,7 @@ struct PlannerSettings
    * thin: `wiki/implementation/parameters.md` 7 lists the pressure constants
    * among its gaps, so this is the one number in the force limit that is neither
    * measured nor readable off the description. The chamber areas *are* the
-   * model's, through `derive_cylinder_force_limits`.
+   * model's, through `crane_model::derive_cylinder_force_limits`.
    */
   double system_pressure_pa{2.5e7};
 
@@ -188,7 +188,6 @@ struct MotionPlan
 
   /// What each stage of this plan cost, against 7's budget. See `replanning.hpp`.
   std::vector<StageTiming> stages{};
-
 };
 
 /// Plan one move, or refuse it and say what could not be done.

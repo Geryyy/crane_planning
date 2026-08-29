@@ -21,6 +21,7 @@
   <exec_depend>eigen</exec_depend>
   <depend>crane_model</depend>
   <depend>crane_msgs</depend>
+  <depend>crane_ocp</depend>
   <depend>generate_parameter_library</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>

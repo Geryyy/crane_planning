@@ -52,39 +52,33 @@ the four tolerances, the wall-clock budget, **and `N`**: acados writes
 `<name>_acados_create_with_discretization(capsule, N, steps)` beside the fixed-`N`
 entry point, so `TimingOcpSettings::intervals` is still an argument.
 
-## The generated tree is normalised on write
+## What is boilerplate lives in `crane_ocp`
 
-`ament_cpplint` and `ament_cppcheck` match `.c` and `.h`, and machine output fails
-them by thousands. What this tree can be is a **fixed point of the hooks that
-rewrite files**: every generated file has its trailing whitespace stripped and ends
-in exactly one newline. Do not pass `generated/` to `pre-commit run --files`.
+The scratch-JSON code generation, the pruning, the whitespace normalisation and
+the `--check` byte-compare are `crane_ocp/scripts/crane_ocp_export.py` -- the same
+module `crane_mpc/scripts/export_ocp.py` uses, because that half of the two
+exporters was the same code twice. What is left here is the problem.
 """
 
 from __future__ import annotations
 
 import argparse
-import filecmp
-import shutil
 import sys
-import tempfile
 from pathlib import Path
 
 import casadi as ca
 import numpy as np
-import yaml
-from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
+from acados_template import AcadosModel, AcadosOcp
 
 PACKAGE = Path(__file__).resolve().parent.parent
 
-# `crane_model`'s `scripts/` is not installed (issue 070's notes), so the shared
-# model module is imported by path out of the source tree, exactly as
-# `crane_mpc/scripts/export_ocp.py` imports it.
-MODEL_PACKAGE = PACKAGE.parent / "crane_model"
-sys.path.insert(0, str(MODEL_PACKAGE / "scripts"))
+# Neither `crane_ocp`'s nor `crane_model`'s `scripts/` is installed (issue 070's
+# notes), so both shared modules are imported by path out of the source tree.
+sys.path.insert(0, str(PACKAGE.parent / "crane_ocp" / "scripts"))
 
-import crane_symbolic as cs  # noqa: E402
+import crane_ocp_export as ox  # noqa: E402
 
-DEFAULT_DESCRIPTIONS = MODEL_PACKAGE / "test" / "description"
+cs = ox.import_crane_symbolic(PACKAGE)
 
 # One solver per tool, for the reason `crane_mpc` ships two: the description is
 # baked into the dynamics, and the two descriptions are different machines.
@@ -95,10 +89,6 @@ DESCRIPTIONS = (
 
 SOLVER_PREFIX = "crane_planning_timing"
 GENERATED_HEADER = "crane_planning_timing_ocp_generated.h"
-
-UNSHIPPED = ("Makefile", "acados_solver.pxd")
-UNSHIPPED_PREFIXES = ("main_", "acados_sim_solver_")
-UNSHIPPED_SUFFIXES = ("_hess.c",)
 
 # --- the problem's own dimensions ---------------------------------------------
 
@@ -156,16 +146,6 @@ DEFAULT_LEVENBERG_MARQUARDT = 1.0e-2
 # ------------------------------------------------------------------ the numbers
 
 
-def read_parameters(path: Path) -> dict:
-    """Read this package's hydraulic limits down to their `ros__parameters`."""
-    with open(path) as stream:
-        root = yaml.safe_load(stream)
-    node = root["crane_planner"]["ros__parameters"]
-    if not isinstance(node, dict):
-        raise ValueError(f"{path}: crane_planner.ros__parameters is not a mapping")
-    return node
-
-
 def constraint_scale(model: cs.CraneSymbolicModel, hydraulics: dict) -> np.ndarray:
     """
     Return the divisor of each row of `h`, in that row's own physical unit.
@@ -185,15 +165,12 @@ def constraint_scale(model: cs.CraneSymbolicModel, hydraulics: dict) -> np.ndarr
     planned axis, so a divisor would only move the row away from the scale the
     other ten are being brought to.
     """
-    relief = float(hydraulics["system_pressure_pa"])
-    pressure = np.full(cs.K_ACTUATED_DOF, relief)
-    zero = np.zeros(cs.K_ACTUATED_DOF)
-    # `wiki/hydraulics.md` §4's F_i = A_A p_A - A_B p_B, asked of the shared model
-    # rather than restated: the two chambers pressurised one at a time. The
-    # **larger** of the two, exactly as `export_ocp.py`'s own divisor, so a row
-    # this package conditions and a row the MPC conditions are the same number.
-    extend = np.array(ca.evalf(model.chamber_force(pressure, zero))).ravel()
-    retract = np.array(ca.evalf(model.chamber_force(zero, pressure))).ravel()
+    # The **larger** of the two chamber forces, exactly as `export_ocp.py`'s own
+    # divisor, so a row this package conditions and a row the MPC conditions are
+    # the same number.
+    extend, retract = ox.chamber_forces(
+        model, hydraulics["system_pressure_pa"], cs.K_ACTUATED_DOF
+    )
 
     scale = np.ones(NH)
     for axis in cs.K_PLANNED_AXES:
@@ -421,61 +398,6 @@ def build_ocp(description_xml: str, tool: str, hydraulics: dict) -> tuple:
 # ------------------------------------------------------------------ generation
 
 
-def write_output_map(model: cs.CraneSymbolicModel, name: str, tree: Path) -> None:
-    """
-    Code-generate the shared output map beside the solver, in physical units.
-
-    acados generates only what it solves, and what it solves is eleven rows each
-    already divided by its conditioning constant. Three things need the physical
-    quantity instead: `OcpNode`'s record of what the answer demands of the
-    machine, the static-force refusal that names a path no timing exists for, and
-    the bisected warm start, which asks how far outside constraints 6 and 7 a
-    node is at a candidate rate.
-
-    It is `crane_symbolic`'s own `z` over the module's own `(x, u, p)` --
-    **exactly the function `crane_mpc` ships**, up to the symbol prefix, which is
-    what `test_timing_ocp.cpp` compares the two trees on.
-    """
-    function = ca.Function(
-        f"{name}_output",
-        [model.x, model.u, model.p],
-        [ca.densify(model.z)],
-        ["x", "u", "p"],
-        ["z"],
-    )
-    generator = ca.CodeGenerator(
-        f"{name}_output.c",
-        {
-            "mex": False,
-            "casadi_int": "int",
-            "casadi_real": "double",
-            "with_header": True,
-        },
-    )
-    generator.add(function)
-    generator.generate(str(tree) + "/")
-
-
-def normalise(path: Path) -> None:
-    """Strip trailing whitespace and leave exactly one final newline."""
-    text = path.read_text()
-    body = "\n".join(line.rstrip() for line in text.splitlines())
-    path.write_text(body.rstrip("\n") + "\n")
-
-
-def prune(tree: Path) -> None:
-    """Delete what acados generates and this package does not ship."""
-    for path in sorted(tree.rglob("*")):
-        if not path.is_file():
-            continue
-        if (
-            path.name in UNSHIPPED
-            or path.name.startswith(UNSHIPPED_PREFIXES)
-            or path.name.endswith(UNSHIPPED_SUFFIXES)
-        ):
-            path.unlink()
-
-
 def write_header(output: Path, scale: np.ndarray) -> Path:
     """Write the numbers `src/timing_ocp.cpp` would otherwise derive a second time."""
     path = output / GENERATED_HEADER
@@ -640,85 +562,28 @@ def generate(output: Path, descriptions: Path, hydraulics: dict) -> None:
         ocp, scale, model = build_ocp(
             (descriptions / description).read_text(), tool, hydraulics
         )
-        name = ocp.model.name
-        tree = output / name
-        ocp.code_export_directory = str(tree)
-        # The JSON is the only artifact carrying the absolute path of the tree it
-        # was written into, so it goes to a scratch file: a checked-in copy would
-        # differ between a devcontainer and a native checkout for a reason that
-        # has nothing to do with the OCP.
-        with tempfile.TemporaryDirectory() as scratch:
-            AcadosOcpSolver.generate(ocp, json_file=str(Path(scratch) / f"{name}.json"))
-        prune(tree)
-        write_output_map(model, name, tree)
+        tree = ox.generate_solver(ocp, output)
+        ox.write_output_map(model, ocp.model.name, tree)
 
     write_header(output, scale)
-    (output / "README.md").write_text(README)
-    for path in sorted(output.rglob("*")):
-        if path.is_file():
-            normalise(path)
-
-
-def compare(left: Path, right: Path) -> list:
-    """Return every path under `left` that `right` does not match byte for byte."""
-    differences = []
-    names = {path.relative_to(left) for path in left.rglob("*") if path.is_file()}
-    names |= {path.relative_to(right) for path in right.rglob("*") if path.is_file()}
-    for name in sorted(names):
-        one = left / name
-        other = right / name
-        if not one.is_file() or not other.is_file():
-            differences.append(name)
-        elif not filecmp.cmp(one, other, shallow=False):
-            differences.append(name)
-    return differences
+    ox.finalise(output, README)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    parser.add_argument(
-        "--descriptions",
-        type=Path,
-        default=DEFAULT_DESCRIPTIONS,
-        help="where the two expanded machine descriptions are",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=PACKAGE / "generated",
-        help="where the generated solvers go",
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="regenerate into a scratch tree and diff instead of rewriting",
-    )
+    ox.add_arguments(parser, PACKAGE)
     arguments = parser.parse_args()
 
-    hydraulics = read_parameters(PACKAGE / "config" / "hydraulic_limits.yaml")
+    hydraulics = ox.read_ros_parameters(
+        PACKAGE / "config" / "hydraulic_limits.yaml", "crane_planner"
+    )
 
-    if not arguments.check:
-        if arguments.output.exists():
-            shutil.rmtree(arguments.output)
-        generate(arguments.output, arguments.descriptions, hydraulics)
-        print(f"wrote {arguments.output}")
-        return 0
-
-    with tempfile.TemporaryDirectory() as scratch:
-        fresh = Path(scratch) / "generated"
-        generate(fresh, arguments.descriptions, hydraulics)
-        differences = compare(arguments.output, fresh)
-    if differences:
-        print(
-            "the checked-in solver is not what `export_timing_ocp.py` writes "
-            "today. Re-run the script and commit the result; if only the CasADi "
-            "or acados banner moved, the toolchain changed rather than the model."
-        )
-        for name in differences:
-            print(f"  {name}")
-        return 1
-    print("the checked-in solver is current")
-    return 0
+    return ox.run(
+        arguments.output,
+        arguments.check,
+        lambda output: generate(output, arguments.descriptions, hydraulics),
+        "export_timing_ocp.py",
+    )
 
 
 if __name__ == "__main__":

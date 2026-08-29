@@ -39,7 +39,8 @@ crane_model::Result<PlannerContext> build_planner(
   // relief setting is a deployment constant. A description whose cylinders have
   // no usable area is refused here instead of at the first plan, so a machine
   // that cannot have a force limit never answers a request as though it had one.
-  auto forces = derive_cylinder_force_limits(model, settings.system_pressure_pa);
+  auto forces =
+    crane_model::derive_cylinder_force_limits(model, settings.system_pressure_pa);
   if (!forces.ok()) {
     return Result<PlannerContext>::failure(forces.status());
   }
@@ -48,7 +49,14 @@ crane_model::Result<PlannerContext> build_planner(
   context.limits = std::move(limits).value();
   context.geometry = std::move(geometry).value();
   context.settings = settings;
-  context.settings.timing.actuation.cylinder_force_max = forces.value();
+  // The **smaller** of the two chamber forces, because mpc.md 3 constraint 6 is
+  // written symmetrically in `|tau_i|` and the retracting side of a differential
+  // cylinder is the weaker one. That projection is the planner-shaped part; the
+  // two-sided answer is the model's.
+  for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+    context.settings.timing.actuation.cylinder_force_max[row] =
+      forces.value()[row].symmetric();
+  }
   return Result<PlannerContext>::success(std::move(context));
 }
 

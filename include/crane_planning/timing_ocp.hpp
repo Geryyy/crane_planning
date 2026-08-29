@@ -119,6 +119,16 @@ struct ActuationLimits
    * `F_cyl = tau_a,i / J_c,ii` -- so the configuration dependence of
    * `|tau_i| <= J_c,ii F_i^max` is carried by the transmission and the number
    * here is a plain cylinder force.
+   *
+   * **Where it comes from.** `crane_model::derive_cylinder_force_limits` answers
+   * it from the chamber areas the description carries and the relief pressure a
+   * deployment states -- `config/hydraulic_limits.yaml` is where this package
+   * writes that pressure down *with its evidence*, which is thin:
+   * `wiki/implementation/parameters.md` 7 lists the pressure constants among its
+   * gaps. What is planner-shaped, and so is here rather than there, is that the
+   * bound is **symmetric**: constraint 6 is written in `|tau_i|`, so the number
+   * taken is the smaller of the two directions, which on a differential cylinder
+   * is the retracting one.
    */
   std::array<double, crane_model::kActuatedDof> cylinder_force_max{};
 
@@ -387,25 +397,6 @@ struct TimingOcpRequest
   /// 7's measured initial state. Default-constructed is the stopped start.
   TimingOcpStart start{};
 };
-
-/// `F_i^max` from the model's own chamber areas and the relief pressure.
-/**
- * `wiki/trajectory_planning.md` 3 records that **no existing planner enforces
- * the force limit**, so there is no earlier number to inherit -- and
- * `wiki/implementation/parameters.md` carries the chamber areas but no relief
- * setting at all; 7 lists the pressure constants among its gaps. What is
- * available is `hydraulics.md` 4's `F_i = A_A p_A - A_B p_B`, which
- * `Model::cylinder_force` already implements, so the areas are asked of the
- * model rather than copied into a parameter file where they would drift.
- *
- * The limit returned is the **smaller** of the two chamber areas times
- * `system_pressure_pa`, because mpc.md 3 constraint 6 is written symmetrically
- * in `|tau_i|` and the retracting side of a differential cylinder is the weaker
- * one. `system_pressure_pa` is the one number this cannot derive and it is not
- * measured -- see `config/hydraulic_limits.yaml`.
- */
-[[nodiscard]] crane_model::Result<std::array<double, crane_model::kActuatedDof>>
-derive_cylinder_force_limits(const crane_model::Model & model, double system_pressure_pa);
 
 /// Solve 5.2's OCP along `path`, or refuse and say what the solver said.
 /**

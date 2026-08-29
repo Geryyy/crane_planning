@@ -21,6 +21,9 @@ find_package(acados REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(crane_model REQUIRED)
 find_package(crane_msgs REQUIRED)
+# The acados layer, once: the capsule binding both this package and `crane_mpc`
+# open their generated solvers through.
+find_package(crane_ocp REQUIRED)
 find_package(generate_parameter_library REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -142,6 +145,7 @@ target_link_libraries(planner_core
     ruckig::ruckig
   PRIVATE
     acados
+    crane_ocp::crane_ocp
     ${OMPL_LIBRARIES}
     urdfdom::urdfdom_model
   PUBLIC
@@ -233,6 +237,7 @@ ament_export_libraries(crane_planning_generated_ocp planner_core planner_node)
 ament_export_dependencies(
   crane_model
   crane_msgs
+  crane_ocp
   Eigen3
   geometry_msgs
   rclcpp

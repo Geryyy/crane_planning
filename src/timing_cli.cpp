@@ -456,11 +456,13 @@ int main(int argc, char ** argv)
               "--system-pressure-pa is required; config/hydraulic_limits.yaml is the file "
               "that carries the number and the evidence for it");
     }
-    auto forces = crane_planning::derive_cylinder_force_limits(model, system_pressure);
+    auto forces = crane_model::derive_cylinder_force_limits(model, system_pressure);
     if (!forces.ok()) {
       throw std::runtime_error("cylinder force limits: " + forces.status().message);
     }
-    settings.actuation.cylinder_force_max = forces.value();
+    for (std::size_t row = 0; row < crane_model::kActuatedDof; ++row) {
+      settings.actuation.cylinder_force_max[row] = forces.value()[row].symmetric();
+    }
     settings.actuation.ddq_a_max =
       fixed_list<crane_model::kActuatedDof>(arguments, "ddq-a-max", settings.actuation.ddq_a_max);
     settings.actuation.pump_flow_max =
