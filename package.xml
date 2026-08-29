@@ -2,73 +2,43 @@
 <package format="3">
   <name>crane_planning</name>
   <version>0.1.0</version>
-  <description>OMPL geometry and generated acados timing for the `crane_planner`
-    node. Provides `/crane/plan_motion` and the `/a2b_movement` compatibility
-    adapter; grip motion is owned by concrete_block_motion_planning.</description>
+  <description>The `crane_planner` node: an OMPL geometric search over the five
+    planned joint coordinates, a C2 fit, and one CasADi/IPOPT optimal control
+    problem that decides how fast the path may be traversed. Provides
+    `/crane/plan_motion`; grip motion is owned by
+    concrete_block_motion_planning.</description>
   <maintainer email="maintainers@example.invalid">Architecture maintainers</maintainer>
   <license>Apache-2.0</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
-  <!-- The optimal control problem of trajectory_planning §5.2.  Libraries §1
-       lists acados against "the optimal control problems of `mpc` and
-       `trajectory_planning`", which is this one and issue 049's; no NLP is
-       written by hand here.  There is no rosdep key for acados and none is
-       invented: the image installs it to /usr/local, and CMakeLists.txt records
-       how `find_package(acados)` resolves it. -->
-  <build_depend>acados</build_depend>
-  <exec_depend>acados</exec_depend>
-  <build_depend>eigen</build_depend>
-  <exec_depend>eigen</exec_depend>
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Everything the machine can do (reach, hang, collide, lift) is asked of
+       this package. No geometry and no constant is restated here; the OCP is
+       assembled from `crane_model.symbolic`'s own CasADi graph. -->
   <depend>crane_model</depend>
   <depend>crane_msgs</depend>
-  <depend>crane_ocp</depend>
-  <depend>generate_parameter_library</depend>
+  <!-- The optimal control problem of wiki/trajectory_planning.md 5.2, written
+       once and solved with IPOPT. libraries.md 1 lists CasADi for exactly this;
+       no NLP is written by hand. -->
+  <depend>casadi</depend>
+  <!-- RRT-Connect is the sole geometric search, through OMPL's own Python
+       bindings. libraries.md 1 lists it for sampling-based path planning; no
+       RRT is written here and MoveIt is not required. -->
+  <depend>ompl</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
-  <!-- OMPL RRT-Connect is the sole geometric search. Its polyline is
-       shortcut, fitted to the required C² path, and revalidated before the
-       generated acados timing OCP consumes it. MoveIt is not required. -->
-  <depend>ompl</depend>
-  <depend>rclcpp</depend>
-  <exec_depend>launch</exec_depend>
-  <exec_depend>launch_ros</exec_depend>
-  <!-- Ruckig supplies the jerk-limited boundary-condition solve used to fit
-       the C² path between OMPL and the timing OCP. -->
-  <depend>ruckig</depend>
+  <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
-  <!-- `a2b_movement` (`CalcMovement.srv`), the one retained planning contract
-       ROS 2 Interfaces §9 keeps compatible, and the message package its payload
-       fields are made of.  These are **retained-tree interface packages, not new
-       dependencies** in Libraries' sense: that page governs which libraries this
-       workspace may take on, and these two are `.srv` and `.msg` definitions the
-       timber stack already builds and this workspace already installs.  Adding
-       them is what makes the adapter possible without carrying `LogShape` any
-       further than the adapter itself.  `wood_log_msgs` is named even though no
-       header here includes it directly, because `CalcMovement` embeds `LogShape`
-       and `Log[]`: an interface dependency that is only transitive is one a
-       manifest walk cannot see. -->
-  <depend>timber_crane_planning_interfaces</depend>
   <depend>trajectory_msgs</depend>
-  <depend>wood_log_msgs</depend>
-  <!-- Pinocchio's own URDF front end, and the one `crane_model` parses the
-       description with (`src/model.cpp`).  It is used here for the one thing the
-       frozen model API does not expose and this planner cannot invent: the
-       position and velocity limits the description gives the six actuated
-       joints.  Libraries lists Pinocchio for "URDF and SRDF parsing"; writing a
-       second XML reader here is what its Style Guide 1.1 forbids. -->
-  <depend>urdfdom</depend>
-  <!-- The two installed developer scripts, `plan_a2b` and `timing_a2b`.  They
-       are not part of the planner and nothing in `src/` imports them, but they
-       are installed as programs and `ros2 run` has to be able to start them, so
-       what they import is declared.  `rclpy` is `plan_a2b`'s alone: `timing_a2b`
-       drives the compiled `crane_planning_timing_cli` and joins no graph. -->
-  <exec_depend>python3-matplotlib</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <!-- `scripts/plan_example.py` alone; the node draws nothing. -->
+  <exec_depend>python3-matplotlib</exec_depend>
 
   <export>
-    <build_type>ament_cmake</build_type>
+    <build_type>ament_python</build_type>
   </export>
 </package>

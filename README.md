@@ -1,142 +1,118 @@
 # crane_planning
 
-## Offline-style A-to-B visualization
+The `crane_planner` node. Three stages and one dependency that matters.
 
-After starting `crane_planner_node` with the normal robot description and state
-publishers, a single planner response can be plotted without writing a second
-planner:
-
-```bash
-ros2 run crane_planning plan_a2b --goal 1.5 0.0 1.2 --yaw 0.0 --show
+```
+PlanMotion(goal in K0_mounting_base)
+  -> inverse kinematics        the joint configuration that puts the tool there, hanging
+  -> OMPL RRT-Connect          a collision-free polyline in the five planned coordinates
+  -> C2 fit                    q_a(sigma) with q_a' and q_a'' defined everywhere
+  -> CasADi/IPOPT timing OCP   how fast that path may be traversed
+  -> JointTrajectory on /crane/reference
 ```
 
-The goal is expressed in `K0_mounting_base`. The script saves `plan_a2b.png`
-and the returned joint/TCP samples as `plan_a2b.csv`; use `--output` to choose
-another basename. Collision checking is enabled by default and can be disabled
-with `--no-collision-check`.
+Everything the machine can do -- reach, hang, collide, lift -- is asked of
+`crane_model`. Nothing about the machine is written down here: joint ranges and
+velocity limits come from the `robot_description` the profile remaps this node
+onto, the cylinder areas and the equations of motion come from
+`crane_model.symbolic`, and the two numbers the description does not carry (the
+pump limit and the relief setting) are in `config/crane_planner.yaml` with their
+evidence beside them.
 
-## Standalone timing-OCP tuning
+## The three stages, and why each one is there
 
-Tuning the time parametrization of §5.2 does not need a graph, and it does not
-need a second implementation of the problem either. `crane_planning_timing_cli`
-is the deployed `solve_timing_ocp` with a `main` in front of it: no ROS, no
-node, one path, one solve, one CSV. `scripts/timing_a2b.py` builds its argument
-list and plots what comes back. The binary is installed; the script is run from
-the tree, because it reads `crane_model`'s checked-in machine descriptions and
-those are test fixtures rather than installed files. Source the workspace first
-so it can find the binary, or point `--binary` at it.
+**Inverse kinematics.** The request is Cartesian and the search is not, so
+something has to turn `(position, yaw)` into a joint configuration. It is one
+least-squares problem over the five planned coordinates with the passive pair
+re-settled at every configuration tested -- so what is solved is where the tool
+actually ends up, not where it would be if it did not hang. The telescope
+redundancy is taken up by a weak pull towards the start, and the restarts spread
+over the telescope range because that is the direction the residual is flat in.
+
+**The geometric search.** RRT-Connect over the five planned coordinates, in
+coordinates scaled by each axis's own velocity limit -- so the metric OMPL
+extends and interpolates in is *seconds at full speed* and not a sum of radians
+and metres. The passive pair is never sampled: it hangs, so it is solved
+wherever geometry is checked. Only exact solutions are accepted; an approximate
+path is a refusal.
+
+**The C2 fit.** A clamped cubic spline through the shortcut polyline, with
+`sigma` distributed by how long each chord takes at its slowest axis's limit. It
+is twice differentiable, and that is the entire point: the timing stage writes
+`ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`, so at a kink in the polyline
+`q_a''` is unbounded, the admissible path rate collapses to zero, and the
+machine stops dead at every waypoint.
+
+**The timing OCP.** One NLP over `sigma`, solved with IPOPT:
+
+| | |
+|---|---|
+| state | `(sigma_dot, q_u, dq_u)` -- the path rate and the two sway coordinates |
+| control | `sigma_ddot` |
+| dynamics | `ddq_u = -M_uu^-1 (M_ua ddq_a + h_u)`, every derivative divided by `sigma_dot` |
+| cost | `int dsigma/sigma_dot` + `w_sway int ||dq_u||^2 dt` + `w_u int sigma_ddot^2` |
+| constraints | `ddq_a`, cylinder force and summed pump flow at **every** node, `q_u` inside the sway box, `dq_u` bounded, `sigma_dot` under the per-node velocity ceiling |
+| boundary | `q_u` and `dq_u` measured at the start, at the hanging pose and at rest at the goal |
+
+The sway is a state and not an afterthought, which is what makes the tool arrive
+still. Integration is RK4 in `sigma`, so the path is evaluated at interval
+midpoints as well as at nodes.
+
+The initial guess earns its three passes: the velocity ceiling says nothing
+about acceleration, so the classical `sqrt(ddq_max / |q_a''|)` curve goes on top
+of it; neither says anything about cylinder force or pump flow, which are what
+actually bind on a lift, so the rate is bisected down until the worst row sits
+at 90% of its allowance; and per-node feasibility is not reachability, so a
+forward and a backward sweep under `d(sigma_dot^2)/dsigma = 2 sigma_ddot`
+connect the nodes to each other.
+
+## Tuning it
+
+`scripts/plan_example.py` runs the deployment's own `Planner` against the
+checked-in machine descriptions -- no ROS, no graph, no clock -- and plots what
+the answer asks of the machine: joint positions, velocities and accelerations,
+the path rate, the sway offset and rate, cylinder force and pump flow, each
+against its own limit.
 
 ```bash
-python3 src/concrete_block_stack/crane_planning/scripts/timing_a2b.py --show
+./scripts/plan_example.py --show
+./scripts/plan_example.py --sway-weight 8 --intervals 60 --output slow.png
+./scripts/plan_example.py --tool epsilon7040 --payload-mass 400 --csv plan.csv
 ```
 
-The default output is `timing_a2b.png` in the working directory with the
-matching `.csv`, one row per shooting node — the grid the constraints are
-actually imposed on. Use `--a` and `--b` to change the five planned joint
-coordinates, `--via` to add interior waypoints, or `--tool epsilon7040` for the
-other machine:
+It exercises every stage, so a refusal from it is the refusal the node would
+give. `--goal` takes a joint configuration and puts its tool pose through the
+real inverse kinematics; `--goal-pose` takes a Cartesian pose instead, which may
+turn out to be unreachable.
+
+## The node
+
+| | |
+|---|---|
+| service | `/crane/plan_motion` (`crane_msgs/PlanMotion`) |
+| publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
+| | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
+| subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
+| frame | `K0_mounting_base` for every goal and every published pose; nothing is converted |
+
+It is **not a second writer of the machine**: `/crane/reference` is a reference
+and not a command, `crane_velocity_controller` remains the sole claimant of the
+six velocity command interfaces, and this node holds no `controller_manager`
+client of any kind.
+
+`/joint_states` carries partial messages from two producers --
+`joint_state_broadcaster` for the actuated six and `tip_tilt_state_broadcaster`
+for the passive pair -- so they are cached in two slots and read by joint name,
+never by index.
+
+Every refusal names itself and leaves the standing reference alone: a goal that
+cannot be reached, a path that cannot be found, a path that cannot be smoothed
+inside the joint ranges and a path that cannot be timed are four different
+answers.
+
+## Build and run
 
 ```bash
-python3 .../scripts/timing_a2b.py --sway-weight 5.0 --kappa 0.7 --intervals 60 --show
+./ralph/verify.sh crane_model crane_planning
+ros2 launch crane_planning crane_planner.launch.py
 ```
-
-**Every tuning option left unset is the deployment's own default.** The script
-passes through only what it is given, and the CLI fills the rest in from
-`TimingOcpSettings`, which is where `crane_planner.yaml`'s defaults come from
-too — so a weight tuned here is a weight the node runs once it is written into
-that file, and no number lives in two places. `--print-command` shows the
-invocation. Run `--help` for all OCP, path-shape, hydraulic and payload options.
-
-The CLI can also be driven directly, which is what a test or a sweep script
-should do:
-
-```bash
-ros2 run crane_planning crane_planning_timing_cli \
-  --description "$(ros2 pkg prefix crane_model)/../../src/.../pzs100.urdf" \
-  --waypoint 0,-0.2,0.4,1.0,0 --waypoint 0,-0.2,0.9,1.4,0 \
-  --sway-weight 5.0 --output sweep.csv
-```
-
-It prints a `key=value` summary on stdout — status, duration, iterations, the
-peak demand of each constrained quantity against its **unscaled** limit — and
-refuses on stderr with the solver's own status word.
-
-The path is fitted with the planner's own `fit_c2_path`, so the OCP is tuned
-against the path shape the deployment produces and not against a polynomial
-written for the occasion.
-
-## What it does
-
-`crane_planner_node` exposes the two planning contracts:
-
-* `/crane/plan_motion` is the native crane planning service.
-* `/a2b_movement` is a compatibility adapter for the timber stack and delegates
-  to the same native planning pipeline.
-
-Successful requests follow one bounded pipeline:
-
-1. Convert the request and measured state, including payload and passive sway.
-2. Solve equilibrium-constrained endpoint IK and validate the forward-kinematics
-   residual.
-3. Search the five actuated path coordinates with deterministic OMPL
-   RRT-Connect. The passive pair is recovered from the model equilibrium at
-   each checked configuration; the tool axis remains fixed.
-4. Shortcut the resulting polyline, fit the required C² path with Ruckig, and
-   re-check the fitted curve against the scene, crane self-collision, and sway
-   envelope. Unchecked requests skip scene checks but still enforce model and
-   joint validity.
-5. Time the accepted geometric path with the generated acados path-constrained
-   OCP, including sway, force, flow, and terminal-rest constraints.
-
-Collision-checked requests require a current scene in the expected frame.
-Every stage has bounded work and contributes to `latency_budget`; refusals name
-the stage or constraint that prevented a plan. A moving measured start is
-preserved in both path and timing boundary conditions, so replanning does not
-silently reset velocity to zero. On refusal, the last adopted trajectory
-remains published on `/crane/reference`.
-
-## Interfaces and ownership
-
-`/crane/plan_grip` is not provided by this package. Grip sequencing and tool
-actuation belong to
-`concrete_block_motion_planning/grip_traj_movement`; `crane_msgs/PlanGrip`
-remains only as a compatibility schema for clients that still build that
-request.
-
-The package intentionally has no structured lift/traverse/descend planner,
-sampling fallback, grip trajectory generator, tool-axis mechanism, or legacy
-velocity-ramp timing. OMPL is the sole geometric search; C² fitting is its
-required preprocessing for the OCP, not a second search mechanism.
-
-## Configuration and generated timing code
-
-`config/crane_planner.yaml` contains solve settings: endpoint IK tolerances,
-OMPL budgets and seed, shortcut/C²-fit settings, collision and sway sampling,
-input freshness, replanning latency, and OCP limits. Joint limits and machine
-geometry come from `robot_description` and `crane_model`.
-
-The checked-in acados sources for the PZS100 and Epsilon 7040 are generated
-artifacts. `export_timing_ocp.py` is the source of truth; run its `--check`
-mode when changing the timing model or validating a checkout. The generated
-solver is kept separate from the handwritten planner implementation at build
-time.
-
-`export_timing_ocp.py` owns the *formulation* -- the symbolic model, the
-constraint rows, the parameter layout -- and `src/timing_ocp.cpp` owns
-everything that is written onto the shipped solver at runtime: the scaled
-bounds, the per-node passive equilibrium, the stage parameter blocks and the
-bisected warm start. That line is the whole reason `timing_a2b.py` shells out to
-a binary rather than driving acados itself; the alternative was a second copy of
-those four things in Python, agreeing with the C++ by hand.
-
-## Dependencies
-
-The planner uses OMPL, Ruckig, Eigen, `crane_model`, and the generated acados
-timing solver. ROS interface dependencies provide `PlanMotion` and the retained
-`CalcMovement` adapter contract. MoveIt is not required.
-
-The two installed scripts are developer tools and are not part of the planner.
-`plan_a2b` is installed and needs `rclpy`, numpy and matplotlib. `timing_a2b`
-needs numpy, matplotlib and pyyaml, joins no graph, and is run from the tree
-beside `export_timing_ocp.py`. Neither needs casadi or acados --
-`export_timing_ocp.py` does, and it is an export-time script.

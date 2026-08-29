@@ -1,202 +1,160 @@
 # The `crane_planner` node of ROS 2 Interfaces 2, as the `fake` and `hardware`
 # profiles compose it.
 #
-# Everything here is a property of the *solve*, not of the machine.  The machine's
-# own numbers -- how far and how fast each of the six actuated joints may go --
-# are read out of the `robot_description` the profile remaps this node onto, and
-# deliberately do not appear in this file: a limit written down beside a node is a
-# limit that drifts away from the description every controller in the same
-# deployment was configured against.  The same goes for the arm geometry a2, a3
-# and d45(q4) of wiki/robot_model.md 2.2, which are probed out of the model at
-# startup and checked rather than declared.
-#
-# The two numbers worth reading twice are the acceptance residuals.  2.2 says in
-# as many words that the semi-analytic solve is not a closed-form inverse and can
-# fail to converge, so every solution is put through a forward-kinematics
-# residual before it is used and a residual over `eps_pos` or `eps_yaw` is a
-# `success=false` with the number in the message.  Raising them does not make the
-# planner better at reaching a goal; it makes it quieter about missing.
+# Almost everything here is a property of the *solve*, not of the machine. How
+# far and how fast each joint may go is read out of the `robot_description` the
+# profile remaps this node onto, and deliberately does not appear below: a limit
+# written down beside a node is a limit that drifts away from the description
+# every controller in the same deployment was configured against. The two
+# exceptions are the pump and the relief setting, which the URDF does not carry
+# and nothing in this workspace can measure; they are at the end, with their
+# evidence beside them.
 crane_planner:
   ros__parameters:
-    # The tool the profiles select.  It decides which URDF joint the eighth
-    # canonical coordinate is, and nothing else in this file changes with it.
+    # The tool the profiles select. It decides which URDF joint the eighth
+    # canonical coordinate is, and nothing else here changes with it.
     tool: pzs100
 
+    # The reservation held back from *every* physical limit, so the MPC has
+    # authority left to correct with. Not reachable from a request.
+    kappa: 0.8
 
-    # The acceptance test of wiki/robot_model.md 2.2, in metres and radians.
+    # --- the endpoint inverse kinematics -------------------------------------
+    #
+    # The acceptance test, in metres and radians. It is not a closed-form
+    # inverse: the passive pair is re-settled at every configuration tested, so
+    # the answer is put through a forward-kinematics residual before it is used
+    # and a miss over these is a `success=false` carrying the number. Raising
+    # them does not make the planner better at reaching a goal; it makes it
+    # quieter about missing. The restarts spread over the telescope range,
+    # which is the coordinate the residual is flat in.
     eps_pos: 0.001
     eps_yaw: 0.001
+    ik_restarts: 5
 
-    # The scalar search of 2.2 step 3, the fixed point of step 4, and the
-    # Jacobian polish that closes whatever they leave.  The last two are what a
-    # solve costs: each of their iterations re-solves the passive pair at the
-    # configuration it is testing, and one `Model::passive_equilibrium` is worth
-    # some hundred forward-kinematics evaluations.
-    d45_samples: 41
-    fixed_point_iterations: 4
-    refinement_iterations: 6
-
-    # The equilibrium-constrained solve of 2.2, which is what a *placement*
-    # endpoint is found with -- the passive pair is a decision variable under
-    # `g_u(q) = 0` rather than a pinning, so the tool arrives at rest.
-    # `eps_equilibrium` is the assertion that it really did: the answer's passive
-    # pair is put back through `Model::passive_equilibrium` and compared, because
-    # `g_u(q) = 0` also has the tool *standing up* as a root and the solver's own
-    # constraint residual cannot tell the two apart.  The two caps are the bound;
-    # hitting either is a refusal naming it, never a best-effort endpoint.  One
-    # solve costs 0.25 s on the PZS100 and 0.73 s at its worst on the 7040.
-    eps_equilibrium: 1.0e-4
-    nlp_max_iterations: 60
-    nlp_max_wall_clock: 5.0
-
-    # The startup check that this description really is the planar two-link arm
-    # 2.2 poses the closure on.  Both machine descriptions in this workspace
-    # close to floating-point noise.
-    geometry_samples: 9
-    geometry_tolerance:
-      length: 1.0e-6
-      bearing: 1.0e-6
-
-
-    # How sigma is distributed along that path.  Shape numbers, not machine
-    # limits: sigma is a path parameter and not a time, and what the machine can
-    # actually traverse is settled by the path-constrained OCP of 5.2, which is
-    # issue 043.  The jerk span is what rounds the acceleration profile, and a
-    # jerk-limited profile is why q_a''(sigma) is defined everywhere -- the
-    # property 4.5 says a kinked path lacks, and whose absence stops the machine
-    # dead at every waypoint.
-    path_rate_headroom: 2.0
-    path_acceleration_span: 4.0
-    path_jerk_span: 4.0
-
-    # **The sole geometric search.**  RRT-Connect runs for every request over
-    # the five path coordinates and never samples the passive pair. Its result
-    # is shortcut, fitted to a C² path, and re-checked before timing; there is
-    # no structured planner or fallback branch.
+    # --- the geometric search ------------------------------------------------
+    #
+    # **The sole geometric search.** RRT-Connect runs for every request over the
+    # five planned coordinates and never samples the passive pair; its result is
+    # shortcut, fitted to a C2 curve and re-checked before timing. There is no
+    # structured planner and no fallback branch.
     #
     # The seed is a constant and not a clock: identical requests against one
-    # scene are reproducible. The two caps are per call — wall clock and the
-    # number of configurations checked, the latter independent of host speed.
-    # Exhausting either is a refusal naming the exhausted budget; the overall
-    # replanning bound is charged separately by latency_budget.
+    # scene are reproducible. Exhausting the time budget is a refusal naming it.
     ompl_seed: 20420042
     ompl_time_budget: 5.0
-    ompl_max_validity_checks: 4000
     ompl_extension_span: 2.0
     shortcut_attempts: 120
     # Half a turn either side of what the endpoints ask for, for the rotator,
-    # which is a `continuous` joint and therefore has no range in the description
-    # to sample from.  Every distinct pose it has is in there, because q7 and
-    # q7 + 2π are the same geometry.
+    # which is `continuous` and therefore has no range in the description to
+    # sample from. Every distinct pose it has is in there, because q7 and
+    # q7 + 2*pi are the same geometry.
     ompl_unbounded_margin: 3.141592653589793
 
-    # The emitted reference: 25 Hz, which is the rate the horizon is consumed at
-    # (ROS 2 Interfaces 4), and a floor so that a goal a few millimetres away is
-    # still a trajectory rather than a step.
-    Ts: 0.04
-
-    # **The admissible sway bound, and this is where it lives.**  wiki/mpc.md 3
-    # constraint 3 imposes `|q_u - q_eq| <= q_u^+` as a state box, the swing
-    # envelope of wiki/trajectory_planning.md 4.3 clears the path over that same
-    # box, and the virtual working cell of wiki/control_architecture.md 5.1
-    # consumes the same number -- derived independently of this planner's data,
-    # as 5.1 requires, but not a different number.  A design value: 0.2 rad is
-    # half a metre of tool travel on a 2.5 m pendulum, and it is the swing
-    # crane_supervisor's own `dq_u_max` of 0.4 rad/s was derived from.
+    # --- what "clear" means --------------------------------------------------
+    #
+    # **The admissible sway bound, and this is where it lives.** The swing
+    # envelope clears the path over this same box, mpc.md 3 constraint 3 imposes
+    # it as a state box, and the virtual working cell consumes the same number.
+    # A design value: 0.2 rad is half a metre of tool travel on a 2.5 m
+    # pendulum, and it is the swing crane_supervisor's own dq_u_max was derived
+    # from.
     q_sway_max: [0.2, 0.2]
-
-    # What "checked" means, in metres.  The path and the sway envelope are both
-    # sampled at this step, and the check tightens it to half the thinnest
-    # primitive in the scene when the scene carries something thinner -- the
-    # runges are 0.28 m across, so a scene with the truck in it checks at 0.14 m.
-    # A scene that would need a finer step than the floor is refused, because a
-    # path checked at a step it does not resolve is not checked.
+    # The step the path and the sway envelope are both sampled at, in metres. It
+    # is tightened to half the thinnest primitive the scene carries -- the
+    # runges are 0.28 m across, so a scene with the truck in it checks at
+    # 0.14 m. A scene needing finer than the floor is refused, because a path
+    # checked at a step it does not resolve is not checked.
     check_resolution: 0.10
     min_check_resolution: 0.01
     max_check_samples: 2048
-    max_sway_samples: 15
 
-    # The second half of wiki/robot_model.md 2.2 step 3's redundancy score.  It
-    # is a preference between telescope extensions and not the check: the check
-    # is the one along the path, and it refuses.
-    clearance_weight: 1.0
-    clearance_reference: 0.5
+    # The truck, as a property of the vehicle. **The legacy dimensions,
+    # preserved and no longer hard-coded**: the scene carries one primitive with
+    # the reserved id `truck` and the bed and the six runges are placed on it.
+    # Move the truck and they move.
+    truck_runge_dimensions: [0.28, 0.31, 2.12]
+    truck_runge_stations: [-2.0, 0.0, 2.0]
+    truck_bed_thickness: 0.10
 
-    # The truck, as a property of the vehicle.  **The legacy dimensions,
-    # preserved and no longer hard-coded**: the timber planner carried two rows
-    # of three 0.28 x 0.31 x 2.12 m boxes as `postsRight`/`postsLeft` in a
-    # motion-planning YAML, and trajectory_planning 4.2 asks for the geometry to
-    # be kept and the position to come from the measured truck pose instead.  It
-    # does: the scene carries one primitive with the reserved id `truck`, and the
-    # bed and the six runges are placed on it.  Move the truck and they move.
-    truck:
-      runge_dimensions: [0.28, 0.31, 2.12]
-      runge_stations: [-2.0, 0.0, 2.0]
-      bed_thickness: 0.10
+    # --- the timing OCP ------------------------------------------------------
+    #
+    # One NLP over the path parameter, not over time. Minimising traversal time
+    # is minimising the integral of dsigma/sigma_dot, and the sway is a *state*
+    # of it rather than something checked afterwards -- which is what makes the
+    # tool arrive at rest.
+    #
+    # `intervals` is the whole cost/accuracy dial: the problem is 6*N + 1
+    # variables and the force and flow rows are evaluated at every node.
+    # `sway_weight` and `input_weight` are what `scripts/plan_example.py` exists
+    # to tune -- traversal time against how much the tool swings on the way.
+    intervals: 40
+    sway_weight: 2.0
+    input_weight: 0.001
+    # Numerical, not physical: the objective divides by sigma_dot, and at the
+    # endpoints the path is at rest in q_a so nothing else bounds it.
+    sigma_rate_min: 0.02
+    sigma_rate_max: 2.0
+    sigma_accel_max: 20.0
+    # rad/s and rad/s^2. The sway rate is control_architecture's own bound; the
+    # joint accelerations are a comfort limit the description does not carry.
+    dq_sway_max: [1.0, 0.5]
+    ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
+    max_wall_clock: 30.0
+    max_iterations: 400
+    tolerance: 1.0e-6
 
-    # How old /joint_states may be and still be a start state.  It carries the
-    # rates as well as the positions, and a message with no `velocity` array is
-    # refused rather than read as a standstill — wiki/trajectory_planning.md §7
-    # asks for `(q, dq)` **as measured**, and a measurement that does not say
-    # whether the machine is moving is not one to plan a re-plan from.
+    # The emitted reference: 25 Hz, the rate the horizon is consumed at.
+    Ts: 0.04
+
+    # --- freshness -----------------------------------------------------------
+    #
+    # How old each input may be and still be planned from. `/joint_states`
+    # carries the rates as well as the positions, and a message with no
+    # `velocity` array is refused rather than read as a standstill.
+    #
+    # The passive pair has its own deadline and not one age shared with every
+    # input: `sensor_msgs/JointState` has no `valid` flag, so freshness is the
+    # whole test, and past it the request is refused. Reading an absent sway
+    # estimate as zero is the stopped-start convention this refusal removes.
+    #
+    # The scene's age is its own number too: 0.5 s is the age of a 100 Hz
+    # measurement of a machine that moves, while the scene is republished on a
+    # 2 s heartbeat. Ten seconds fires on "the world model has stopped" and not
+    # on "nothing has moved lately". It matters because that subscription is
+    # transient-local: a scene published once is latched and handed to every
+    # planner that starts afterwards, so without an age a dead world model reads
+    # as a live one.
     max_input_age: 0.5
-
-    # How old /crane/collision_scene may be and still be the world.  **Its own
-    # number, not `max_input_age`**: 0.5 s is the age of a 100 Hz measurement of
-    # a machine that moves, while the scene's rate is the world model's republish
-    # heartbeat — `collision_scene_heartbeat: 2.0` s in the perception
-    # orchestrator, which republishes on block motion *and* on that heartbeat so
-    # that an unchanged scene keeps saying so.  Ten seconds is five of those, so
-    # this fires on "the world model has stopped" and not on "nothing has moved
-    # lately".
-    #
-    # It matters because this subscription is transient-local depth 1: a scene
-    # published once is latched by the middleware and handed to every planner
-    # that starts afterwards, so without an age a dead world model reads as a
-    # live one.  Past the age the scene is never planned against; the request is
-    # *refused* when `avoid_collisions` is set — a trajectory certified clear of
-    # geometry that may have moved is a false statement, and this planner already
-    # refuses the adjacent case of `avoid_collisions` with no scene at all — and
-    # merely annotated when it is not, because a scene the request declined to
-    # use is no reason to stop a stationary site from planning.
-    max_scene_age: 10.0
-
-    # **The passive half of that start state**, and what happens when it is not
-    # there.  `tip_tilt_state_broadcaster` carries the sway at 100 Hz on
-    # /joint_states; its 150 ms deadline is control_architecture §5.3's own row
-    # for this input and not one age shared with every input.  sensor_msgs/JointState
-    # has no `valid` flag, so freshness is the whole test.  Past it, or with
-    # nothing ever received, `refuse` is §5.3's answer for a state the planner
-    # closes on — the response names which of the two it was, so that "never
-    # connected" and "died" stay different things to chase.
-    #
-    # `conservative` is the other defined consequence: plan from the hanging pose
-    # and hold back `conservative_sway` from the sway box, so sway up to the
-    # reserve can be present without leaving what mpc §3 constraints 3 and 4
-    # permit.  It is a reservation and not an assumption, and the answer says so.
-    # There is no third value: reading an absent estimate as zero sway is the
-    # stopped-start convention §7 exists to remove.
     pendulum_state_deadline: 0.15
-    passive_estimate_policy: refuse
-    conservative_sway:
-      q_u: 0.05
-      dq_u: 0.10
-
-    # /crane/payload_estimate, on the same terms.  Ten periods of its 10 Hz
-    # publication; past that, or where it reports `valid == false`, the payload is
-    # the one the request declared and the answer says so.  Both CBS profiles
-    # publish `valid == false` today, so that is the branch that runs.
+    max_scene_age: 10.0
     payload_estimate_deadline: 1.0
 
-    # **§7's latency bound, and it lives here rather than in a caller's timeout.**
-    # One total over the endpoint IK, the geometry, the smoothing and the OCP,
-    # charged stage by stage: a timeout bounds how long the *caller* waits and
-    # leaves a slow solve running under a request nobody is waiting on.  Sized
-    # against what a plan costs rather than round — one plan is some 14 s here, of
-    # which the OCP's own `max_wall_clock` share is 12 s — because a bound is only
-    # a bound if the ordinary case clears it on a slower machine too.  Exceeding
-    # it names the stage that overran and how long it had, emits no partial plan,
-    # and leaves the previous trajectory standing on /crane/reference.  At or
-    # below zero is no budget at all, and the stages are then charged and reported
-    # without any of them being able to refuse.
-    latency_budget: 45.0
+    # --- the two hydraulic numbers the description does not carry ------------
+    #
+    # **Neither of them is strong, and that is why they are written down here
+    # with their evidence rather than compiled in.**
+    #
+    # `pump_flow_max` is parameters.md 4's Q_P^max = 1.4e-3 m^3/s, *measured
+    # 2023, pre-retrofit, not re-verified*: taken on a machine that has since
+    # been rebuilt, and never checked against the pump that is on the crane
+    # today. `pump_flow_planning_factor` is that page's own 0.95 planning
+    # discount on it and is **not** a second kappa -- kappa is a separate,
+    # larger reservation applied to every physical limit. The two multiply.
+    # Closing this needs a flow measurement on the retrofitted machine; the
+    # recordings under control_recordings/ do not contain one.
+    #
+    # `system_pressure_pa` is **not measured at all**. The cylinder force limit
+    # is the smaller chamber area times this pressure -- the areas come from
+    # crane_model, so they cannot drift -- and 250 bar is a plausible relief
+    # setting for a crane of this class, not a reading off this machine. It is
+    # stated rather than omitted because a force limit that does not exist is
+    # the status quo this planner set out to end, and the consequence of it
+    # being wrong is asymmetric: too low and the planner refuses moves the
+    # machine could make, too high and the constraint stops binding before the
+    # hydraulics do. Erring low is the safe direction. Replace it with the plate
+    # on the power pack, or with the identification campaign of hydraulics.md
+    # 5.8 -- both human-only.
+    pump_flow_max: 0.0014
+    pump_flow_planning_factor: 0.95
+    system_pressure_pa: 25000000.0
