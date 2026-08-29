@@ -1294,15 +1294,7 @@ class Planner:
                 "certified against nothing is not certified"
             )
 
-        primitives = (
-            expand_truck(list(scene or []), self.config) if avoid_collisions else []
-        )
-        if any(primitive.id == PAYLOAD_ID for primitive in primitives):
-            raise PlanningError(f"'{PAYLOAD_ID}' is a reserved scene id")
-        carried = payload_primitive(self.model, start.q, payload_shape)
-        if carried is not None and avoid_collisions:
-            primitives.append(carried)
-
+        primitives = self.prepare_scene(start, payload_shape, scene, avoid_collisions)
         payload_vector = payload_parameters(payload)
         geometry = Geometry(
             self.model,
@@ -1363,6 +1355,30 @@ class Planner:
             speed_scale,
         )
         return self._resample(geometry, path, timing, start)
+
+    def prepare_scene(
+        self, start: Start, payload_shape, scene, avoid_collisions: bool
+    ) -> list:
+        """
+        Return the bodies this plan is actually checked against.
+
+        Not the same list the request carried: the reserved `truck` primitive
+        becomes a bed and six runges, and what is in the gripper is inserted as
+        a body of its own, because the frozen model collision API takes no
+        payload. Both are invisible to anyone who only sees the scene topic,
+        which is why this is a method and not a private step -- the node shows
+        it, and a refusal is far easier to read beside the geometry that caused
+        it.
+        """
+        if not avoid_collisions:
+            return []
+        primitives = expand_truck(list(scene or []), self.config)
+        if any(primitive.id == PAYLOAD_ID for primitive in primitives):
+            raise PlanningError(f"'{PAYLOAD_ID}' is a reserved scene id")
+        carried = payload_primitive(self.model, start.q, payload_shape)
+        if carried is not None:
+            primitives.append(carried)
+        return primitives
 
     def _settled(
         self, q_a: np.ndarray, q_tool: float, payload: np.ndarray

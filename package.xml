@@ -31,6 +31,9 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>trajectory_msgs</depend>
+  <!-- The plan, drawn: the path, the tool swept along it, the goal, and the
+       bodies the plan was checked against. -->
+  <depend>visualization_msgs</depend>
   <!-- The retained `a2b_movement` contract (`CalcMovement.srv`) and the message
        package its payload fields are made of. These are retained-tree interface
        packages, not new third-party dependencies: they are the `.srv` and

@@ -94,6 +94,7 @@ turn out to be unreachable.
 | publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's own name, for RViz |
+| | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |
 | subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
 | frame | `K0_mounting_base` for every goal and every published pose; nothing is converted |
 
@@ -111,6 +112,27 @@ Every refusal names itself and leaves the standing reference alone: a goal that
 cannot be reached, a path that cannot be found, a path that cannot be smoothed
 inside the joint ranges and a path that cannot be timed are four different
 answers.
+
+## Seeing the plan
+
+`/crane_planner/markers` draws four things, and each answers a question the
+numbers do not. The **path** the tool takes, as one line. The **tool** swept
+along it -- the segment from the tip hinge to the tool centre at samples down
+the trajectory, which is the pendulum, so its lean is the sway the OCP planned
+and a plan that swings looks like it swings. The **goal**, where the request
+asked for the tool and which way round. And the **scene the planner actually
+checked against**, which is not the scene anyone published: by that point the
+reserved `truck` primitive has become a bed and six runges and what is in the
+gripper has been inserted as a body of its own. Structural bodies, perceived
+ones and the payload are three colours, because "why was this refused" is
+usually answered by which kind it hit.
+
+The goal and the geometry go out **before** the solve, so a refusal leaves them
+on screen: "it said no" and "it said no, and here is the runge it would have
+hit" are very different messages.
+
+`concrete_block_behavior_tree/rviz/cbs.rviz` carries the display, under
+*Planning and Control*, beside the plain `nav_msgs/Path` traces.
 
 ## The `a2b_movement` compatibility service
 

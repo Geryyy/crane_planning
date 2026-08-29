@@ -36,9 +36,11 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from visualization_msgs.msg import MarkerArray
 
 from timber_crane_planning_interfaces.srv import CalcMovement
 
+from . import markers as viz
 from .a2b import (
     A2B_MOVEMENT_SERVICE,
     translate_payload,
@@ -72,6 +74,9 @@ PLANNED_PATH_TOPIC = "/crane_planner/planned_path"
 #: launch contract reads as evidence that the planner cannot be a second
 #: command producer, and spending it on a topic nobody reads is a bad trade.
 LEGACY_TCP_PATH_TOPIC = "tcp_path"
+#: Everything a plan looks like, in one array: the path, the tool swept along
+#: it, the goal, and the bodies the plan was actually checked against.
+MARKERS_TOPIC = "/crane_planner/markers"
 JOINT_STATES_TOPIC = "/joint_states"
 COLLISION_SCENE_TOPIC = "/crane/collision_scene"
 PAYLOAD_ESTIMATE_TOPIC = "/crane/payload_estimate"
@@ -141,6 +146,9 @@ class CranePlanner(Node):
         )
         self.planned_path = self.create_publisher(Path, PLANNED_PATH_TOPIC, latched())
         self.legacy_tcp_path = self.create_publisher(Path, LEGACY_TCP_PATH_TOPIC, 10)
+        # Transient-local, because an RViz started after the plan should still
+        # see it -- a plan is a standing decision, not a stream.
+        self.markers = self.create_publisher(MarkerArray, MARKERS_TOPIC, latched())
         self.create_service(PlanMotion, PLAN_MOTION_SERVICE, self._plan)
         # The retained timber contract, on the same node and over the same
         # planner: one adapter, no second set of limits.
@@ -521,17 +529,29 @@ class CranePlanner(Node):
     def _run(
         self, start, position_m, yaw, payload, shape, avoid_collisions, speed_scale
     ):
-        """Plan, publish the reference and the operator path, and stand by it."""
+        """Plan, publish the reference and the drawing, and stand by them."""
+        primitives = self._primitives(avoid_collisions)
+        # The goal and the geometry are drawn **before** the solve, so that a
+        # refusal leaves them on screen. "It said no" and "it said no, and here
+        # is the runge it would have hit" are very different messages.
+        checked = self.planner.prepare_scene(start, shape, primitives, avoid_collisions)
+        stamp = self.get_clock().now().to_msg()
+        standing = viz.scene(checked, PLANNING_FRAME, stamp) + viz.goal(
+            position_m, yaw, PLANNING_FRAME, stamp
+        )
+        self._draw(standing)
+
         plan = self.planner.plan(
             start,
             position_m,
             yaw,
             payload=payload,
             payload_shape=shape,
-            scene=self._primitives(avoid_collisions),
+            scene=primitives,
             avoid_collisions=avoid_collisions,
             speed_scale=speed_scale,
         )
+        self._draw(standing + viz.plan(self.planner.model, plan, PLANNING_FRAME, stamp))
         trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
         path = self._path(plan)
         self.standing = trajectory
@@ -566,6 +586,11 @@ class CranePlanner(Node):
             point.time_from_start.nanosec = int((when - int(when)) * 1e9)
             trajectory.points.append(point)
         return trajectory
+
+    def _draw(self, markers: list) -> None:
+        """Replace the drawing wholesale: a `DELETEALL`, then this plan's set."""
+        self.markers.publish(viz.clear(PLANNING_FRAME, self.get_clock().now().to_msg()))
+        self.markers.publish(MarkerArray(markers=markers))
 
     def _path(self, plan) -> Path:
         """Build the tool's own geometry, for the operator. Visualization only."""
