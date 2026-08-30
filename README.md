@@ -103,10 +103,8 @@ and not a command, `crane_velocity_controller` remains the sole claimant of the
 six velocity command interfaces, and this node holds no `controller_manager`
 client of any kind.
 
-`/joint_states` carries partial messages from two producers --
-`joint_state_broadcaster` for the actuated six and `tip_tilt_state_broadcaster`
-for the passive pair -- so they are cached in two slots and read by joint name,
-never by index.
+`/joint_states` comes from `joint_state_broadcaster`, actuated and passive
+joints alike. Messages are cached and read by joint name, never by index.
 
 Every refusal names itself and leaves the standing reference alone: a goal that
 cannot be reached, a path that cannot be found, a path that cannot be smoothed

@@ -249,11 +249,10 @@ class CranePlanner(Node):
         """
         Keep the recent messages; which is which is decided when they are read.
 
-        `/joint_states` carries **partial** messages: `joint_state_broadcaster`
-        publishes the actuated six and `tip_tilt_state_broadcaster` the passive
-        pair, at different rates and from different hardware. Telling them apart
-        needs the joint names, which come from the description -- so routing
-        here would silently drop every state that arrived before it.
+        `/joint_states` comes from `joint_state_broadcaster`, actuated and
+        passive joints alike. Which joint is which still needs the joint names,
+        which come from the description -- so routing here would silently drop
+        every state that arrived before it.
         """
         self.joint_states.append(message)
 
