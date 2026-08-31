@@ -17,11 +17,10 @@ the native path stays a box.
 # It is an adapter and not a planner
 
 Nothing here plans, limits, or checks a collision. `translate_request` produces
-the arguments of `Planner.plan`, the same call `/crane/plan_motion` is answered
-by -- so the same start state, the same scene, the same kappa and the same
-`/crane/reference` publication -- and the answer is carried back unchanged.
-There is no second set of limits and no second collision configuration, because
-there is no second planner.
+the arguments of `Planner.plan` and the node runs it -- so one start state, one
+scene, one kappa and one `/crane/reference` publication -- and the answer is
+carried back unchanged. There is no second set of limits and no second collision
+configuration, because there is no second planner.
 
 # What `CalcMovement` says and what it does not
 

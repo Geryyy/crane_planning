@@ -1,22 +1,20 @@
-# The `crane_planner` node of ROS 2 Interfaces 2, as the `fake` and `hardware`
-# profiles compose it.
+# The `crane_planner` node, as the `fake` and `hardware` profiles compose it.
 #
 # Almost everything here is a property of the *solve*, not of the machine. How
 # far and how fast each joint may go is read out of the `robot_description` the
 # profile remaps this node onto, and deliberately does not appear below: a limit
 # written down beside a node is a limit that drifts away from the description
-# every controller in the same deployment was configured against. The two
-# exceptions are the pump and the relief setting, which the URDF does not carry
-# and nothing in this workspace can measure; they are at the end, with their
-# evidence beside them.
+# every controller in the same deployment was configured against. The one
+# exception is the pump, which the URDF does not carry and nothing in this
+# workspace can measure; it is at the end, with its evidence beside it.
 crane_planner:
   ros__parameters:
     # The tool the profiles select. It decides which URDF joint the eighth
     # canonical coordinate is, and nothing else here changes with it.
     tool: pzs100
 
-    # The reservation held back from *every* physical limit, so the MPC has
-    # authority left to correct with. Not reachable from a request.
+    # The reservation held back from the pump and from every rate limit, so the
+    # controller has authority left to correct with. Not reachable from a request.
     kappa: 0.8
 
     # --- the endpoint inverse kinematics -------------------------------------
@@ -24,51 +22,62 @@ crane_planner:
     # The acceptance test, in metres and radians. It is not a closed-form
     # inverse: the passive pair is re-settled at every configuration tested, so
     # the answer is put through a forward-kinematics residual before it is used
-    # and a miss over these is a `success=false` carrying the number. Raising
-    # them does not make the planner better at reaching a goal; it makes it
-    # quieter about missing. The restarts spread over the telescope range,
-    # which is the coordinate the residual is flat in.
+    # and a miss over these is a refusal carrying the number. Raising them does
+    # not make the planner better at reaching a goal; it makes it quieter about
+    # missing.
+    #
+    # `ik_restarts` applies to the **goal alone**, spread over the telescope
+    # range because that is the coordinate the residual is flat in. Every sample
+    # along the tool path is solved with one restart seeded from its
+    # predecessor, which is both the right seed and what keeps the lifted path
+    # on a single inverse-kinematics branch.
     eps_pos: 0.001
     eps_yaw: 0.001
     ik_restarts: 5
 
-    # --- the geometric search ------------------------------------------------
+    # --- the geometric stage, and what "clear" means -------------------------
     #
-    # **The sole geometric search.** RRT-Connect runs for every request over the
-    # five planned coordinates and never samples the passive pair; its result is
-    # shortcut, fitted to a C2 curve and re-checked before timing. There is no
-    # structured planner and no fallback branch.
+    # **There is no sampling planner.** The tool centre point runs a straight
+    # line from where it is to where the goal asks for it; every sample of that
+    # line is lifted into the five planned coordinates by inverse kinematics and
+    # the whole machine is checked there. A blocked line is a refusal, not a
+    # cue to search around it.
     #
-    # The seed is a constant and not a clock: identical requests against one
-    # scene are reproducible. Exhausting the time budget is a refusal naming it.
-    ompl_seed: 20420042
-    ompl_time_budget: 5.0
-    ompl_extension_span: 2.0
-    shortcut_attempts: 120
-    # Half a turn either side of what the endpoints ask for, for the rotator,
-    # which is `continuous` and therefore has no range in the description to
-    # sample from. Every distinct pose it has is in there, because q7 and
-    # q7 + 2*pi are the same geometry.
-    ompl_unbounded_margin: 3.141592653589793
+    # Sampling does not prove clearance on its own. What makes it a proof is a
+    # margin paired with a bound on how far anything can move between two
+    # samples: rotating a planned joint by dq displaces any point below it by at
+    # most r*dq, so if every checked configuration clears the scene by more than
+    # the sum below, and no consecutive pair moves the machine further than
+    # `margin_interp`, then nothing touches anything anywhere in between.
+    #
+    # The margin is therefore spent three ways, and each part is spent once:
+    #
+    #     required = margin_safety + margin_interp + swing envelope
+    #
+    # `margin_safety` is the clearance an answer actually carries. The swing
+    # envelope is `l_tool * sin(q_sway_max)` and is computed, not configured --
+    # which is why the sway box no longer has to be gridded pose by pose.
+    #
+    # Halving `margin_interp` roughly doubles the lifted configurations and so
+    # the geometric stage's cost. Raising it spends clearance on resolution.
+    margin_safety: 0.05
+    margin_interp: 0.05
+    # How far the tool's collision geometry reaches past the tool centre point.
+    # It enters the step bound as an over-estimate of the machine's outermost
+    # point: too large only costs samples, too small is unsound. The carried
+    # body's own reach is added to it per request.
+    tool_radius: 1.0
+    # The cap on lifted configurations. Reaching it means the arm reconfigures
+    # faster along the line than the line resolves -- a singularity, or an
+    # inverse-kinematics branch change -- and is a refusal. It is the same test
+    # that sets the resolution, which is why a branch jump cannot pass unseen.
+    max_lift_samples: 4096
 
-    # --- what "clear" means --------------------------------------------------
-    #
     # **The admissible sway bound, and this is where it lives.** The swing
-    # envelope clears the path over this same box, mpc.md 3 constraint 3 imposes
-    # it as a state box, and the virtual working cell consumes the same number.
-    # A design value: 0.2 rad is half a metre of tool travel on a 2.5 m
-    # pendulum, and it is the swing crane_supervisor's own dq_u_max was derived
-    # from.
+    # envelope above is derived from it, and it is the state box the timing OCP
+    # holds the pendulum inside. A design value: 0.2 rad is half a metre of tool
+    # travel on a 2.5 m pendulum.
     q_sway_max: [0.2, 0.2]
-    # The step the path and the sway envelope are both sampled at, in metres. It
-    # is tightened to half the thinnest primitive the scene carries -- the
-    # thinnest the truck brings is the bed slab at `truck_bed_thickness`, so a
-    # scene with the truck in it checks at 0.05 m. A scene needing finer than the
-    # floor is refused, because a path checked at a step it does not resolve is
-    # not checked.
-    check_resolution: 0.10
-    min_check_resolution: 0.01
-    max_check_samples: 2048
 
     # The truck, as a property of the vehicle. **The legacy dimensions,
     # preserved and no longer hard-coded**: the scene carries one primitive with
@@ -84,8 +93,8 @@ crane_planner:
     # Stations are offsets from the box centre. For the shipped `vehicle_box`
     # they put the runges at world x -5.593, -4.381 and -1.397, which is where
     # `lkw_rungen_134.stl` stands the posts -- `post_setup:=134` in sim and its
-    # subset `13` on hardware. The previous [-2.0, 0.0, 2.0] matched none of
-    # them. Keep equal to `world_model.vehicle_box.runge_stations_m`.
+    # subset `13` on hardware. Keep equal to
+    # `world_model.vehicle_box.runge_stations_m`.
     truck_runge_dimensions: [0.28, 0.31, 2.12]
     truck_runge_stations: [-2.261, -1.049, 1.935]
     truck_bed_thickness: 0.10
@@ -99,20 +108,55 @@ crane_planner:
     truck_headboard_thickness: 0.45
     truck_headboard_height: 1.922
 
+    # How many cubic segments the path is fitted with, whatever the sample
+    # count. **This is the dial that keeps the certificate and the curve from
+    # fighting.** The certificate wants samples dense; the curve wants its first
+    # and last intervals long, because the path is clamped to leave and arrive
+    # at rest in q_a and that flattening has to happen somewhere. An
+    # interpolating fit ties the two together and squeezes the clamp into a
+    # sliver of sigma -- measured |q_a''| of 361 at sigma = 0 against 0.4 across
+    # the interior, which the timing OCP reads at its first node and refuses.
+    # Approximating with far fewer control points than samples gives both, and
+    # stops the fit chasing inverse-kinematics noise between neighbours.
+    path_segments: 12
+
     # --- the timing OCP ------------------------------------------------------
     #
     # One NLP over the path parameter, not over time. Minimising traversal time
-    # is minimising the integral of dsigma/sigma_dot, and the sway is a *state*
-    # of it rather than something checked afterwards -- which is what makes the
-    # tool arrive at rest.
+    # is minimising the integral of dsigma/sigma_dot, so the end time is free --
+    # that integral *is* the end time. The sway is a *state* of the problem
+    # rather than something checked afterwards.
     #
     # `intervals` is the whole cost/accuracy dial: the problem is 6*N + 1
-    # variables and the force and flow rows are evaluated at every node.
-    # `sway_weight` and `input_weight` are what `scripts/plan_example.py` exists
-    # to tune -- traversal time against how much the tool swings on the way.
+    # variables and the pump row is evaluated at every node.
     intervals: 40
+    # Traversal time against how much the tool swings on the way.
     sway_weight: 2.0
+    # **Effort, priced and not bounded.** `tau_a` is the actuated generalized
+    # force of robot_model.md 3.3, normalised per request by what the same path
+    # costs to *hold* -- so this weight is dimensionless and prices the dynamic
+    # effort a fast traversal adds on top of the pose's own gravity load. It is
+    # what carries the machine's inertia into the answer.
+    #
+    # It replaces a hard cylinder-force constraint whose limit was the smaller
+    # chamber area times a relief pressure **nothing in this workspace has ever
+    # measured**. The consequence is deliberate and is the trade: this planner
+    # no longer refuses a move it cannot lift. It plans it, and the machine
+    # stalls on it. Restoring a real bound needs a reading off the power pack or
+    # the identification campaign of hydraulics.md 5.8 -- both human-only.
+    tau_weight: 0.1
     input_weight: 0.001
+    # **Terminal sway, as a cost.** One control -- the rate along a path the OCP
+    # may not leave -- cannot in general drive four terminal quantities to zero,
+    # and asking for it as a hard equality is what turns a slow answer into
+    # `Infeasible_Problem_Detected`. Normalised by the admissible box, so this
+    # is a multiple of "the whole allowance" and the answer reports the residual
+    # in degrees. Raise it to arrive stiller and later.
+    terminal_sway_weight: 200.0
+    # The pump row carries L1 slack for the same reason. A move needing a few
+    # percent more flow than the reservation allows should come back slower and
+    # say so in its message, not come back as a refusal.
+    flow_slack_weight: 1000.0
     # Numerical, not physical: the objective divides by sigma_dot, and at the
     # endpoints the path is at rest in q_a so nothing else bounds it.
     sigma_rate_min: 0.02
@@ -152,31 +196,18 @@ crane_planner:
     max_scene_age: 10.0
     payload_estimate_deadline: 1.0
 
-    # --- the two hydraulic numbers the description does not carry ------------
-    #
-    # **Neither of them is strong, and that is why they are written down here
-    # with their evidence rather than compiled in.**
+    # --- the one hydraulic number the description does not carry -------------
     #
     # `pump_flow_max` is parameters.md 4's Q_P^max = 1.4e-3 m^3/s, *measured
     # 2023, pre-retrofit, not re-verified*: taken on a machine that has since
     # been rebuilt, and never checked against the pump that is on the crane
     # today. `pump_flow_planning_factor` is that page's own 0.95 planning
     # discount on it and is **not** a second kappa -- kappa is a separate,
-    # larger reservation applied to every physical limit. The two multiply.
-    # Closing this needs a flow measurement on the retrofitted machine; the
-    # recordings under control_recordings/ do not contain one.
+    # larger reservation. The two multiply.
     #
-    # `system_pressure_pa` is **not measured at all**. The cylinder force limit
-    # is the smaller chamber area times this pressure -- the areas come from
-    # crane_model, so they cannot drift -- and 250 bar is a plausible relief
-    # setting for a crane of this class, not a reading off this machine. It is
-    # stated rather than omitted because a force limit that does not exist is
-    # the status quo this planner set out to end, and the consequence of it
-    # being wrong is asymmetric: too low and the planner refuses moves the
-    # machine could make, too high and the constraint stops binding before the
-    # hydraulics do. Erring low is the safe direction. Replace it with the plate
-    # on the power pack, or with the identification campaign of hydraulics.md
-    # 5.8 -- both human-only.
+    # Closing this needs a flow measurement on the retrofitted machine; the
+    # recordings under control_recordings/ do not contain one. It is now the
+    # **only** actuator limit the planner enforces, which raises what it is
+    # worth to measure.
     pump_flow_max: 0.0014
     pump_flow_planning_factor: 0.95
-    system_pressure_pa: 25000000.0

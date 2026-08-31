@@ -1,17 +1,21 @@
 """
 Plan a motion, and time it.
 
-Three stages, no more: OMPL RRT-Connect searches the five planned joint
-coordinates, a C2 spline turns the polyline into q_a(sigma) with derivatives,
-and one CasADi/IPOPT optimal control problem over sigma decides how fast the
-machine may traverse it. Everything the machine can do -- reach, hang, collide,
-lift -- is asked of `crane_model`; nothing about the machine is written down
-here.
+Two stages. The tool centre point runs a straight line from where it is to where
+the goal asks for it; every sample of that line is lifted into the five planned
+joint coordinates by inverse kinematics, and the whole machine is checked there.
+One CasADi/IPOPT optimal control problem over the path parameter then decides how
+fast the machine may traverse the result.
 
-The passive pair (tip/tilt sway) is never searched over: it hangs, so it is
-solved with `passive_equilibrium` wherever geometry is checked, and it is a
-*state* of the timing OCP so that the answer is a trajectory the tool arrives
-at rest from.
+Everything the machine can do -- reach, hang, collide -- is asked of
+`crane_model`; nothing about the machine is written down here.
+
+The passive pair (tip/tilt sway) is never searched over. Where it hangs is a
+closed form -- `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, which
+`crane_mpc/src/mpc_node.cpp` measured to 1e-4 rad across the workspace and found
+independent of slew, telescope, rotator, tool and payload -- and it is a *state*
+of the timing OCP, so the answer is a trajectory the tool arrives nearly still
+from.
 """
 
 from __future__ import annotations
@@ -35,9 +39,7 @@ from crane_model import (
     parse,
 )
 from crane_model import symbolic as symbolic_model
-from ompl import base as ob
-from ompl import geometric as og
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import BSpline, make_lsq_spline
 from scipy.optimize import least_squares
 
 #: The five coordinates a plan moves, in canonical indices. The tool axis (q8)
@@ -46,9 +48,37 @@ PLANNED_INDICES = ACTUATED_INDICES[:5]
 TOOL_INDEX = ACTUATED_INDICES[5]
 PLANNED_DOF = len(PLANNED_INDICES)
 
+#: The frame each planned coordinate turns about, for the step bound below. The
+#: telescope is prismatic and has no radius, which is what `None` marks.
+PLANNED_FRAMES = (
+    Frame.SLEWING_COLUMN,
+    Frame.BOOM,
+    Frame.ARM,
+    None,
+    Frame.ROTATOR,
+)
+TELESCOPE_AXIS = 3
+
+#: Metres of tip travel per metre of `q4`. **Two, not one.** `q4` is stage-1
+#: travel and `q5_small_telescope` mimics it at multiplier 1, so a chain couples
+#: the second stage and the tip advances `2 q4` -- `wiki/nomenclature.md` 4. A
+#: step bound built on 1.0 lets a telescope-dominated segment move the tool
+#: twice as far as it is checked for, which is the whole margin.
+TELESCOPE_TRAVEL_PER_UNIT = 2.0
+
 #: `q_a | q_a' | q_a'' | q8` -- what the OCP needs to know about the path at one
 #: value of sigma, and the only thing it is told about it.
 PATH_BLOCK = 3 * PLANNED_DOF + 1
+
+#: Where the adaptive march starts, and the step at which it gives up. The
+#: first is only a guess -- it halves on the first violation and grows back
+#: over a clear run -- and the second is what a branch change runs into.
+INITIAL_LIFT_STEP = 1.0 / 32.0
+MIN_LIFT_STEP = 1.0e-6
+
+#: The two rows of the boom four-bar the hanging pose tracks, in planned axes.
+BOOM_AXIS = 1
+ARM_AXIS = 2
 
 
 class PlanningError(RuntimeError):
@@ -60,32 +90,35 @@ class PlanningError(RuntimeError):
 
 @dataclass(frozen=True)
 class Limits:
-    """What the machine may do, read from the description and the hydraulics."""
+    """What the machine may do, read from the description."""
 
     lower: np.ndarray  # position, per planned coordinate; -inf where continuous
     upper: np.ndarray
     bounded: np.ndarray  # False for a `continuous` joint, which has no range
     dq_max: np.ndarray  # velocity, per planned coordinate
-    force_max: np.ndarray  # cylinder force, per planned axis, at the relief
+    tau_max: np.ndarray  # rated actuated effort, per planned coordinate
     flow_max: float  # summed pump draw
-    passive_lower: np.ndarray  # the range the sway pair may hang in
-    passive_upper: np.ndarray
 
 
 def read_limits(
     description_xml: str,
     tool: Tool,
-    model: symbolic_model.CraneSymbolicModel,
-    system_pressure_pa: float,
     pump_flow_max: float,
     pump_flow_planning_factor: float,
 ) -> Limits:
     """
-    Position and velocity out of the description, force out of the hydraulics.
+    Position and velocity out of the description; the pump out of the config.
 
     A `continuous` joint occupies two configuration slots (a cos/sin pair) and
-    carries no range; the rotator is one, so it is reported unbounded rather
-    than given an invented range here.
+    carries no range; the rotator is one, so it is reported unbounded rather than
+    given an invented range here.
+
+    There is deliberately no cylinder-force *constraint*. It was the smaller
+    chamber area times a relief pressure nothing in this workspace has measured.
+    `tau_max` is the description's own `effort` on each planned joint and is not
+    a substitute for it: nothing is bounded by it, it is the scale the OCP's
+    effort term is divided by, so that `tau_weight` means "a fraction of rated
+    effort" on every axis alike.
     """
     description = parse(description_xml, tool)
     inner = description.model
@@ -93,40 +126,30 @@ def read_limits(
     upper = np.empty(PLANNED_DOF)
     bounded = np.empty(PLANNED_DOF, dtype=bool)
     dq_max = np.empty(PLANNED_DOF)
+    tau_max = np.empty(PLANNED_DOF)
     for axis, index in enumerate(PLANNED_INDICES):
         slot = description.drives[index][0].slot
         bounded[axis] = slot.nq == 1
         lower[axis] = inner.lowerPositionLimit[slot.idx_q] if slot.nq == 1 else -np.inf
         upper[axis] = inner.upperPositionLimit[slot.idx_q] if slot.nq == 1 else np.inf
         dq_max[axis] = inner.velocityLimit[slot.idx_v]
+        tau_max[axis] = inner.effortLimit[slot.idx_v]
     if not np.all(np.isfinite(dq_max)) or np.any(dq_max <= 0.0):
         raise PlanningError(
             "the description gives a planned joint no finite positive velocity limit"
         )
-    passive = [description.drives[index][0].slot for index in PASSIVE_INDICES]
-    passive_lower = np.array([inner.lowerPositionLimit[slot.idx_q] for slot in passive])
-    passive_upper = np.array([inner.upperPositionLimit[slot.idx_q] for slot in passive])
-
-    # `hydraulics.md` 4's F = A_A p_A - A_B p_B with one chamber at the relief
-    # setting at a time. The *smaller* of the two is the limit, because the
-    # constraint is written symmetrically in |F| and a differential cylinder is
-    # weaker retracting.
-    pressure = np.full(len(ACTUATED_INDICES), float(system_pressure_pa))
-    zero = np.zeros(len(ACTUATED_INDICES))
-    extend = np.abs(np.array(ca.evalf(model.chamber_force(pressure, zero))).ravel())
-    retract = np.abs(np.array(ca.evalf(model.chamber_force(zero, pressure))).ravel())
-    force_max = np.minimum(extend, retract)[:PLANNED_DOF]
-    if np.any(force_max <= 0.0):
-        raise PlanningError("a cylinder carries no force at the relief pressure")
+    if not np.all(np.isfinite(tau_max)) or np.any(tau_max <= 0.0):
+        raise PlanningError(
+            "the description gives a planned joint no finite positive effort limit, "
+            "which is what the OCP's effort term is measured against"
+        )
     return Limits(
         lower=lower,
         upper=upper,
         bounded=bounded,
         dq_max=dq_max,
-        force_max=force_max,
+        tau_max=tau_max,
         flow_max=float(pump_flow_max) * float(pump_flow_planning_factor),
-        passive_lower=passive_lower,
-        passive_upper=passive_upper,
     )
 
 
@@ -139,33 +162,56 @@ class PlannerConfig:
 
     tool: Tool = Tool.PZS100
 
-    # Reservation held back from every physical limit so the MPC has authority
-    # left to correct with.
+    # Reservation held back from every physical limit so the controller has
+    # authority left to correct with.
     kappa: float = 0.8
 
-    # Endpoint IK acceptance, in metres and radians.
+    # Endpoint IK acceptance, in metres and radians. `ik_restarts` applies to
+    # the goal alone; along the line the previous sample is the seed.
     eps_pos: float = 1.0e-3
     eps_yaw: float = 1.0e-3
     ik_restarts: int = 5
 
-    # OMPL. The seed is a constant and not a clock: one request against one
-    # scene is reproducible.
-    ompl_seed: int = 20420042
-    ompl_time_budget: float = 5.0
-    ompl_extension_span: float = 2.0
-    ompl_unbounded_margin: float = np.pi
-    shortcut_attempts: int = 120
+    # --- what "clear" means, in metres ---------------------------------------
+    #
+    # The three-way split of the margin. `margin_safety` is the clearance an
+    # answer actually carries; `margin_interp` is what pays for the gap between
+    # two checked configurations; the swing envelope is computed, not configured.
+    # Each is spent once. See `Geometry`.
+    margin_safety: float = 0.05
+    margin_interp: float = 0.05
+    #: How far the tool's collision geometry reaches past the tool centre point.
+    #: It enters the step bound as an over-estimate of the machine's outermost
+    #: point, so too large costs samples and too small is unsound.
+    tool_radius: float = 1.0
+    #: The cap on lifted samples. Reaching it means the arm reconfigures faster
+    #: than the line resolves -- usually an IK branch jump -- and is a refusal.
+    max_lift_samples: int = 4096
 
-    # Collision, in metres. The path and the sway envelope share the step.
     q_sway_max: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2]))
-    check_resolution: float = 0.10
-    min_check_resolution: float = 0.01
-    max_check_samples: int = 2048
 
-    # Timing OCP.
+    #: How many cubic segments the path is fitted with, whatever the sample
+    #: count. This is the dial that decouples the two things the old
+    #: interpolating fit welded together: the collision certificate wants
+    #: samples dense, and the curve wants its end intervals long. Approximating
+    #: with far fewer control points than samples gives both.
+    path_segments: int = 12
+
+    # --- the timing OCP ------------------------------------------------------
     intervals: int = 40
     sway_weight: float = 2.0
+    tau_weight: float = 0.1
     input_weight: float = 1.0e-3
+    #: Terminal sway, as a cost and not an equality. One control -- the path
+    #: rate -- cannot in general drive four terminal quantities to zero along a
+    #: path it may not leave, and asking it to as a hard row is a refusal rather
+    #: than a slow trajectory. Normalised by the admissible bounds, so this
+    #: weight is a multiple of "the whole box".
+    terminal_sway_weight: float = 200.0
+    #: The pump row carries L1 slack for the same reason: a move that needs
+    #: 5% more flow than the reservation allows should come back slower and say
+    #: so, not come back as `Infeasible_Problem_Detected`.
+    flow_slack_weight: float = 1.0e3
     sigma_rate_min: float = 0.02
     sigma_rate_max: float = 2.0
     sigma_accel_max: float = 20.0
@@ -177,18 +223,15 @@ class PlannerConfig:
     max_iterations: int = 400
     tolerance: float = 1.0e-6
 
-    # Hydraulics the description does not carry. See config/hydraulic_limits.yaml.
+    # The pump, which the description does not carry.
     pump_flow_max: float = 1.4e-3
     pump_flow_planning_factor: float = 0.95
-    system_pressure_pa: float = 2.5e7
 
     # The emitted reference period.
     Ts: float = 0.04
 
     # The truck, as a property of the vehicle: the scene carries one primitive
     # with the reserved id `truck` and the bed and six runges are placed on it.
-    # The stations are the posts of `post_setup:=134` and its subset `13`; keep
-    # them equal to `world_model.vehicle_box.runge_stations_m`.
     truck_runge_dimensions: np.ndarray = field(
         default_factory=lambda: np.array([0.28, 0.31, 2.12])
     )
@@ -196,9 +239,6 @@ class PlannerConfig:
         default_factory=lambda: np.array([-2.261, -1.049, 1.935])
     )
     truck_bed_thickness: float = 0.10
-    # The headboard closing the cab end of the deck: 0.45 m of plate and side
-    # rail standing 1.922 m off the bed surface, across its full width. It is
-    # the box's +x end, which is the end the outermost runge station is at.
     truck_headboard_thickness: float = 0.45
     truck_headboard_height: float = 1.922
 
@@ -310,108 +350,21 @@ def payload_primitive(
 # ---------------------------------------------------------------- the hanging pose
 
 
-class Equilibrium:
+def passive_equilibrium(q_a: np.ndarray) -> np.ndarray:
     """
-    Where the tool hangs, as Newton on a compiled residual.
+    Where the tool hangs, in closed form.
 
-    `crane_model` answers this too, and answers it more carefully -- it scans
-    the whole passive range for a seed every time. That costs some 80 ms, and a
-    sampling planner asks the question tens of thousands of times: once per
-    state OMPL checks, once per residual evaluation of the inverse kinematics,
-    once per node of the timing OCP. So the same equation is solved here off the
-    shared CasADi graph, warm-started from the last answer, which is the right
-    seed because consecutive questions are about neighbouring configurations.
+    A two-hinge pendulum under gravity hangs straight down, so the tip joint
+    takes up whatever the boom four-bar accumulated and the tilt joint does not
+    move at all. `crane_mpc/src/mpc_node.cpp` measured this against the general
+    5x5-grid-plus-Newton solve and found it good to 1e-4 rad across the
+    workspace, and independent of slew, telescope, rotator, tool and payload --
+    against a sway box half-width of 0.2 rad.
 
-    A two-hinge pendulum has four critical points on the torus and two of them
-    are the tool standing *up*; they satisfy `h_u = 0` exactly as well. The sign
-    of the stiffness is what separates them, so it is checked at every iterate
-    and not only at the end.
+    That solve costs 22.6 ms and this costs two subtractions, which is what makes
+    it affordable to settle the pendulum at every configuration the lift checks.
     """
-
-    #: The residual is of order 1e3 N m before it cancels; this is the floor it
-    #: reaches, and it is worth under 1e-11 rad against the restoring stiffness.
-    RESIDUAL_NM = 1.0e-8
-    ITERATIONS = 32
-    #: Samples per axis in the cold-start scan. Five over the pi of tip range
-    #: puts a sample well inside the hanging well.
-    SAMPLES = 5
-    #: How far outside the description's passive range an answer may land and
-    #: still be that range's own edge. At a canonical pose the tool hangs
-    #: *exactly* on the tip limit, and Newton reaches it from below by two ulps;
-    #: a bare comparison then refuses the pose the machine is actually in.
-    RANGE_TOLERANCE = 1.0e-6
-
-    def __init__(self, model: symbolic_model.CraneSymbolicModel, limits: Limits):
-        q_a = ca.SX.sym("q_a", PLANNED_DOF)
-        q_u = ca.SX.sym("q_u", 2)
-        q_tool = ca.SX.sym("q_tool")
-        payload = ca.SX.sym("payload", symbolic_model.NP - 1)
-        residual = ca.substitute(
-            model.bias_u,
-            ca.vertcat(model.x, model.u, model.p),
-            ca.vertcat(
-                q_a,
-                q_u,
-                ca.SX.zeros(PLANNED_DOF + 2),  # x, at rest
-                ca.SX.zeros(PLANNED_DOF),  # u
-                q_tool,
-                payload,  # p
-            ),
-        )
-        self._step = ca.Function(
-            "equilibrium_step",
-            [q_a, q_u, q_tool, payload],
-            [residual, ca.jacobian(residual, q_u)],
-        )
-        self._scan = [
-            np.array([tip, tilt])
-            for tip in np.linspace(
-                limits.passive_lower[0], limits.passive_upper[0], self.SAMPLES
-            )
-            for tilt in np.linspace(
-                limits.passive_lower[1], limits.passive_upper[1], self.SAMPLES
-            )
-        ]
-        self._lower = limits.passive_lower
-        self._upper = limits.passive_upper
-        self._last = np.zeros(2)
-
-    def solve(self, q_a: np.ndarray, q_tool: float, payload: np.ndarray) -> np.ndarray:
-        """Return the passive pair the tool hangs at, or refuse that it hangs at all."""
-        for seed in [self._last, *self._scan]:
-            answer = self._newton(q_a, q_tool, payload, seed)
-            if answer is not None:
-                self._last = answer
-                return answer
-        raise PlanningError(
-            "the tool reaches no hanging pose inside the range the description gives "
-            "the passive joints at this configuration"
-        )
-
-    def _newton(self, q_a, q_tool, payload, seed):
-        q_u = np.asarray(seed, dtype=float).copy()
-        for _ in range(self.ITERATIONS):
-            residual, stiffness = self._step(q_a, q_u, q_tool, payload)
-            residual = np.array(residual).ravel()
-            stiffness = np.array(stiffness)
-            if not (np.all(np.isfinite(residual)) and np.all(np.isfinite(stiffness))):
-                return None
-            try:
-                # Positive definite is the hanging branch; the saddles and the
-                # tool standing up are the other three roots.
-                factor = np.linalg.cholesky(0.5 * (stiffness + stiffness.T))
-            except np.linalg.LinAlgError:
-                return None
-            if np.linalg.norm(residual) <= self.RESIDUAL_NM:
-                if np.any(q_u < self._lower - self.RANGE_TOLERANCE) or np.any(
-                    q_u > self._upper + self.RANGE_TOLERANCE
-                ):
-                    return None
-                return np.clip(q_u, self._lower, self._upper)
-            q_u = q_u - np.linalg.solve(factor.T, np.linalg.solve(factor, residual))
-            if not np.all(np.isfinite(q_u)):
-                return None
-        return None
+    return np.array([0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi])
 
 
 # ------------------------------------------------------------------- geometry
@@ -419,20 +372,44 @@ class Equilibrium:
 
 class Geometry:
     """
-    Whether a configuration and a path are clear, at the pose the tool hangs at.
+    Whether a configuration is clear, at the pose the tool hangs at.
 
-    Every distance is a `crane_model` query -- there is no second collision
-    model here. The sway envelope of `wiki/trajectory_planning.md` 4.3 is
-    answered in two steps: one query at the nominal hanging pose settles the
-    free-space majority, because no admissible sway can move the tool further
-    than `l_tool * sin(q_u^+)`; only where that margin is not met is the sway
-    box actually gridded.
+    Every distance is a `crane_model` query -- there is no second collision model
+    here.
+
+    # How a finite set of checks certifies a continuous motion
+
+    Sampling never proves clearance on its own. What makes it a proof is a
+    margin paired with a bound on how far anything can move between two samples.
+    Rotating planned joint `j` by `dq_j` displaces any point below it by at most
+    `radii[j] * |dq_j|`, so between two configurations no point of the machine
+    moves further than `step_bound`. Therefore:
+
+        if every checked configuration clears the scene by more than
+        `required`, and `step_bound <= margin_interp` for every consecutive
+        pair, then no point of the machine touches anything anywhere on the
+        continuous motion between them.
+
+    `required` is spent three ways and each part is spent once:
+
+        required = margin_safety + margin_interp + envelope
+
+    `margin_interp` bridges the samples, `envelope` is how far the tool can swing
+    inside the admissible sway box, and `margin_safety` is what is actually left
+    over as clearance. The swing is therefore answered by one distance test
+    rather than by gridding the sway box, and a thin obstacle cannot be tunnelled
+    -- which is what the old "tighten the step to half the thinnest primitive"
+    rule was reaching for without being able to prove.
+
+    Self-collision keeps its own test at zero: the machine's links are near each
+    other by design, and holding them a margin apart would refuse poses it is
+    built to reach.
     """
 
     def __init__(
         self,
         model: CraneModel,
-        equilibrium: Equilibrium,
+        limits: Limits,
         scene: list,
         config: PlannerConfig,
         q_tool: float,
@@ -440,98 +417,131 @@ class Geometry:
         payload_shape=None,
     ):
         self.model = model
-        self.equilibrium = equilibrium
+        self.limits = limits
         self.scene = list(scene)
         self.config = config
         self.q_tool = float(q_tool)
         self.payload = payload
         self.payload_shape = payload_shape
         self.envelope = self._envelope()
-        self.step_m = self._resolution()
+        self.required = (
+            float(config.margin_safety) + float(config.margin_interp) + self.envelope
+        )
+        self.radii = self._radii()
 
     def bodies(self, q: np.ndarray) -> list:
         """Return the scene at `q`, with what the tool carries placed on it."""
         carried = payload_primitive(self.model, q, self.payload_shape)
         return self.scene if carried is None else self.scene + [carried]
 
+    def _carried_reach(self) -> float:
+        """How far past the tool centre point the carried body reaches, in metres."""
+        if self.payload_shape is None:
+            return 0.0
+        _shape, dimensions, offset = self.payload_shape
+        return float(
+            np.linalg.norm(np.asarray(offset, dtype=float))
+            + np.linalg.norm(np.asarray(dimensions, dtype=float))
+        )
+
     def _envelope(self) -> float:
-        """How far the tool can swing, in metres, at the admissible sway bound."""
+        """
+        Return how far the farthest carried point can swing, in metres.
+
+        Measured from the passive pivot to that point and **not to the tool
+        centre point**: a gripped block hangs below the TCP, so it swings on a
+        longer pendulum than the tool does and takes up more room for the same
+        `q_sway_max`. Everything between the pivot and the TCP is closer to the
+        pivot and so swings less, which is why only what is carried is added.
+
+        The sway box is shared with the controller by design, so this is not a
+        conservative approximation of a swing that will not happen -- it is a
+        state the machine is entitled to reach, and geometry that was not
+        checked for it was not checked.
+        """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
         hinge = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TILT)
         tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
         length = float(np.linalg.norm(tcp.position_m - hinge.position_m))
+        length += self._carried_reach()
         return length * float(np.sin(np.max(np.abs(self.config.q_sway_max))))
 
-    def _resolution(self) -> float:
-        """Return the step, tightened to half the thinnest primitive the scene carries."""
-        step = float(self.config.check_resolution)
-        for primitive in self.scene:
-            step = min(step, 0.5 * float(np.min(primitive.dimensions_m)))
-        if step < self.config.min_check_resolution:
-            raise PlanningError(
-                f"the scene needs a check step of {step:.4f} m, below the "
-                f"{self.config.min_check_resolution:.4f} m floor: a path checked at a "
-                "step it does not resolve is not checked"
-            )
-        return step
+    def _radii(self) -> np.ndarray:
+        """
+        How far a body can move per unit of each planned coordinate.
+
+        Measured at full telescope extension, which is where every radius is
+        largest. The outermost point of the machine is taken to be the tool
+        centre point plus `tool_radius` and the carried body's own reach, and the
+        distance is taken from the joint's *origin* rather than its axis -- both
+        over-estimate, which is the safe direction for a bound that has to hold.
+        The telescope is prismatic, and displaces what it carries by
+        `TELESCOPE_TRAVEL_PER_UNIT` -- two metres per metre of `q4`, not one.
+        """
+        q = np.zeros(GENERALIZED_DOF)
+        q[TOOL_INDEX] = self.q_tool
+        extension = self.limits.upper[TELESCOPE_AXIS]
+        if np.isfinite(extension):
+            q[PLANNED_INDICES[TELESCOPE_AXIS]] = extension
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q[list(PLANNED_INDICES)])
+        tcp = self.model.forward_kinematics(
+            q, Frame.MOUNTING_BASE, Frame.TCP
+        ).position_m
+
+        reach = float(self.config.tool_radius) + self._carried_reach()
+
+        radii = np.ones(PLANNED_DOF)
+        radii[TELESCOPE_AXIS] = TELESCOPE_TRAVEL_PER_UNIT
+        for axis, frame in enumerate(PLANNED_FRAMES):
+            if frame is None:
+                continue
+            origin = self.model.forward_kinematics(
+                q, Frame.MOUNTING_BASE, frame
+            ).position_m
+            radii[axis] = float(np.linalg.norm(tcp - origin)) + reach
+        return radii
+
+    def step_bound(self, first: np.ndarray, second: np.ndarray) -> float:
+        """Return the furthest any point of the machine moves between two configurations."""
+        return float(
+            np.sum(self.radii * np.abs(np.asarray(second) - np.asarray(first)))
+        )
 
     def configuration(self, q_a: np.ndarray) -> np.ndarray:
         """Return the canonical eight at `q_a`, with the tool hanging."""
         q = np.zeros(GENERALIZED_DOF)
         q[list(PLANNED_INDICES)] = q_a
         q[TOOL_INDEX] = self.q_tool
-        q[list(PASSIVE_INDICES)] = self.equilibrium.solve(
-            q_a, self.q_tool, self.payload
-        )
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
         return q
 
-    def clearance(self, q: np.ndarray) -> float:
-        """Smallest distance to anything, the machine against itself included."""
-        return float(self.model.collision_query(q, self.bodies(q)).minimum_distance_m)
+    def clearance(self, q_a: np.ndarray) -> float:
+        """
+        Scene clearance at `q_a`, in metres, or `-inf` where it cannot be evaluated.
 
-    def is_valid(self, q_a: np.ndarray) -> bool:
-        """Clear at the hanging pose, and clear anywhere the tool may swing to."""
+        The self-collision row is separated out and tested at zero; what is
+        returned is the distance to the scene, which is what the margin is
+        against.
+        """
         try:
             q = self.configuration(q_a)
+            bodies = self.bodies(q)
+            results = self.model.collision_queries(q, bodies)
         except (CraneModelError, PlanningError):
-            return False
-        bodies = self.bodies(q)
-        # One sweep, not two. `crane_model.collision.query` is defined as
-        # `min(queries(...))`, so asking for the overall minimum and then for
-        # the per-primitive row computed every distance pair twice -- and this
-        # is the inner loop of the search.
-        results = self.model.collision_queries(q, bodies)
-        if min(result.minimum_distance_m for result in results) <= 0.0:
-            return False
-        if self.envelope <= 0.0 or not bodies:
-            return True
-        scene_only = min(
-            (result.minimum_distance_m for result in results[:-1]),
-            default=np.inf,
-        )
-        if scene_only > self.envelope:
-            return True
-        # The sufficient condition did not hold, so the box is checked. Corners
-        # and edge midpoints: the extremes are where the tool actually reaches.
-        equilibrium = q[list(PASSIVE_INDICES)]
-        bound = np.asarray(self.config.q_sway_max, dtype=float)
-        axis = (-1.0, 0.0, 1.0)
-        swung = q.copy()
-        for tip in axis:
-            for tilt in axis:
-                swung[list(PASSIVE_INDICES)] = equilibrium + bound * np.array(
-                    [tip, tilt]
-                )
-                # The payload swings with the tool, so it is re-placed too.
-                if (
-                    self.model.collision_query(
-                        swung, self.bodies(swung)
-                    ).minimum_distance_m
-                    <= 0.0
-                ):
-                    return False
-        return True
+            return -np.inf
+        # `crane_model.collision.queries` answers one row per scene primitive in
+        # scene order, then -- if the description has any self-pairs at all --
+        # one for the machine against itself.
+        scene_rows = results[: len(bodies)]
+        self_rows = results[len(bodies) :]
+        if any(row.minimum_distance_m <= 0.0 for row in self_rows):
+            return -np.inf
+        return min((row.minimum_distance_m for row in scene_rows), default=np.inf)
+
+    def is_valid(self, q_a: np.ndarray) -> bool:
+        """Clear of the scene by the whole margin, and not folded into itself."""
+        return self.clearance(q_a) > self.required
 
     def travel(self, first: np.ndarray, second: np.ndarray) -> float:
         """How far the tool moves between two configurations, in metres."""
@@ -546,17 +556,55 @@ class Geometry:
             return np.inf
         return float(np.linalg.norm(other.position_m - one.position_m))
 
-    def check_path(self, path) -> None:
-        """Sample the fitted curve and refuse at the first blocked sigma."""
-        samples = min(
-            self.config.max_check_samples,
-            max(16, int(np.ceil(path.travel_m / self.step_m)) + 1),
+    def tcp_pose(self, q_a: np.ndarray) -> tuple[np.ndarray, float]:
+        """Return the tool centre point's position and yaw at `q_a`, hanging."""
+        pose = self.model.forward_kinematics(
+            self.configuration(q_a), Frame.MOUNTING_BASE, Frame.TCP
         )
-        for sigma in np.linspace(0.0, 1.0, samples):
-            if not self.is_valid(path.position(sigma)):
+        rotation = pin.XYZQUATToSE3(
+            np.concatenate([pose.position_m, pose.orientation_xyzw])
+        ).rotation
+        return pose.position_m, yaw_of(rotation)
+
+    def check_path(self, path) -> None:
+        """
+        Re-run the certificate on the fitted curve, which is what executes.
+
+        The polyline satisfied it by construction; the spline through it is a
+        different curve, so it earns the same two tests -- clearance at every
+        sample, and the step bound between consecutive ones. It is walked with
+        the same adaptive step for the same reason: a sample count read off the
+        tool's travel says nothing about how far the arm moved between two of
+        them.
+        """
+        previous = path.position(0.0)
+        if not self.is_valid(previous):
+            raise PlanningError("the fitted path is blocked at its start")
+        sigma, step, count = 0.0, INITIAL_LIFT_STEP, 1
+        while sigma < 1.0:
+            step = min(step, 1.0 - sigma)
+            candidate = path.position(sigma + step)
+            if self.step_bound(previous, candidate) > self.config.margin_interp:
+                step *= 0.5
+                if step < MIN_LIFT_STEP:
+                    raise PlanningError(
+                        f"the fitted path moves the machine faster than the "
+                        f"{self.config.margin_interp:.3f} m interpolation margin "
+                        f"resolves near sigma = {sigma:.3f}, so it is not certified"
+                    )
+                continue
+            if not self.is_valid(candidate):
                 raise PlanningError(
-                    f"the fitted path is blocked at sigma = {sigma:.3f}"
+                    f"the fitted path is blocked at sigma = {sigma + step:.3f}"
                 )
+            previous, sigma = candidate, sigma + step
+            count += 1
+            if count > int(self.config.max_lift_samples):
+                raise PlanningError(
+                    f"the fitted path needs more than {self.config.max_lift_samples} "
+                    "samples to certify"
+                )
+            step *= 1.25
 
 
 # -------------------------------------------------------------------- the IK
@@ -579,6 +627,7 @@ def solve_ik(
     position_m: np.ndarray,
     yaw: float,
     seed: np.ndarray,
+    restarts: int = 1,
 ) -> np.ndarray:
     """
     Solve for the planned five that put the tool at `(position_m, yaw)`, hanging.
@@ -586,9 +635,17 @@ def solve_ik(
     One least-squares problem, not a closed form: the passive pair is re-settled
     at every configuration tested, so what is solved is where the tool actually
     ends up rather than where it would be if it did not hang. The redundancy the
-    telescope leaves is taken up by a weak pull towards the seed, and the
-    restarts spread over the telescope range because that is the coordinate the
-    residual is flat in.
+    telescope leaves is taken up by a weak pull towards the seed.
+
+    `restarts` is what separates the two callers. The goal is solved cold and
+    spreads its restarts over the telescope range, because that is the coordinate
+    the residual is flat in. Every sample along the line is solved with one
+    restart from its predecessor, which is the right seed -- consecutive
+    questions are about neighbouring poses -- and is also what keeps the lifted
+    path on one IK branch.
+
+    This checks reachability and nothing else. Whether the answer is clear is the
+    caller's question, because the caller knows which sample it is.
     """
     lower = np.where(limits.bounded, limits.lower, seed - 2.0 * np.pi)
     upper = np.where(limits.bounded, limits.upper, seed + 2.0 * np.pi)
@@ -602,58 +659,204 @@ def solve_ik(
         rotation = pin.XYZQUATToSE3(
             np.concatenate([pose.position_m, pose.orientation_xyzw])
         ).rotation
-        angle = np.arctan2(
-            np.sin(yaw_of(rotation) - yaw), np.cos(yaw_of(rotation) - yaw)
-        )
         return np.concatenate(
-            [pose.position_m - position_m, [angle], 1.0e-3 * (q_a - seed)]
+            [
+                pose.position_m - position_m,
+                [_wrap(yaw_of(rotation) - yaw)],
+                1.0e-3 * (q_a - seed),
+            ]
         )
 
-    best, best_error = None, np.inf
-    telescope = np.linspace(lower[3], upper[3], max(1, config.ik_restarts))
-    for extension in telescope:
-        start = np.clip(seed.copy(), lower, upper)
-        start[3] = extension
+    def jacobian(q_a):
+        """
+        Return the residual's derivative, analytically rather than by differencing.
+
+        Worth the two dozen lines: a five-parameter finite difference costs six
+        forward-kinematics evaluations per iteration and this costs one
+        Jacobian, which is why the lift stopped being the slowest stage.
+
+        Two corrections turn the model's answer into this residual's. The
+        Jacobian is LOCAL, so the linear and angular blocks are rotated into
+        `K0_mounting_base`. And the passive pair is not independent: the
+        pendulum hangs at `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, so moving the
+        boom or the arm swings the tip joint back by exactly as much, and the
+        tip column enters those two with a factor of -1.
+
+        The yaw row takes the angular Jacobian's z entry, which is exact only
+        while the tool hangs near-upright. That costs a little convergence and
+        nothing in correctness: the residual it is a derivative of stays exact,
+        and the acceptance test below is on the residual.
+        """
+        try:
+            q = geometry.configuration(q_a)
+        except (CraneModelError, PlanningError):
+            return np.zeros((PLANNED_DOF + 4, PLANNED_DOF))
+        pose = geometry.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
+        rotation = pin.XYZQUATToSE3(
+            np.concatenate([pose.position_m, pose.orientation_xyzw])
+        ).rotation
+        full = geometry.model.jacobian(q, Frame.TCP).value
+        linear = rotation @ full[:3, :]
+        angular = rotation @ full[3:, :]
+
+        out = np.zeros((PLANNED_DOF + 4, PLANNED_DOF))
+        tip = PASSIVE_INDICES[0]
+        for axis, column in enumerate(PLANNED_INDICES):
+            coupling = -1.0 if axis in (BOOM_AXIS, ARM_AXIS) else 0.0
+            out[0:3, axis] = linear[:, column] + coupling * linear[:, tip]
+            out[3, axis] = angular[2, column] + coupling * angular[2, tip]
+        out[4:, :] = 1.0e-3 * np.eye(PLANNED_DOF)
+        return out
+
+    if restarts <= 1:
+        starts = [np.clip(np.asarray(seed, dtype=float), lower, upper)]
+    else:
+        starts = []
+        for extension in np.linspace(
+            lower[TELESCOPE_AXIS], upper[TELESCOPE_AXIS], restarts
+        ):
+            candidate = np.clip(np.asarray(seed, dtype=float).copy(), lower, upper)
+            candidate[TELESCOPE_AXIS] = extension
+            starts.append(candidate)
+
+    best, best_error = starts[0], np.inf
+    for start in starts:
         answer = least_squares(
-            residual, start, bounds=(lower, upper), xtol=1e-12, ftol=1e-12, gtol=1e-12
+            residual,
+            start,
+            jac=jacobian,
+            bounds=(lower, upper),
+            xtol=1e-10,
+            ftol=1e-10,
+            gtol=1e-10,
         )
-        error = np.linalg.norm(answer.fun[:4])
+        error = float(np.linalg.norm(answer.fun[:4]))
         if error < best_error:
             best, best_error = answer.x, error
-        # The restarts exist to escape a local minimum. A solve that already
-        # meets the tolerance this function is about to check is not in one, and
-        # the remaining restarts can only re-derive an answer already in hand --
-        # measured across the workspace, every one of them returns the same
-        # configuration to three decimals.
+        # A solve that already meets the tolerance this function is about to
+        # check is not in a local minimum, and the remaining restarts can only
+        # re-derive an answer already in hand. It is taken as `best` outright:
+        # the selection above mixes three metres with one radian in a single
+        # 4-norm while the acceptance test is two separate scalars, so the
+        # restart that satisfies the test need not be the one holding `best`.
         if (
             float(np.linalg.norm(answer.fun[:3])) <= config.eps_pos
             and float(abs(answer.fun[3])) <= config.eps_yaw
         ):
-            # This restart, not whichever had the smallest combined norm. The
-            # selection above mixes three metres with one radian in a single
-            # 4-norm while the acceptance test below is two separate scalars, so
-            # the restart that satisfies the test need not be the one holding
-            # `best` -- and returning the other refuses a goal just reached.
-            best, best_error = answer.x, error
-            break
+            return answer.x
 
-    q_a = best
-    final = residual(q_a)
+    final = residual(best)
     position_error = float(np.linalg.norm(final[:3]))
     yaw_error = float(abs(final[3]))
     if position_error > config.eps_pos or yaw_error > config.eps_yaw:
         raise PlanningError(
-            f"the goal is not reachable: the closest configuration misses it by "
+            f"the tool cannot be placed at "
+            f"({position_m[0]:.3f}, {position_m[1]:.3f}, {position_m[2]:.3f}) m / "
+            f"{np.degrees(yaw):.1f} deg: the closest configuration misses it by "
             f"{position_error * 1e3:.1f} mm and {np.degrees(yaw_error):.2f} deg "
             f"(tolerances {config.eps_pos * 1e3:.1f} mm, "
             f"{np.degrees(config.eps_yaw):.2f} deg)"
         )
-    if not geometry.is_valid(q_a):
-        raise PlanningError("the goal configuration is in collision")
-    return q_a
+    return best
 
 
-# ---------------------------------------------------------------- the geometry search
+# ------------------------------------------------------- the straight tool path
+
+
+def lift(
+    geometry: Geometry,
+    limits: Limits,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_position_m: np.ndarray,
+    goal_yaw: float,
+) -> np.ndarray:
+    """
+    Run the tool centre point down a straight line, and lift it into joint space.
+
+    The line is in `K0_mounting_base`: position interpolates linearly and yaw
+    along the shortest arc. Every sample is placed by inverse kinematics seeded
+    from the one before it, and the whole machine is checked there.
+
+    Where samples land is decided by the certificate in `Geometry` and not by a
+    fixed count: the step is halved until `step_bound` fits inside
+    `margin_interp`, and allowed to grow again over a clear run. That is the only
+    resolution rule, and it is the one that has to hold -- a small step for the
+    tool is not a small step for the arm. Near a singularity, or across the null
+    space the redundant telescope leaves, the tool can barely move while the boom
+    swings through it.
+
+    # Why this marches instead of bisecting
+
+    The five planned coordinates are one more than the four the tool pose fixes,
+    so every pose on the line is reached by a one-parameter family of
+    configurations and the inverse kinematics picks one of them by continuity
+    from its seed. That makes the **goal configuration an output of the walk, not
+    an input to it**: solving the goal separately picks its own point on that
+    family, and no amount of refinement can close the finite jump between two
+    different branches. So the goal pose is what is specified here, the endpoint
+    configuration is whatever marching to it produces, and the caller's cold
+    solve is used to establish that the pose is reachable at all -- not to pin
+    where the arm ends up.
+
+    A genuine branch change still cannot pass unnoticed: it is a large joint step
+    for an arbitrarily small tool step, so the step collapses to the floor and is
+    refused. The resolution test and the continuity guard are one test.
+    """
+    start_position, start_yaw = geometry.tcp_pose(start_q_a)
+    goal_position = np.asarray(goal_position_m, dtype=float)
+    sweep = _wrap(float(goal_yaw) - start_yaw)
+
+    def lift_at(fraction: float, seed: np.ndarray) -> np.ndarray:
+        position = (1.0 - fraction) * start_position + fraction * goal_position
+        q_a = solve_ik(
+            geometry,
+            limits,
+            config,
+            position,
+            start_yaw + fraction * sweep,
+            seed,
+            restarts=1,
+        )
+        if not geometry.is_valid(q_a):
+            raise PlanningError(
+                f"the straight tool path is blocked {fraction * 100.0:.0f}% of the way "
+                f"to the goal: the machine clears the scene there by "
+                f"{geometry.clearance(q_a):.3f} m against the "
+                f"{geometry.required:.3f} m this plan requires"
+            )
+        return q_a
+
+    waypoints = [np.asarray(start_q_a, dtype=float)]
+    fraction, step = 0.0, INITIAL_LIFT_STEP
+    while fraction < 1.0:
+        step = min(step, 1.0 - fraction)
+        candidate = lift_at(fraction + step, waypoints[-1])
+        if geometry.step_bound(waypoints[-1], candidate) > config.margin_interp:
+            step *= 0.5
+            if step < MIN_LIFT_STEP:
+                raise PlanningError(
+                    f"the arm reconfigures faster than the straight tool path resolves "
+                    f"at {fraction * 100.0:.0f}% of the way to the goal -- a "
+                    "singularity or an inverse-kinematics branch change, and either "
+                    "way it is not a path this certifies"
+                )
+            continue
+        waypoints.append(candidate)
+        fraction += step
+        if len(waypoints) > int(config.max_lift_samples):
+            raise PlanningError(
+                f"the straight tool path needs more than {config.max_lift_samples} "
+                f"configurations to resolve at the {config.margin_interp:.3f} m "
+                "interpolation margin"
+            )
+        # Grow again, so one tight corner does not hold the rest of a clear run
+        # at the step it needed.
+        step *= 1.25
+    return np.array(waypoints)
+
+
+# ---------------------------------------------------------------------- the fit
 
 
 @dataclass
@@ -661,13 +864,13 @@ class Path:
     """
     q_a(sigma) on [0, 1], twice differentiable everywhere.
 
-    Twice, and that is the whole point of fitting at all: the timing stage
-    writes `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`, so at a kink in the
-    polyline q_a'' is unbounded, the admissible path rate collapses to zero and
-    the machine stops dead at every waypoint.
+    Twice, and that is the whole point of fitting at all: the timing stage writes
+    `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`, so at a kink in the polyline
+    q_a'' is unbounded, the admissible path rate collapses to zero and the machine
+    stops dead at every waypoint.
     """
 
-    spline: CubicSpline
+    spline: BSpline
     travel_m: float
 
     def position(self, sigma) -> np.ndarray:
@@ -686,172 +889,87 @@ class Path:
         )
 
 
-def search(
-    geometry: Geometry,
-    limits: Limits,
-    config: PlannerConfig,
-    start: np.ndarray,
-    goal: np.ndarray,
-) -> np.ndarray:
-    """
-    RRT-Connect over the five planned coordinates, then a shortcut pass.
-
-    The search runs in coordinates scaled by each axis's own velocity limit, so
-    the metric OMPL extends and interpolates in is *seconds at full speed*
-    rather than a sum of radians and metres. Only exact solutions are taken.
-    """
-    scale = limits.dq_max
-    margin = config.ompl_unbounded_margin
-    lower = np.where(limits.bounded, limits.lower, np.minimum(start, goal) - margin)
-    upper = np.where(limits.bounded, limits.upper, np.maximum(start, goal) + margin)
-    if np.any(start < lower) or np.any(start > upper):
-        raise PlanningError(
-            "the measured start is outside the description's joint range"
-        )
-    if np.any(goal < lower) or np.any(goal > upper):
-        raise PlanningError(
-            "the goal configuration is outside the description's joint range"
-        )
-
-    space = ob.RealVectorStateSpace(PLANNED_DOF)
-    bounds = ob.RealVectorBounds(PLANNED_DOF)
-    for axis in range(PLANNED_DOF):
-        bounds.setLow(axis, float(lower[axis] / scale[axis]))
-        bounds.setHigh(axis, float(upper[axis] / scale[axis]))
-    space.setBounds(bounds)
-    space.setup()
-
-    setup = og.SimpleSetup(space)
-    information = setup.getSpaceInformation()
-
-    class Valid(ob.StateValidityChecker):
-        def isValid(self, state):
-            return geometry.is_valid(
-                np.array([state[axis] for axis in range(PLANNED_DOF)]) * scale
-            )
-
-    checker = Valid(information)
-    setup.setStateValidityChecker(checker)
-
-    # How finely a motion is subdivided. The search metric is time, not
-    # distance, so the fraction is set from how far the tool actually travels
-    # over the start-to-goal chord -- the fitted path is re-checked at `step_m`
-    # afterwards, and that check is what certifies the answer.
-    chord = float(np.linalg.norm((goal - start) / scale))
-    travel = geometry.travel(start, goal)
-    if chord > 1e-9 and travel > 1e-9:
-        extent = float(space.getMaximumExtent())
-        information.setStateValidityCheckingResolution(
-            float(np.clip(geometry.step_m * chord / (travel * extent), 1e-4, 0.05))
-        )
-
-    def state(values):
-        allocated = information.allocState()
-        for axis in range(PLANNED_DOF):
-            allocated[axis] = float(values[axis] / scale[axis])
-        return allocated
-
-    # The direct motion, before the sampler is asked for anything. In this
-    # space -- every axis divided by its own velocity limit -- the straight line
-    # between two configurations is the least joint travel there is, so when it
-    # is clear there is nothing for a search to improve on and `shortcut` would
-    # collapse to it anyway. Both endpoints are already known valid: `solve_ik`
-    # refuses a goal in collision and `Planner.plan` refuses the start, so this
-    # costs one motion check and nothing else.
-    # `setStateValidityCheckingResolution` records a *fraction*; the segment
-    # length a motion check actually subdivides by is recomputed only in
-    # `setup()`, which `solve()` would not reach until after the check below.
-    # Without this the direct motion is checked at OMPL's default one percent --
-    # on this space seven times coarser than the step the scene asked for, which
-    # is how a straight line past a runge gets accepted here and then refused by
-    # `check_path`.
-    information.setup()
-    first, last = state(start), state(goal)
-    if information.checkMotion(first, last):
-        return np.array([start, goal])
-
-    setup.setStartAndGoalStates(first, last)
-    planner = og.RRTConnect(information)
-    planner.setRange(float(config.ompl_extension_span))
-    setup.setPlanner(planner)
-
-    if not setup.solve(float(config.ompl_time_budget)):
-        raise PlanningError(
-            f"no collision-free path was found in {config.ompl_time_budget:.1f} s"
-        )
-    if not setup.haveExactSolutionPath():
-        raise PlanningError("only an approximate path was found, which is not a plan")
-
-    solution = setup.getSolutionPath()
-    waypoints = [
-        np.array([solution.getState(index)[axis] for axis in range(PLANNED_DOF)])
-        * scale
-        for index in range(solution.getStateCount())
-    ]
-    return shortcut(information, space, scale, waypoints, config)
-
-
-def shortcut(
-    information, space, scale, waypoints: list, config: PlannerConfig
-) -> np.ndarray:
-    """
-    Replace random spans by their chord wherever the chord is clear.
-
-    Its own seeded generator, so the smoothing is reproducible for the same
-    search result, and its own check allowance -- how hard the search was is no
-    reason to smooth its answer less.
-    """
-    generator = np.random.default_rng(config.ompl_seed + 1)
-
-    def state(values):
-        allocated = information.allocState()
-        for axis in range(PLANNED_DOF):
-            allocated[axis] = float(values[axis] / scale[axis])
-        return allocated
-
-    for _ in range(int(config.shortcut_attempts)):
-        if len(waypoints) <= 2:
-            break
-        first, second = sorted(generator.choice(len(waypoints), size=2, replace=False))
-        if second - first < 2:
-            continue
-        if information.checkMotion(state(waypoints[first]), state(waypoints[second])):
-            waypoints = waypoints[: first + 1] + waypoints[second:]
-    return np.array(waypoints)
-
-
 def fit(
     geometry: Geometry,
     limits: Limits,
+    config: PlannerConfig,
     waypoints: np.ndarray,
     dq_start: np.ndarray,
 ) -> tuple[Path, float | None]:
     """
-    Fit `q_a(sigma)` through the waypoints, and say what sigma_dot(0) must be.
+    Fit `q_a(sigma)` to the waypoints, and say what sigma_dot(0) must be.
 
     sigma is distributed by how long each chord takes at the slowest axis's own
     limit, so a segment that is slow in one coordinate gets more of the
     parameter. That total is a duration, and it is also what pins the start
     rate: choosing `q_a'(0) = dq_a * L` makes `dq_a = q_a'(0) sigma_dot(0)` hold
-    exactly at `sigma_dot(0) = 1/L`, rather than leaving a residual to accept or
-    refuse.
+    exactly at `sigma_dot(0) = 1/L`.
+
+    # Why this approximates instead of interpolating
+
+    A cubic spline forced through every sample ties the number of curve
+    segments to the number of samples, and those two want opposite things. The
+    collision certificate wants samples **dense** -- that is what makes it a
+    proof. The curve wants its first and last intervals **long**, because the
+    path is clamped to leave and arrive at rest in `q_a` and that flattening has
+    to happen somewhere. Interpolating a densely sampled path squeezes the
+    clamp into a sliver of sigma, and `q_a''` at the endpoint blows up: measured
+    at 361 against an interior value of 0.4, a spike the timing OCP then reads
+    at its very first node and refuses.
+
+    A least-squares B-spline with its own knot count breaks the tie. `sigma` is
+    sampled as densely as the certificate demands and the curve carries
+    `path_segments` cubic pieces regardless, so the end intervals stay long and
+    the curvature stays O(1). It also stops the fit chasing inverse-kinematics
+    noise between neighbouring samples.
+
+    The curve no longer passes exactly through the checked configurations, which
+    would matter if the polyline were the thing being certified. It is not:
+    `Geometry.check_path` re-runs the whole certificate on this curve, because
+    this curve is what executes.
     """
+    if len(waypoints) < 2:
+        raise PlanningError("the lifted path carries fewer than two configurations")
     spans = np.max(np.abs(np.diff(waypoints, axis=0)) / limits.dq_max, axis=1)
-    spans = np.maximum(spans, 1.0e-3)
+    spans = np.maximum(spans, 1.0e-9)
     total = float(np.sum(spans))
     nodes = np.concatenate([[0.0], np.cumsum(spans) / total])
+    nodes[-1] = 1.0
 
+    degree = 3
+    # One coefficient per segment plus the degree, and never more than the data
+    # can determine.
+    segments = int(np.clip(config.path_segments, 1, max(1, len(waypoints) - degree)))
+    interior = np.linspace(0.0, 1.0, segments + 1)[1:-1]
+    knots = np.concatenate([np.zeros(degree + 1), interior, np.ones(degree + 1)])
+    try:
+        spline = make_lsq_spline(nodes, waypoints, knots, k=degree)
+    except ValueError as failure:
+        raise PlanningError(
+            f"the lifted path cannot be fitted with {segments} segments: {failure}"
+        ) from None
+
+    # The endpoints and the end slopes are boundary conditions, not something to
+    # be least-squares fitted. For a clamped B-spline the first and last
+    # coefficients *are* the endpoint values, and the end slope is set by the
+    # one coefficient next to each -- so both are imposed exactly by writing
+    # four coefficients, and every remaining one is left as fitted.
+    coefficients = np.array(spline.c, dtype=float)
+    coefficients[0] = waypoints[0]
+    coefficients[-1] = waypoints[-1]
     moving = float(np.linalg.norm(dq_start)) > 1.0e-9
     start_rate = (
         np.asarray(dq_start, dtype=float) * total if moving else np.zeros(PLANNED_DOF)
     )
-    spline = CubicSpline(
-        nodes,
-        waypoints,
-        bc_type=((1, start_rate), (1, np.zeros(PLANNED_DOF))),
+    coefficients[1] = (
+        coefficients[0] + start_rate * (knots[degree + 1] - knots[1]) / degree
     )
+    # Arriving at rest in q_a is what lets sigma_dot stay above its floor while
+    # dq_a = q_a' sigma_dot still reaches zero.
+    coefficients[-2] = coefficients[-1]
+    spline = BSpline(knots, coefficients, degree)
 
-    dense = np.linspace(0.0, 1.0, 129)
+    dense = np.linspace(0.0, 1.0, max(129, len(waypoints)))
     sampled = spline(dense)
     slack = 1.0e-6
     for axis in range(PLANNED_DOF):
@@ -862,8 +980,8 @@ def fit(
             or np.max(sampled[:, axis]) > limits.upper[axis] + slack
         ):
             raise PlanningError(
-                f"the fitted path overshoots joint {axis}'s range; the search returned "
-                "waypoints too far apart to smooth inside it"
+                f"the fitted path leaves joint {axis}'s range; the lifted "
+                f"configurations cannot be followed with {segments} segments"
             )
 
     travel = 0.0
@@ -890,8 +1008,9 @@ class Timing:
     q_a: np.ndarray
     dq_a: np.ndarray
     ddq_a: np.ndarray
-    cylinder_force: np.ndarray
+    tau: np.ndarray
     pump_flow: np.ndarray
+    flow_slack: np.ndarray
     time: np.ndarray
     iterations: int
     solve_time_s: float
@@ -900,21 +1019,38 @@ class Timing:
     def duration(self) -> float:
         return float(self.time[-1])
 
+    @property
+    def terminal_sway(self) -> float:
+        """How far the tool still hangs off its rest pose at the goal, in radians."""
+        return float(np.max(np.abs(self.q_u[-1] - self.q_u_eq[-1])))
+
 
 class TimingOcp:
     """
     How fast the machine may traverse a given path, as one NLP over sigma.
 
     The independent variable is the path parameter, not time. The state is
-    `(sigma_dot, q_u, dq_u)`: the sway is *planned*, not merely tolerated, so
-    the trajectory the machine is handed is one the tool arrives at rest from.
-    The control is `sigma_ddot`, and the five joint accelerations follow from it
-    by the chain rule -- `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot` -- which
-    is why the path has to be C2 and why nothing here re-solves geometry.
+    `(sigma_dot, q_u, dq_u)`: the sway is *planned*, not merely tolerated. The
+    control is `sigma_ddot`, and the five joint accelerations follow from it by
+    the chain rule -- `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot` -- which is
+    why the path has to be C2 and why nothing here re-solves geometry.
 
     Minimising traversal time is minimising the integral of `dsigma/sigma_dot`,
     so `sigma_dot` is bounded away from zero throughout; the path is fitted to
-    leave and arrive at rest in *q_a*, which is what makes that admissible.
+    leave and arrive at rest in *q_a*, which is what makes that admissible. The
+    end time is free -- that integral is the end time.
+
+    # What binds and what is merely priced
+
+    Joint velocity, joint acceleration and the sway box are hard. The pump is
+    hard with L1 slack. `tau_a` is **priced and not bounded**: the cylinder-force
+    row it replaces needed a relief pressure nothing here has measured, and a
+    limit that is invented refuses moves the machine can make. Pricing effort
+    still puts the machine's inertia in the problem -- the optimiser feels what
+    it costs to accelerate a loaded telescope -- without asserting a number.
+
+    The consequence is real and is the trade: this planner no longer refuses a
+    move it cannot lift. It plans it, and the machine stalls on it.
     """
 
     def __init__(
@@ -949,8 +1085,11 @@ class TimingOcp:
             ),
         )
         ddq_u, output = substituted[:2], substituted[2:]
-        force = output[
-            symbolic_model.K_CYLINDER_FORCE_OFFSET : symbolic_model.K_CYLINDER_FORCE_OFFSET
+        # `tau_a` of `wiki/robot_model.md` 3.3 -- the actuated generalized force,
+        # which is what carries the machine's inertia into the cost. The cylinder
+        # force rows sit further down the same output map and are not read.
+        tau = output[
+            symbolic_model.K_ACTUATED_FORCE_OFFSET : symbolic_model.K_ACTUATED_FORCE_OFFSET
             + PLANNED_DOF
         ]
         flow = ca.sum1(
@@ -969,7 +1108,7 @@ class TimingOcp:
             [ca.vertcat(control / sigma_dot, dq_u / sigma_dot, ddq_u / sigma_dot)],
         )
         #: What the answer demands of the machine at one node.
-        self.demand = ca.Function("demand", arguments, [ddq_a, force, flow])
+        self.demand = ca.Function("demand", arguments, [ddq_a, tau, flow])
 
     def _blocks(self, path: Path, q_tool: float, nodes: np.ndarray) -> np.ndarray:
         return np.array([path.block(sigma, q_tool) for sigma in nodes])
@@ -978,9 +1117,9 @@ class TimingOcp:
         """
         Return the largest `sigma_dot` each node admits on joint velocity alone.
 
-        `dq_a = q_a'(sigma) sigma_dot`, so a velocity limit is a bound on the
-        path rate and not a nonlinear row. At the endpoints `q_a' = 0` and
-        nothing bounds it, which is why `sigma_rate_max` exists.
+        `dq_a = q_a'(sigma) sigma_dot`, so a velocity limit is a bound on the path
+        rate and not a nonlinear row. At the endpoints `q_a' = 0` and nothing
+        bounds it, which is why `sigma_rate_max` exists.
         """
         rate = np.abs(blocks[:, 5:10])
         allowed = self.config.kappa * speed_scale * self.limits.dq_max
@@ -1008,13 +1147,13 @@ class TimingOcp:
 
         Three passes, and all three earn their place. The velocity ceiling says
         nothing about acceleration, so the classical `sqrt(ddq_max / |q_a''|)`
-        curve is imposed on top of it. Neither says anything about cylinder
-        force or pump flow, which are what actually bind on a lift, so the rate
-        is bisected down until the worst of them sits at 90% of its allowance --
-        90% and not 100% because a barrier method started with a dozen rows at
-        zero slack is a barrier method that does not start. And per-node
-        feasibility is not reachability, so a forward and a backward sweep under
-        `d(sigma_dot^2)/dsigma = 2 sigma_ddot` connect the nodes to each other.
+        curve is imposed on top of it. Neither says anything about pump flow,
+        which is what actually binds on a lift, so the rate is bisected down until
+        it sits at 90% of its allowance -- 90% and not 100% because a barrier
+        method started with a dozen rows at zero slack is a barrier method that
+        does not start. And per-node feasibility is not reachability, so a forward
+        and a backward sweep under `d(sigma_dot^2)/dsigma = 2 sigma_ddot` connect
+        the nodes to each other.
         """
         guess = ceiling.copy()
         curvature = np.abs(blocks[:, 10:15])
@@ -1027,25 +1166,19 @@ class TimingOcp:
                     float(np.min(np.sqrt(allowed[turning] / curvature[node][turning]))),
                 )
 
-        def demand(node: int, rate: float) -> float:
+        def draw(node: int, rate: float) -> float:
             state = np.concatenate([[rate], equilibrium[node], np.zeros(2)])
-            _, force, flow = self.demand(state, 0.0, blocks[node], payload)
-            force = np.abs(np.array(force).ravel()) / (
-                self.config.kappa * self.limits.force_max
-            )
-            return max(
-                float(np.max(force)),
-                float(abs(float(flow))) / (self.config.kappa * flow_max),
-            )
+            _, _, flow = self.demand(state, 0.0, blocks[node], payload)
+            return float(abs(float(flow))) / (self.config.kappa * flow_max)
 
         floor = 2.0 * self.config.sigma_rate_min
         for node in range(len(blocks)):
-            if demand(node, guess[node]) <= 0.9:
+            if draw(node, guess[node]) <= 0.9:
                 continue
             low, high = floor, guess[node]
             for _ in range(12):
                 middle = 0.5 * (low + high)
-                if demand(node, middle) <= 0.9:
+                if draw(node, middle) <= 0.9:
                     low = middle
                 else:
                     high = middle
@@ -1086,11 +1219,8 @@ class TimingOcp:
         middles = self._blocks(path, q_tool, nodes[:-1] + 0.5 * span)
         # What a speed scale scales. It is the caller's own divider on the
         # machine's allowance, so it takes every *rate* budget with it: joint
-        # velocity, the path rate itself, and the pump. Acceleration goes with
-        # its square, because along a fixed path `ddq_a` is quadratic in the
-        # rate. The cylinder force allowance is deliberately untouched --
-        # gravity does not slow down, and a lift that needs the force standing
-        # still needs it at half speed too.
+        # velocity, the path rate itself, and the pump. Acceleration goes with its
+        # square, because along a fixed path `ddq_a` is quadratic in the rate.
         #
         # Scaling the pump is what makes the divider mean anything on this
         # machine: these moves are flow-limited long before they are
@@ -1105,29 +1235,10 @@ class TimingOcp:
                 "velocity limits allow it to continue"
             )
 
-        # The gravity load does not fall with speed, so a path that overloads a
-        # cylinder standing still has no timing at all -- and saying so here is
-        # worth more than a solver that reports infeasibility.
-        for node in range(intervals + 1):
-            state = np.concatenate(
-                [[config.sigma_rate_min], equilibrium[node], np.zeros(2)]
-            )
-            _, force, _ = self.demand(state, 0.0, blocks[node], payload_vector)
-            excess = (
-                np.abs(np.array(force).ravel()) - config.kappa * self.limits.force_max
-            )
-            if np.any(excess > 0.0):
-                axis = int(np.argmax(excess))
-                raise PlanningError(
-                    f"the path is not liftable: holding it at sigma = {nodes[node]:.2f} "
-                    f"already asks cylinder {axis} for "
-                    f"{float(np.abs(np.array(force).ravel())[axis]) * 1e-3:.1f} kN against "
-                    f"{config.kappa * self.limits.force_max[axis] * 1e-3:.1f} kN allowed"
-                )
-
         opti = ca.Opti()
         state = opti.variable(5, intervals + 1)
         control = opti.variable(intervals)
+        flow_slack = opti.variable(intervals + 1)
         sigma_dot, q_u, dq_u = state[0, :], state[1:3, :], state[3:5, :]
 
         cost = 0.0
@@ -1146,31 +1257,37 @@ class TimingOcp:
             )
             opti.subject_to(there == here + (step / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4))
 
-            # Traversal time, sway and a regularisation on the input, all as
-            # integrals over sigma: dt = dsigma / sigma_dot is the only reason
-            # the first term is the objective it is.
-            cost += span * (
-                0.5 * (1.0 / sigma_dot[node] + 1.0 / sigma_dot[node + 1])
-                + config.sway_weight * ca.sumsqr(dq_u[:, node]) / sigma_dot[node]
-                + config.input_weight * control[node] ** 2
-            )
-
         # What the answer demands of the machine, at **every** node including the
         # last. The terminal node carries no input of its own, but it does not
         # need one: the path arrives at rest in q_a, so `q_a'(1) sigma_ddot`
-        # vanishes and `ddq_a = q_a''(1) sigma_dot^2` is well defined -- and it
-        # is the row that decides how fast the machine may still be travelling
-        # when it gets there. Leaving the last node out is how a plan ends with
-        # nine times the admissible deceleration.
+        # vanishes and `ddq_a = q_a''(1) sigma_dot^2` is well defined -- and it is
+        # the row that decides how fast the machine may still be travelling when
+        # it gets there. Leaving the last node out is how a plan ends with nine
+        # times the admissible deceleration.
         for node in range(intervals + 1):
             here = state[:, node]
             input_ = control[min(node, intervals - 1)]
-            ddq_a, force, flow = self.demand(here, input_, blocks[node], payload_vector)
+            ddq_a, tau, flow = self.demand(here, input_, blocks[node], payload_vector)
             allowed = config.kappa * accel_max
             opti.subject_to(opti.bounded(-allowed, ddq_a, allowed))
-            allowed = config.kappa * self.limits.force_max
-            opti.subject_to(opti.bounded(-allowed, force, allowed))
-            opti.subject_to(opti.bounded(0.0, flow, config.kappa * flow_max))
+            opti.subject_to(flow_slack[node] >= 0.0)
+            opti.subject_to(flow >= 0.0)
+            opti.subject_to(flow <= config.kappa * flow_max + flow_slack[node])
+
+            # Traversal time, sway, effort and a regularisation on the input, all
+            # as integrals over sigma: `dt = dsigma / sigma_dot` is the only
+            # reason the first term is the objective it is. The trapezoid weight
+            # halves the two endpoints.
+            weight = span * (0.5 if node in (0, intervals) else 1.0)
+            cost += weight * (
+                1.0 / sigma_dot[node]
+                + config.sway_weight * ca.sumsqr(dq_u[:, node]) / sigma_dot[node]
+                + config.tau_weight
+                * ca.sumsqr(tau / self.limits.tau_max)
+                / sigma_dot[node]
+            )
+            cost += config.flow_slack_weight * flow_slack[node] / flow_max
+        cost += config.input_weight * span * ca.sumsqr(control)
 
         opti.subject_to(
             opti.bounded(-config.sigma_accel_max, control, config.sigma_accel_max)
@@ -1194,10 +1311,16 @@ class TimingOcp:
         opti.subject_to(dq_u[:, 0] == dq_u_start)
         if sigma_dot_start is not None:
             opti.subject_to(sigma_dot[0] == sigma_dot_start)
-        # The tool arrives hanging and still, which is the whole reason the sway
-        # is a state of this problem rather than something checked afterwards.
-        opti.subject_to(q_u[:, intervals] == equilibrium[intervals])
-        opti.subject_to(dq_u[:, intervals] == 0.0)
+        # The tool should arrive hanging and still, and that is a **cost**. One
+        # control -- the rate along a path it may not leave -- cannot in general
+        # drive four terminal quantities to zero, and demanding it as a hard row
+        # is what turns a slow answer into `Infeasible_Problem_Detected`. The
+        # normalisation is the admissible box, so the weight is a multiple of
+        # "the whole allowance" and the number reported afterwards is in radians.
+        cost += config.terminal_sway_weight * (
+            ca.sumsqr((q_u[:, intervals] - equilibrium[intervals]) / config.q_sway_max)
+            + ca.sumsqr(dq_u[:, intervals] / config.dq_sway_max)
+        )
 
         opti.minimize(cost)
         guess = self._guess(
@@ -1213,9 +1336,10 @@ class TimingOcp:
         opti.set_initial(q_u, equilibrium.T)
         opti.set_initial(dq_u, np.zeros((2, intervals + 1)))
         opti.set_initial(control, np.zeros(intervals))
+        opti.set_initial(flow_slack, np.zeros(intervals + 1))
         opti.solver(
             "ipopt",
-            {"print_time": False},
+            {"print_time": False, "expand": True},
             {
                 "print_level": 0,
                 "sb": "yes",
@@ -1231,7 +1355,8 @@ class TimingOcp:
             answer = opti.solve()
         except RuntimeError as failure:
             raise PlanningError(
-                f"no admissible timing exists for this path: {opti.stats().get('return_status', failure)}"
+                f"no admissible timing exists for this path: "
+                f"{opti.stats().get('return_status', failure)}"
             ) from None
         elapsed = time.monotonic() - started
 
@@ -1239,9 +1364,10 @@ class TimingOcp:
         accel = np.array(answer.value(control)).ravel()
         sway = np.array(answer.value(q_u)).reshape(2, -1).T
         sway_rate = np.array(answer.value(dq_u)).reshape(2, -1).T
+        slack = np.array(answer.value(flow_slack)).ravel()
 
         ddq_a = np.zeros((intervals + 1, PLANNED_DOF))
-        force = np.zeros((intervals + 1, PLANNED_DOF))
+        tau = np.zeros((intervals + 1, PLANNED_DOF))
         flow = np.zeros(intervals + 1)
         for node in range(intervals + 1):
             here = np.concatenate([[rate[node]], sway[node], sway_rate[node]])
@@ -1249,7 +1375,7 @@ class TimingOcp:
                 here, accel[min(node, intervals - 1)], blocks[node], payload_vector
             )
             ddq_a[node] = np.array(values[0]).ravel()
-            force[node] = np.array(values[1]).ravel()
+            tau[node] = np.array(values[1]).ravel()
             flow[node] = float(values[2])
 
         time_of = np.concatenate(
@@ -1265,8 +1391,9 @@ class TimingOcp:
             q_a=blocks[:, 0:5],
             dq_a=blocks[:, 5:10] * rate[:, None],
             ddq_a=ddq_a,
-            cylinder_force=force,
+            tau=tau,
             pump_flow=flow,
+            flow_slack=slack,
             time=time_of,
             iterations=int(opti.stats().get("iter_count", 0)),
             solve_time_s=elapsed,
@@ -1327,9 +1454,8 @@ class Planner:
     """
     One description, one tool, one set of limits, many requests.
 
-    Built once from the robot description -- parsing it, deriving the force
-    limits from the hydraulics and code-generating the OCP's functions all
-    happen here, not per request.
+    Built once from the robot description -- parsing it and code-generating the
+    OCP's functions both happen here, not per request.
     """
 
     def __init__(self, robot_description_xml: str, config: PlannerConfig | None = None):
@@ -1341,12 +1467,9 @@ class Planner:
         self.limits = read_limits(
             robot_description_xml,
             self.config.tool,
-            self.symbolic,
-            self.config.system_pressure_pa,
             self.config.pump_flow_max,
             self.config.pump_flow_planning_factor,
         )
-        self.equilibrium = Equilibrium(self.symbolic, self.limits)
         self.ocp = TimingOcp(self.symbolic, self.limits, self.config)
 
     def plan(
@@ -1364,8 +1487,8 @@ class Planner:
         Answer a placement goal in `K0_mounting_base` with a timed trajectory.
 
         The stages refuse; they do not degrade. A goal that cannot be reached, a
-        path that cannot be found or smoothed, and a path that cannot be timed
-        are three different answers, and each one names itself.
+        straight tool path that is blocked or does not resolve, and a path that
+        cannot be timed are three different answers, and each one names itself.
         """
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
@@ -1379,7 +1502,7 @@ class Planner:
         payload_vector = payload_parameters(payload)
         geometry = Geometry(
             self.model,
-            self.equilibrium,
+            self.limits,
             primitives,
             self.config,
             start.q_tool,
@@ -1387,27 +1510,45 @@ class Planner:
             payload_shape if avoid_collisions else None,
         )
 
-        goal = solve_ik(
+        # Is the goal pose reachable at all? This solve is cold and spreads its
+        # restarts over the telescope range, which is the coordinate the residual
+        # is flat in -- so it answers "no configuration reaches this" cheaply and
+        # with the miss in millimetres. The configuration it returns is
+        # deliberately **not** kept: which point of the redundant family the arm
+        # ends at is decided by marching there from the start, and pinning an
+        # independently chosen one is a discontinuity no refinement can close.
+        solve_ik(
             geometry,
             self.limits,
             self.config,
             np.asarray(goal_position_m, dtype=float),
             float(goal_yaw),
             start.q_a,
+            restarts=int(self.config.ik_restarts),
         )
         if not geometry.is_valid(start.q_a):
-            raise PlanningError("the measured start configuration is in collision")
+            raise PlanningError(
+                f"the measured start configuration clears the scene by only "
+                f"{geometry.clearance(start.q_a):.3f} m against the "
+                f"{geometry.required:.3f} m this plan requires"
+            )
 
-        waypoints = search(geometry, self.limits, self.config, start.q_a, goal)
-        path, sigma_dot_start = fit(geometry, self.limits, waypoints, start.dq_a)
+        waypoints = lift(
+            geometry,
+            self.limits,
+            self.config,
+            start.q_a,
+            np.asarray(goal_position_m, dtype=float),
+            float(goal_yaw),
+        )
+        path, sigma_dot_start = fit(
+            geometry, self.limits, self.config, waypoints, start.dq_a
+        )
         geometry.check_path(path)
 
         nodes = np.linspace(0.0, 1.0, int(self.config.intervals) + 1)
         equilibrium = np.array(
-            [
-                geometry.configuration(path.position(sigma))[list(PASSIVE_INDICES)]
-                for sigma in nodes
-            ]
+            [passive_equilibrium(path.position(sigma)) for sigma in nodes]
         )
         q_u_start = start.q_u if start.passive_measured else equilibrium[0]
         dq_u_start = (
@@ -1422,8 +1563,8 @@ class Planner:
             )
         if np.any(np.abs(dq_u_start) > self.config.dq_sway_max):
             raise PlanningError(
-                "the tool is swinging faster than the admissible sway rate, so there is "
-                "no plan that starts from it"
+                "the tool is swinging faster than the admissible sway rate, so there "
+                "is no plan that starts from it"
             )
 
         timing = self.ocp.solve(
@@ -1436,18 +1577,17 @@ class Planner:
             sigma_dot_start,
             speed_scale,
         )
-        return self._resample(geometry, path, timing, start)
+        return self._resample(geometry, path, timing, start, len(waypoints))
 
     def prepare_scene(self, scene, avoid_collisions: bool) -> list:
         """
         Return the static bodies this plan is checked against.
 
-        Not the same list the request carried: the reserved `truck` primitive
-        has become a bed, six runges and a headboard by the time the planner
-        looks at it, and that is invisible to anyone who only sees the scene
-        topic. This is a
-        method and not a private step because the node draws it, and a refusal
-        is far easier to read beside the geometry that caused it.
+        Not the same list the request carried: the reserved `truck` primitive has
+        become a bed, six runges and a headboard by the time the planner looks at
+        it, and that is invisible to anyone who only sees the scene topic. This
+        is a method and not a private step because the node draws it, and a
+        refusal is far easier to read beside the geometry that caused it.
 
         What the tool carries is **not** here. It moves, so it is placed at each
         configuration checked rather than pinned to the scene once.
@@ -1459,14 +1599,12 @@ class Planner:
             raise PlanningError(f"'{PAYLOAD_ID}' is a reserved scene id")
         return primitives
 
-    def _settled(
-        self, q_a: np.ndarray, q_tool: float, payload: np.ndarray
-    ) -> np.ndarray:
+    def _settled(self, q_a: np.ndarray, q_tool: float) -> np.ndarray:
         """Return the canonical eight at `q_a` with the passive pair hanging."""
         q = np.zeros(GENERALIZED_DOF)
         q[list(PLANNED_INDICES)] = q_a
         q[TOOL_INDEX] = q_tool
-        q[list(PASSIVE_INDICES)] = self.equilibrium.solve(q_a, q_tool, payload)
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
         return q
 
     def _tcp_yaw(self, q: np.ndarray) -> float:
@@ -1481,31 +1619,34 @@ class Planner:
         self, payload: Payload | None, yaw: float, q_tool: float
     ) -> np.ndarray:
         """
-        Where the tool hangs relative to the tip pivot K5, for one payload and yaw.
+        Where the tool hangs relative to the tip pivot K5, for one yaw.
 
-        The retained `a2b_movement` goal names the pivot and the native goal
-        names the tool, so the adapter needs the vector between them. It is read
-        out of the model at the hanging equilibrium and never written down: the
-        PZS100's rail gripper and the 7040's jaw do not hang at the same offset,
-        and a centre of mass off the tool axis changes it again.
+        The retained `a2b_movement` goal names the pivot and the native goal names
+        the tool, so the adapter needs the vector between them. It is read out of
+        the model at the hanging equilibrium and never written down: the PZS100's
+        rail gripper and the 7040's jaw do not hang at the same offset.
 
-        The two passive joints make the settled offset independent of the boom
-        and telescope pose -- once the pendulum is settled, only rotation about
-        gravity moves this vector. So the description's own yaw convention is
-        measured at a canonical pose, the slew is turned by the difference, the
-        pendulum is settled again, and the result is *checked* to carry the
-        requested yaw rather than assumed to.
+        The two passive joints make the settled offset independent of the boom and
+        telescope pose -- once the pendulum is settled, only rotation about gravity
+        moves this vector. So the description's own yaw convention is measured at a
+        canonical pose, the slew is turned by the difference, the pendulum is
+        settled again, and the result is *checked* to carry the requested yaw
+        rather than assumed to.
+
+        `payload` no longer enters it: the hanging pose is a closed form in the
+        boom and arm angles alone, which is what `crane_mpc` measured it to be.
+        The argument is kept so the adapter's call site stays honest about what it
+        is asking for.
         """
         if not (np.isfinite(yaw) and np.isfinite(q_tool)):
             raise PlanningError(
                 "`phi_tool_n` or the tool coordinate q8 is not finite, so the hanging "
                 "tip-to-tool offset cannot be evaluated"
             )
-        vector = payload_parameters(payload)
         q_a = np.zeros(PLANNED_DOF)
-        canonical = self._settled(q_a, q_tool, vector)
+        canonical = self._settled(q_a, q_tool)
         q_a[0] = _wrap(yaw - self._tcp_yaw(canonical))
-        q = self._settled(q_a, q_tool, vector)
+        q = self._settled(q_a, q_tool)
 
         error = _wrap(self._tcp_yaw(q) - yaw)
         if abs(error) > 1.0e-9:
@@ -1519,26 +1660,26 @@ class Planner:
         offset = tcp.position_m - tip.position_m
         if not (np.all(np.isfinite(offset)) and np.linalg.norm(offset) > 0.0):
             raise PlanningError(
-                "the description produced no finite non-zero offset from the tip pivot to "
-                "the tool centre point, so `y_n` cannot be placed on the native tool goal"
+                "the description produced no finite non-zero offset from the tip pivot "
+                "to the tool centre point, so `y_n` cannot be placed on the native "
+                "tool goal"
             )
         return offset
 
-    def _resample(self, geometry, path, timing, start: Start) -> Plan:
+    def _resample(self, geometry, path, timing, start: Start, lifted: int) -> Plan:
         """
         Put the answer on the emitted reference's own clock.
 
         The OCP works on a uniform sigma grid, which is not a uniform time grid;
-        the consumer reads at `Ts`. Sigma is interpolated against the elapsed
-        time the solve produced, and the joint rates are re-derived from
+        the consumer reads at `Ts`. Sigma is interpolated against the elapsed time
+        the solve produced, and the joint rates are re-derived from
         `q_a'(sigma) sigma_dot` there rather than interpolated -- interpolating a
         derivative and its integral separately is how the two stop agreeing.
 
         The passive pair is carried too, and it is the sway the OCP **planned**
-        rather than the pose the tool would settle to. It costs nothing -- the
-        OCP solves for it either way -- and it is what the trajectory actually
-        claims: on the way to the goal the tool is swinging, and a consumer
-        tracking the passive joints as state wants the swing, not the rest pose.
+        rather than the pose the tool would settle to. It costs nothing -- the OCP
+        solves for it either way -- and it is what the trajectory actually claims:
+        on the way to the goal the tool is swinging.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
@@ -1556,8 +1697,8 @@ class Planner:
             q[:, index] = np.interp(stamps, timing.time, timing.q_u[:, slot])
             dq[:, index] = np.interp(stamps, timing.time, timing.dq_u[:, slot])
 
-        # The tool where the plan says it is, sway included -- not where it
-        # would hang if the machine stopped at each sample.
+        # The tool where the plan says it is, sway included -- not where it would
+        # hang if the machine stopped at each sample.
         tcp = np.array(
             [
                 geometry.model.forward_kinematics(
@@ -1566,13 +1707,16 @@ class Planner:
                 for row in q
             ]
         )
+        slack = float(np.max(timing.flow_slack)) / self.limits.flow_max
         message = (
             f"{timing.duration:.2f} s over {path.travel_m:.2f} m of tool travel, "
-            f"{len(stamps)} points at {Ts * 1e3:.0f} ms; IPOPT converged in "
-            f"{timing.iterations} iterations and {timing.solve_time_s:.2f} s; "
-            f"peak force {np.max(np.abs(timing.cylinder_force) / self.limits.force_max):.2f} "
-            f"and peak pump draw {np.max(timing.pump_flow) / self.limits.flow_max:.2f} "
-            f"of the physical limit, at kappa = {self.config.kappa}"
+            f"{lifted} lifted configurations, {len(stamps)} points at "
+            f"{Ts * 1e3:.0f} ms; IPOPT converged in {timing.iterations} iterations and "
+            f"{timing.solve_time_s:.2f} s; peak pump draw "
+            f"{np.max(timing.pump_flow) / self.limits.flow_max:.2f} of the physical "
+            f"limit at kappa = {self.config.kappa}"
+            + (f", exceeding the reservation by {slack:.3f}" if slack > 1e-9 else "")
+            + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest"
         )
         return Plan(time=stamps, q=q, dq=dq, tcp=tcp, timing=timing, message=message)
 

@@ -1,5 +1,5 @@
 """
-The `crane_planner` node: `/crane/plan_motion`, and the reference it answered with.
+The `crane_planner` node: `/a2b_movement`, and the reference it answered with.
 
 It is **not a second writer of the machine**. `crane_velocity_controller` is the
 sole claimant of the six velocity command interfaces and which controller holds
@@ -28,7 +28,6 @@ from crane_model import (
     canonical_joints,
 )
 from crane_msgs.msg import CollisionScene, PayloadEstimate
-from crane_msgs.srv import PlanMotion
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from rclpy.node import Node
@@ -59,7 +58,6 @@ from .planner import (
     pin,
 )
 
-PLAN_MOTION_SERVICE = "/crane/plan_motion"
 REFERENCE_TOPIC = "/crane/reference"
 PLANNED_PATH_TOPIC = "/crane_planner/planned_path"
 #: The Cartesian path the legacy A2B server published beside its service
@@ -121,7 +119,6 @@ class CranePlanner(Node):
         self.joint_states: deque = deque(maxlen=8)
         self.scene: CollisionScene | None = None
         self.estimate: PayloadEstimate | None = None
-        self.standing = JointTrajectory()
 
         self.create_subscription(
             String, ROBOT_DESCRIPTION_TOPIC, self._description, latched()
@@ -149,7 +146,6 @@ class CranePlanner(Node):
         # Transient-local, because an RViz started after the plan should still
         # see it -- a plan is a standing decision, not a stream.
         self.markers = self.create_publisher(MarkerArray, MARKERS_TOPIC, latched())
-        self.create_service(PlanMotion, PLAN_MOTION_SERVICE, self._plan)
         # The retained timber contract, on the same node and over the same
         # planner: one adapter, no second set of limits.
         self.create_service(CalcMovement, A2B_MOVEMENT_SERVICE, self._a2b)
@@ -173,13 +169,14 @@ class CranePlanner(Node):
             "kappa",
             "eps_pos",
             "eps_yaw",
-            "ompl_time_budget",
-            "ompl_extension_span",
-            "ompl_unbounded_margin",
-            "check_resolution",
-            "min_check_resolution",
+            "margin_safety",
+            "margin_interp",
+            "tool_radius",
             "sway_weight",
+            "tau_weight",
             "input_weight",
+            "terminal_sway_weight",
+            "flow_slack_weight",
             "sigma_rate_min",
             "sigma_rate_max",
             "sigma_accel_max",
@@ -187,7 +184,6 @@ class CranePlanner(Node):
             "tolerance",
             "pump_flow_max",
             "pump_flow_planning_factor",
-            "system_pressure_pa",
             "Ts",
             "truck_bed_thickness",
             "truck_headboard_thickness",
@@ -196,9 +192,8 @@ class CranePlanner(Node):
             self.declare_parameter(name, float(getattr(defaults, name)))
         for name in (
             "ik_restarts",
-            "ompl_seed",
-            "shortcut_attempts",
-            "max_check_samples",
+            "max_lift_samples",
+            "path_segments",
             "intervals",
             "max_iterations",
         ):
@@ -404,75 +399,19 @@ class CranePlanner(Node):
 
     # -- the service ----------------------------------------------------------
 
-    def _plan(self, request, response):
-        """
-        Answer a placement goal, or refuse and say what is still standing.
-
-        A refusal hands back the trajectory that is still on the reference topic
-        rather than an empty one, so a caller can tell "nothing changed" from
-        "the machine has no plan".
-        """
-        response.trajectory = self.standing
-        response.tcp_path = []
-        if self.planner is None:
-            response.success = False
-            response.message = (
-                f"no robot description has arrived on {ROBOT_DESCRIPTION_TOPIC}"
-            )
-            return response
-        if request.goal.header.frame_id != PLANNING_FRAME:
-            response.success = False
-            response.message = (
-                f"the goal is in '{request.goal.header.frame_id}'; this planner converts "
-                f"nothing and plans only in '{PLANNING_FRAME}'"
-            )
-            return response
-
-        try:
-            orientation = request.goal.pose.orientation
-            rotation = pin.Quaternion(
-                orientation.w, orientation.x, orientation.y, orientation.z
-            ).toRotationMatrix()
-            payload, shape = self._payload(request.payload)
-            plan, trajectory, path = self._run(
-                self._start(),
-                np.array(
-                    [
-                        request.goal.pose.position.x,
-                        request.goal.pose.position.y,
-                        request.goal.pose.position.z,
-                    ]
-                ),
-                float(np.arctan2(rotation[1, 0], rotation[0, 0])),
-                payload if payload.valid else None,
-                shape,
-                request.avoid_collisions,
-                request.speed_scale,
-            )
-        except PlanningError as refusal:
-            response.success = False
-            response.message = f"{refusal}; the standing reference is unchanged"
-            self.get_logger().warn(response.message)
-            return response
-
-        response.success = True
-        response.message = plan.message
-        response.trajectory = trajectory
-        response.tcp_path = path.poses
-        return response
-
     def _a2b(self, request, response):
         """
         Answer the retained `a2b_movement` contract over the same planner.
 
-        Nothing here plans: `crane_planning.a2b` maps the request onto the
-        native call and this runs it, so the two services share one start
-        state, one scene, one kappa and one reference publication.
+        Nothing here plans: `crane_planning.a2b` maps the request onto
+        `Planner.plan` and this runs it. It is the node's only service -- the
+        native `/crane/plan_motion` had no caller anywhere in the workspace and
+        was removed -- so this is also the only path that publishes
+        `/crane/reference`.
 
         `CalcMovement.Response` has **no message field**, so a refusal cannot
         say why in the answer. It goes to the log, and the trajectory is left
-        empty rather than carrying whatever is still standing -- a caller could
-        not tell those two apart, and the legacy server left it empty too.
+        empty, exactly as the legacy server left it.
         """
         response.success = False
         response.trajectory = JointTrajectory()
@@ -530,7 +469,7 @@ class CranePlanner(Node):
     def _run(
         self, start, position_m, yaw, payload, shape, avoid_collisions, speed_scale
     ):
-        """Plan, publish the reference and the drawing, and stand by them."""
+        """Plan, then publish the reference and the drawing."""
         primitives = self._primitives(avoid_collisions)
         # The goal and the geometry are drawn **before** the solve, so that a
         # refusal leaves them on screen. "It said no" and "it said no, and here
@@ -564,7 +503,6 @@ class CranePlanner(Node):
         )
         trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
         path = self._path(plan)
-        self.standing = trajectory
         self.reference.publish(trajectory)
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)

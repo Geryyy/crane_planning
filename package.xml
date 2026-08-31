@@ -21,10 +21,6 @@
        once and solved with IPOPT. libraries.md 1 lists CasADi for exactly this;
        no NLP is written by hand. -->
   <depend>casadi</depend>
-  <!-- RRT-Connect is the sole geometric search, through OMPL's own Python
-       bindings. libraries.md 1 lists it for sampling-based path planning; no
-       RRT is written here and MoveIt is not required. -->
-  <depend>ompl</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rclpy</depend>

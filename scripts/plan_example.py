@@ -5,8 +5,8 @@ Plan one motion offline and plot what it asks of the machine.
 No ROS, no graph, no clock: this runs the deployment's own `Planner` against
 the checked-in machine descriptions, so what it tunes is what the node solves.
 It exists because the timing OCP has weights, and a weight is tuned by looking
-at the profile it produces -- traversal time against sway against how close the
-cylinders and the pump come to their limits.
+at the profile it produces -- traversal time against sway against the actuated
+force it asks for and how close the pump comes to its limit.
 
     ./scripts/plan_example.py --tool pzs100 --sway-weight 8 --show
 
@@ -91,10 +91,16 @@ def arguments() -> argparse.Namespace:
     tuning.add_argument("--kappa", type=float, default=None)
     tuning.add_argument("--intervals", type=int, default=None)
     tuning.add_argument("--sway-weight", type=float, default=None)
+    tuning.add_argument("--tau-weight", type=float, default=None)
+    tuning.add_argument("--terminal-sway-weight", type=float, default=None)
     tuning.add_argument("--input-weight", type=float, default=None)
     tuning.add_argument("--sigma-accel-max", type=float, default=None)
     tuning.add_argument("--sigma-rate-max", type=float, default=None)
     tuning.add_argument("--max-iterations", type=int, default=None)
+
+    clearance = parser.add_argument_group('what "clear" means, in metres')
+    clearance.add_argument("--margin-safety", type=float, default=None)
+    clearance.add_argument("--margin-interp", type=float, default=None)
 
     parser.add_argument("--output", type=Path, default=Path("plan_example.png"))
     parser.add_argument("--csv", type=Path, default=None)
@@ -108,10 +114,14 @@ def configure(options) -> PlannerConfig:
         "kappa",
         "intervals",
         "sway_weight",
+        "tau_weight",
+        "terminal_sway_weight",
         "input_weight",
         "sigma_accel_max",
         "sigma_rate_max",
         "max_iterations",
+        "margin_safety",
+        "margin_interp",
     ):
         value = getattr(options, name)
         if value is not None:
@@ -134,7 +144,7 @@ def figure(planner: Planner, plan, options):
         axes[0, 0].plot(t, timing.q_a[:, axis], label=names[axis])
         axes[0, 1].plot(t, timing.dq_a[:, axis], label=names[axis])
         axes[1, 0].plot(t, timing.ddq_a[:, axis], label=names[axis])
-        axes[3, 0].plot(t, timing.cylinder_force[:, axis] * 1e-3, label=names[axis])
+        axes[3, 0].plot(t, timing.tau[:, axis] * 1e-3, label=names[axis])
         colour = axes[0, 1].lines[-1].get_color()
         bound = config.kappa * options.speed_scale * limits.dq_max[axis]
         for sign in (1.0, -1.0):
@@ -145,16 +155,13 @@ def figure(planner: Planner, plan, options):
                 ls=":",
                 lw=0.7,
             )
-            axes[3, 0].axhline(
-                sign * config.kappa * limits.force_max[axis] * 1e-3,
-                color=colour,
-                ls=":",
-                lw=0.7,
-            )
     axes[0, 0].set_ylabel("position [rad, m]")
     axes[0, 1].set_ylabel("velocity [rad/s, m/s]")
     axes[1, 0].set_ylabel("acceleration")
-    axes[3, 0].set_ylabel("cylinder force [kN]")
+    # No limit lines: `tau_a` is priced by the OCP's cost and not bounded, so
+    # there is no force limit left to draw it against.
+    axes[3, 0].set_ylabel(r"actuated force $\tau_a$ [kN$\,$m]")
+    axes[3, 0].set_title("priced, not bounded", fontsize=8, loc="left")
 
     axes[1, 1].plot(t, timing.sigma_dot, label=r"$\dot\sigma$")
     axes[1, 1].plot(t, timing.sigma_ddot, label=r"$\ddot\sigma$")
@@ -179,6 +186,9 @@ def figure(planner: Planner, plan, options):
     axes[2, 1].set_ylabel("sway rate [rad/s]")
 
     axes[3, 1].plot(t, timing.pump_flow * 1e3, color="tab:red", label="sum")
+    axes[3, 1].plot(
+        t, timing.flow_slack * 1e3, color="tab:orange", ls="--", label="slack"
+    )
     axes[3, 1].axhline(
         config.kappa * limits.flow_max * 1e3, color="tab:red", ls=":", lw=0.7
     )
@@ -195,8 +205,9 @@ def figure(planner: Planner, plan, options):
     fig.suptitle(
         f"{planner.config.tool.value}: {timing.duration:.2f} s, "
         f"{timing.iterations} IPOPT iterations in {timing.solve_time_s:.2f} s, "
-        f"sway weight {config.sway_weight}, input weight {config.input_weight}, "
-        f"kappa {config.kappa}"
+        f"sway weight {config.sway_weight}, tau weight {config.tau_weight}, "
+        f"kappa {config.kappa}; arrives "
+        f"{np.degrees(timing.terminal_sway):.2f} deg off rest"
     )
     fig.tight_layout()
     return fig
@@ -256,6 +267,10 @@ def main() -> int:
         return 1
 
     print(plan.message)
+    print(
+        f"terminal sway {np.degrees(plan.timing.terminal_sway):.2f} deg, "
+        f"peak pump slack {max(0.0, np.max(plan.timing.flow_slack)) * 1e3:.3f} L/s"
+    )
     if options.csv is not None:
         header = "time_s," + ",".join(
             [f"q{index + 1}" for index in ACTUATED_INDICES]
