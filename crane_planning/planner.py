@@ -471,15 +471,17 @@ class Geometry:
         except (CraneModelError, PlanningError):
             return False
         bodies = self.bodies(q)
-        if float(self.model.collision_query(q, bodies).minimum_distance_m) <= 0.0:
+        # One sweep, not two. `crane_model.collision.query` is defined as
+        # `min(queries(...))`, so asking for the overall minimum and then for
+        # the per-primitive row computed every distance pair twice -- and this
+        # is the inner loop of the search.
+        results = self.model.collision_queries(q, bodies)
+        if min(result.minimum_distance_m for result in results) <= 0.0:
             return False
         if self.envelope <= 0.0 or not bodies:
             return True
         scene_only = min(
-            (
-                result.minimum_distance_m
-                for result in self.model.collision_queries(q, bodies)[:-1]
-            ),
+            (result.minimum_distance_m for result in results[:-1]),
             default=np.inf,
         )
         if scene_only > self.envelope:
@@ -592,6 +594,16 @@ def solve_ik(
         error = np.linalg.norm(answer.fun[:4])
         if error < best_error:
             best, best_error = answer.x, error
+        # The restarts exist to escape a local minimum. A solve that already
+        # meets the tolerance this function is about to check is not in one, and
+        # the remaining restarts can only re-derive an answer already in hand --
+        # measured across the workspace, every one of them returns the same
+        # configuration to three decimals.
+        if (
+            float(np.linalg.norm(answer.fun[:3])) <= config.eps_pos
+            and float(abs(answer.fun[3])) <= config.eps_yaw
+        ):
+            break
 
     q_a = best
     final = residual(q_a)
@@ -707,7 +719,18 @@ def search(
             allocated[axis] = float(values[axis] / scale[axis])
         return allocated
 
-    setup.setStartAndGoalStates(state(start), state(goal))
+    # The direct motion, before the sampler is asked for anything. In this
+    # space -- every axis divided by its own velocity limit -- the straight line
+    # between two configurations is the least joint travel there is, so when it
+    # is clear there is nothing for a search to improve on and `shortcut` would
+    # collapse to it anyway. Both endpoints are already known valid: `solve_ik`
+    # refuses a goal in collision and `Planner.plan` refuses the start, so this
+    # costs one motion check and nothing else.
+    first, last = state(start), state(goal)
+    if information.checkMotion(first, last):
+        return np.array([start, goal])
+
+    setup.setStartAndGoalStates(first, last)
     planner = og.RRTConnect(information)
     planner.setRange(float(config.ompl_extension_span))
     setup.setPlanner(planner)
