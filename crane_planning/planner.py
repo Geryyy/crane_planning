@@ -629,6 +629,12 @@ def solve_ik(
             float(np.linalg.norm(answer.fun[:3])) <= config.eps_pos
             and float(abs(answer.fun[3])) <= config.eps_yaw
         ):
+            # This restart, not whichever had the smallest combined norm. The
+            # selection above mixes three metres with one radian in a single
+            # 4-norm while the acceptance test below is two separate scalars, so
+            # the restart that satisfies the test need not be the one holding
+            # `best` -- and returning the other refuses a goal just reached.
+            best, best_error = answer.x, error
             break
 
     q_a = best
@@ -752,6 +758,14 @@ def search(
     # collapse to it anyway. Both endpoints are already known valid: `solve_ik`
     # refuses a goal in collision and `Planner.plan` refuses the start, so this
     # costs one motion check and nothing else.
+    # `setStateValidityCheckingResolution` records a *fraction*; the segment
+    # length a motion check actually subdivides by is recomputed only in
+    # `setup()`, which `solve()` would not reach until after the check below.
+    # Without this the direct motion is checked at OMPL's default one percent --
+    # on this space seven times coarser than the step the scene asked for, which
+    # is how a straight line past a runge gets accepted here and then refused by
+    # `check_path`.
+    information.setup()
     first, last = state(start), state(goal)
     if information.checkMotion(first, last):
         return np.array([start, goal])
