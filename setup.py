@@ -15,6 +15,9 @@ setup(
         (f"share/{PACKAGE}/launch", glob("launch/*.launch.py")),
     ],
     install_requires=["setuptools"],
+    # colcon picks its pytest step off `tests_require`, not off package.xml, so
+    # without this line `test/` is never run.
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="Architecture maintainers",
     maintainer_email="maintainers@example.invalid",

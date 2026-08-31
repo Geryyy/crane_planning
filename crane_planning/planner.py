@@ -187,13 +187,20 @@ class PlannerConfig:
 
     # The truck, as a property of the vehicle: the scene carries one primitive
     # with the reserved id `truck` and the bed and six runges are placed on it.
+    # The stations are the posts of `post_setup:=134` and its subset `13`; keep
+    # them equal to `world_model.vehicle_box.runge_stations_m`.
     truck_runge_dimensions: np.ndarray = field(
         default_factory=lambda: np.array([0.28, 0.31, 2.12])
     )
     truck_runge_stations: np.ndarray = field(
-        default_factory=lambda: np.array([-2.0, 0.0, 2.0])
+        default_factory=lambda: np.array([-2.261, -1.049, 1.935])
     )
     truck_bed_thickness: float = 0.10
+    # The headboard closing the cab end of the deck: 0.45 m of plate and side
+    # rail standing 1.922 m off the bed surface, across its full width. It is
+    # the box's +x end, which is the end the outermost runge station is at.
+    truck_headboard_thickness: float = 0.45
+    truck_headboard_height: float = 1.922
 
 
 TRUCK_ID = "truck"
@@ -205,12 +212,18 @@ PAYLOAD_ID = "payload"
 
 def expand_truck(scene: list, config: PlannerConfig) -> list:
     """
-    Turn the reserved `truck` primitive into the bed slab and the six runges.
+    Turn the reserved `truck` primitive into the bed, the runges and the headboard.
 
     The crane is bolted to the vehicle, so the box is not an obstacle; what the
-    tool can hit is the bed's top face and the runges standing on it. The
-    dimensions are the vehicle's and are configured; the position is measured
-    and arrives with the primitive.
+    tool can hit is the bed's top face, the runges standing on it and the
+    headboard closing its cab end. The dimensions are the vehicle's and are
+    configured; the position is measured and arrives with the primitive.
+
+    A runge is placed flush against the bed edge rather than centred on it,
+    which is where the description puts the real post's outer face; the
+    configured section is an inflation of that post, so it grows inboard. The
+    headboard is flush against the box's +x face the same way, which is the end
+    the outermost runge station is at.
     """
     expanded = []
     for primitive in scene:
@@ -231,6 +244,19 @@ def expand_truck(scene: list, config: PlannerConfig) -> list:
                 structural=True,
             )
         )
+        head = float(config.truck_headboard_thickness)
+        height = float(config.truck_headboard_height)
+        if head > 0.0 and height > 0.0:
+            centre = np.array([0.5 * (box[0] - head), 0.0, top + 0.5 * height])
+            expanded.append(
+                CollisionPrimitive(
+                    id="truck_headboard",
+                    shape="box",
+                    pose_in_mounting_base=pose * pin.SE3(np.eye(3), centre),
+                    dimensions_m=np.array([head, box[1], height]),
+                    structural=True,
+                )
+            )
         runge = np.asarray(config.truck_runge_dimensions, dtype=float)
         for side, sign in (("right", 1.0), ("left", -1.0)):
             edge = sign * 0.5 * (box[1] - runge[1])
@@ -1403,8 +1429,9 @@ class Planner:
         Return the static bodies this plan is checked against.
 
         Not the same list the request carried: the reserved `truck` primitive
-        has become a bed and six runges by the time the planner looks at it, and
-        that is invisible to anyone who only sees the scene topic. This is a
+        has become a bed, six runges and a headboard by the time the planner
+        looks at it, and that is invisible to anyone who only sees the scene
+        topic. This is a
         method and not a private step because the node draws it, and a refusal
         is far easier to read beside the geometry that caused it.
 

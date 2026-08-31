@@ -140,7 +140,7 @@ the trajectory, which is the pendulum, so its lean is the sway the OCP planned
 and a plan that swings looks like it swings. The **goal**, where the request
 asked for the tool and which way round. And the **scene the planner actually
 checked against**, which is not the scene anyone published: by that point the
-reserved `truck` primitive has become a bed and six runges and what is in the
+reserved `truck` primitive has become a bed, six runges and a headboard, and what is in the
 gripper is drawn where it will actually be. Structural bodies, perceived ones
 and the payload are three colours, because "why was this refused" is usually
 answered by which kind it hit.

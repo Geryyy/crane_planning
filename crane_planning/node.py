@@ -190,6 +190,8 @@ class CranePlanner(Node):
             "system_pressure_pa",
             "Ts",
             "truck_bed_thickness",
+            "truck_headboard_thickness",
+            "truck_headboard_height",
         ):
             self.declare_parameter(name, float(getattr(defaults, name)))
         for name in (

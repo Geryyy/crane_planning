@@ -62,9 +62,10 @@ crane_planner:
     q_sway_max: [0.2, 0.2]
     # The step the path and the sway envelope are both sampled at, in metres. It
     # is tightened to half the thinnest primitive the scene carries -- the
-    # runges are 0.28 m across, so a scene with the truck in it checks at
-    # 0.14 m. A scene needing finer than the floor is refused, because a path
-    # checked at a step it does not resolve is not checked.
+    # thinnest the truck brings is the bed slab at `truck_bed_thickness`, so a
+    # scene with the truck in it checks at 0.05 m. A scene needing finer than the
+    # floor is refused, because a path checked at a step it does not resolve is
+    # not checked.
     check_resolution: 0.10
     min_check_resolution: 0.01
     max_check_samples: 2048
@@ -73,9 +74,30 @@ crane_planner:
     # preserved and no longer hard-coded**: the scene carries one primitive with
     # the reserved id `truck` and the bed and the six runges are placed on it.
     # Move the truck and they move.
+    #
+    # The dimensions are the legacy 0.28 x 0.31 x 2.12 and stay that way: the
+    # description's post is 0.080 x 0.108 x 1.750, so the box is an inflation,
+    # and `expand_truck` grows it inboard from the bed edge -- which is where the
+    # real post's outer face is. It is 0.30 m taller than the real post, which
+    # over-approximates and is safe.
+    #
+    # Stations are offsets from the box centre. For the shipped `vehicle_box`
+    # they put the runges at world x -5.593, -4.381 and -1.397, which is where
+    # `lkw_rungen_134.stl` stands the posts -- `post_setup:=134` in sim and its
+    # subset `13` on hardware. The previous [-2.0, 0.0, 2.0] matched none of
+    # them. Keep equal to `world_model.vehicle_box.runge_stations_m`.
     truck_runge_dimensions: [0.28, 0.31, 2.12]
-    truck_runge_stations: [-2.0, 0.0, 2.0]
+    truck_runge_stations: [-2.261, -1.049, 1.935]
     truck_bed_thickness: 0.10
+    #
+    # The headboard closing the cab end of the deck -- the plate the load butts
+    # against, plus the side rails behind it, as one box across the full width
+    # of the bed. `lkw_ladeflaeche_mit_rammschutz_seitlich_col.stl` puts it at
+    # world x -1.005 .. -0.555 reaching to z 3.186, so 0.450 thick and 1.922 off
+    # a bed surface at 1.264. It is placed flush against the box's +x face,
+    # which is the end the outermost runge station is at. Zero either to drop it.
+    truck_headboard_thickness: 0.45
+    truck_headboard_height: 1.922
 
     # --- the timing OCP ------------------------------------------------------
     #
