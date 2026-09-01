@@ -6,6 +6,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# acados writes the solver here at construction: build output, not the curated
-# tree `scripts/export_timing_ocp.py` produces for shipping.
+# acados compiles the solver here at construction; the shippable tree that
+# `scripts/export_timing_ocp.py` writes is not committed for now.
 generated/
