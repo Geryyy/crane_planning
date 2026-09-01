@@ -21,7 +21,7 @@ setup(
     zip_safe=True,
     maintainer="Architecture maintainers",
     maintainer_email="maintainers@example.invalid",
-    description="Deterministic crane corridors and a CasADi/IPOPT timing OCP.",
+    description="Deterministic collision-free crane corridors and shaped timing.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

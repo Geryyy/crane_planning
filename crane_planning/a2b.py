@@ -5,38 +5,33 @@ Serve the retained `a2b_movement` contract over the native planner.
 
 # Why the service is kept and the message is not
 
-`a2b_movement` is the interface the timber workflow depends on and both stacks
-call today, so this planner serves it and is a drop-in replacement for the
-legacy server. Its payload fields are `wood_log_msgs/LogShape` and `Log[]` -- a
-cylinder description -- which is why a concrete block is currently declared to
-the legacy planner **as a cylinder**. Keeping the service compatible is worth an
-adapter; carrying `LogShape` into the new stack is not. So the fiction stops
-here: everything below this module speaks `crane_model.Payload`, and a block on
-the native path stays a box.
+Both stacks call `a2b_movement` today, so this planner serves it as a drop-in
+replacement for the legacy server. Its payload fields are
+`wood_log_msgs/LogShape` and `Log[]` -- a cylinder -- which is why a concrete
+block is currently declared to the legacy planner **as a cylinder**. Keeping the
+service compatible is worth an adapter; carrying `LogShape` inward is not. The
+fiction stops here: everything below speaks `crane_model.Payload`, and a block
+on the native path stays a box.
 
-# It is an adapter and not a planner
+# An adapter, not a planner
 
-Nothing here plans, limits, or checks a collision. `translate_request` produces
-the arguments of `Planner.plan` and the node runs it -- so one start state, one
-scene, one kappa and one `/crane/reference` publication -- and the answer is
-carried back unchanged. There is no second set of limits and no second collision
-configuration, because there is no second planner.
+Nothing here plans, limits or checks a collision. `translate_request` produces
+the arguments of `Planner.plan`, the node runs it, the answer comes back
+unchanged. One start state, one scene, one kappa, one `/crane/reference`
+publication. No second set of limits, no second collision configuration.
 
-# What `CalcMovement` says and what it does not
+# What `CalcMovement` says and does not
 
-Two things the `.srv` carries only as a comment, and that the callers settle:
+Two things the `.srv` carries only as a comment, settled by the callers:
 
-* **The frame.** `CalcMovement` has no `header` and therefore no frame field.
-  The callers convert into `K0_mounting_base` before they call, and the legacy
-  server answers in it and stamps its published path with it. This adapter
-  therefore **asserts** that frame and converts nothing.
-* **The body.** `y_n` is documented as the "target position of tip (K5)" -- the
-  pivot the pendulum hangs from -- while the native goal is the **tool** pose,
-  `K8_tool_center_point`. `Planner.tip_to_tcp_offset` reads the settled 3-D
-  offset between them out of the description for the request's yaw and payload,
-  rather than writing it down or assuming it is vertical: the PZS100's rail
-  gripper and the 7040's jaw do not hang alike, and an off-axis centre of mass
-  changes it again.
+* **Frame.** No `header`, so no frame field. Callers convert into
+  `K0_mounting_base` before calling and the legacy server answers in it, so this
+  adapter **asserts** that frame and converts nothing.
+* **Body.** `y_n` is the "target position of tip (K5)" -- the pivot the pendulum
+  hangs from -- while the native goal is the **tool** pose,
+  `K8_tool_center_point`. `Planner.tip_to_tcp_offset` reads the settled offset
+  between them out of the description at the request's yaw rather than writing it
+  down or assuming it vertical.
 """
 
 from __future__ import annotations

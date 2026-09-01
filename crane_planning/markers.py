@@ -10,13 +10,12 @@ Four things, and each answers a question the numbers do not:
   looks like it swings;
 * **the goal**, where the request asked for the tool and which way round;
 * **the scene the planner actually checked against**, which is not the scene
-  anyone published. The reserved `truck` primitive has become a bed, six runges
-  and a headboard by this point, and what is in the gripper has been inserted as a body
-  of its own. A refusal is very hard to read without them and obvious with them.
+  anyone published: `truck` has become a bed, six runges and a headboard, and
+  what is in the gripper is a body of its own. A refusal is hard to read without
+  them and obvious with them.
 
-Markers are cheap and this is a plan, not a stream: the whole set is rebuilt and
-republished per request, led by a `DELETEALL` so nothing from the previous plan
-survives into this one.
+Markers are cheap and this is a plan, not a stream: the whole set is rebuilt per
+request, led by a `DELETEALL` so nothing from the previous plan survives.
 """
 
 from __future__ import annotations

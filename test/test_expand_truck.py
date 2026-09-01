@@ -37,7 +37,7 @@ def shipped_config() -> PlannerConfig:
     parameters = next(iter(document.values()))["ros__parameters"]
     config = PlannerConfig()
     for name, value in parameters.items():
-        if name != "tool" and hasattr(config, name):
+        if hasattr(config, name):
             setattr(
                 config,
                 name,

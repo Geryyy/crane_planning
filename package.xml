@@ -3,8 +3,8 @@
   <name>crane_planning</name>
   <version>0.1.0</version>
   <description>The `crane_planner` node: deterministic collision-checked tool
-    corridors lifted into the five planned joint coordinates, a C2 fit, and one
-    CasADi/IPOPT optimal control problem that decides how fast the path may be traversed. Provides
+    corridors lifted into the five planned joint coordinates, a C2 fit, and a
+    vectorized dynamic timing certificate. Provides
     the legacy-compatible `/a2b_movement` service and publishes `/crane/reference`;
     grip motion is owned by concrete_block_motion_planning.</description>
   <maintainer email="maintainers@example.invalid">Architecture maintainers</maintainer>
@@ -13,13 +13,11 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <!-- Everything the machine can do (reach, hang, collide, lift) is asked of
-       this package. No geometry and no constant is restated here; the OCP is
-       assembled from `crane_model.symbolic`'s own CasADi graph. -->
+       this package. No geometry and no constant is restated here; timing uses
+       `crane_model.symbolic`'s own CasADi graph. -->
   <depend>crane_model</depend>
   <depend>crane_msgs</depend>
-  <!-- The optimal control problem of wiki/trajectory_planning.md 5.2, written
-       once and solved with IPOPT. libraries.md 1 lists CasADi for exactly this;
-       no NLP is written by hand. -->
+  <!-- CasADi vectorizes the passive-dynamics rollout and actuator checks. -->
   <depend>casadi</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>

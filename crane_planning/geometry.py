@@ -1,10 +1,9 @@
 """
 Where the machine may go, and the curve fitted through it.
 
-The scene, the inverse kinematics, the bounded family of candidate paths and the
-fit. Clearance is *proved* rather than sampled: a margin paired with a bound on
-how far the machine moves between two checked configurations. Nothing here knows
-about time.
+Scene, IK, the bounded family of candidate paths, the fit. Clearance is *proved*
+rather than sampled: a margin paired with a bound on how far the machine moves
+between two checked configurations. Nothing here knows about time.
 """
 
 from __future__ import annotations
@@ -152,36 +151,20 @@ class Geometry:
     """
     Whether a configuration is clear, at the pose the tool hangs at.
 
-    Every distance is a `crane_model` query -- there is no second collision model
-    here.
+    Every distance is a `crane_model` query -- no second collision model here.
 
-    # How a finite set of checks certifies a continuous motion
+    The certificate: sampling proves nothing alone, a margin paired with a
+    Lipschitz bound does. `radii[j]*|dq_j|` bounds how far joint j's rotation
+    moves anything below it, summed into `step_bound`. So if every checked
+    configuration clears by more than `required` and `step_bound <=
+    margin_interp` for every consecutive pair, nothing touches anything in
+    between. Both halves are load-bearing; README "The collision certificate"
+    has the argument.
 
-    Sampling never proves clearance on its own. What makes it a proof is a
-    margin paired with a bound on how far anything can move between two samples.
-    Rotating planned joint `j` by `dq_j` displaces any point below it by at most
-    `radii[j] * |dq_j|`, so between two configurations no point of the machine
-    moves further than `step_bound`. Therefore:
+        required = margin_safety + margin_interp + envelope   (each spent once)
 
-        if every checked configuration clears the scene by more than
-        `required`, and `step_bound <= margin_interp` for every consecutive
-        pair, then no point of the machine touches anything anywhere on the
-        continuous motion between them.
-
-    `required` is spent three ways and each part is spent once:
-
-        required = margin_safety + margin_interp + envelope
-
-    `margin_interp` bridges the samples, `envelope` is how far the tool can swing
-    inside the admissible sway box, and `margin_safety` is what is actually left
-    over as clearance. The swing is therefore answered by one distance test
-    rather than by gridding the sway box, and a thin obstacle cannot be tunnelled
-    -- which is what the old "tighten the step to half the thinnest primitive"
-    rule was reaching for without being able to prove.
-
-    Self-collision keeps its own test at zero: the machine's links are near each
-    other by design, and holding them a margin apart would refuse poses it is
-    built to reach.
+    Self-collision tests at zero, not against `required`: the links are near each
+    other by design.
     """
 
     def __init__(
@@ -226,16 +209,14 @@ class Geometry:
         """
         Return how far the farthest carried point can swing, in metres.
 
-        Measured from the passive pivot to that point and **not to the tool
-        centre point**: a gripped block hangs below the TCP, so it swings on a
-        longer pendulum than the tool does and takes up more room for the same
-        `q_sway_max`. Everything between the pivot and the TCP is closer to the
-        pivot and so swings less, which is why only what is carried is added.
+        Measured from the passive pivot to that point, **not to the TCP**: a
+        gripped block hangs below the TCP, so it swings on a longer pendulum for
+        the same `q_sway_max`. Everything between pivot and TCP is closer in and
+        swings less, which is why only the carried body is added.
 
-        The sway box is shared with the controller by design, so this is not a
-        conservative approximation of a swing that will not happen -- it is a
-        state the machine is entitled to reach, and geometry that was not
-        checked for it was not checked.
+        The sway box is shared with the controller, so this is not a conservative
+        allowance for a swing that will not happen -- it is a state the machine is
+        entitled to reach.
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
@@ -249,13 +230,12 @@ class Geometry:
         """
         How far a body can move per unit of each planned coordinate.
 
-        Measured at full telescope extension, which is where every radius is
-        largest. The outermost point of the machine is taken to be the tool
-        centre point plus `tool_radius` and the carried body's own reach, and the
-        distance is taken from the joint's *origin* rather than its axis -- both
-        over-estimate, which is the safe direction for a bound that has to hold.
-        The telescope is prismatic, and displaces what it carries by
-        `TELESCOPE_TRAVEL_PER_UNIT` -- two metres per metre of `q4`, not one.
+        At full telescope extension, where every radius is largest. Outermost
+        point taken as TCP + `tool_radius` + the carried body's reach; distance
+        taken from each joint's *origin*, not its axis. Both over-estimate, the
+        safe direction for a bound that has to hold. The prismatic telescope
+        displaces what it carries by `TELESCOPE_TRAVEL_PER_UNIT` -- two metres per
+        metre of q4, not one.
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
@@ -281,7 +261,7 @@ class Geometry:
         return radii
 
     def step_bound(self, first: np.ndarray, second: np.ndarray) -> float:
-        """Return the furthest any point of the machine moves between two configurations."""
+        """Furthest any point of the machine moves between two configurations."""
         return float(
             np.sum(self.radii * np.abs(np.asarray(second) - np.asarray(first)))
         )
@@ -296,11 +276,10 @@ class Geometry:
 
     def clearance(self, q_a: np.ndarray) -> float:
         """
-        Scene clearance at `q_a`, in metres, or `-inf` where it cannot be evaluated.
+        Scene clearance at `q_a` in metres, `-inf` where it cannot be evaluated.
 
-        The self-collision row is separated out and tested at zero; what is
-        returned is the distance to the scene, which is what the margin is
-        against.
+        Self-collision is split out and tested at zero; what is returned is the
+        distance to the scene, which is what the margin is against.
         """
         try:
             q = self.configuration(q_a)
@@ -308,9 +287,8 @@ class Geometry:
             results = self.model.collision_queries(q, bodies)
         except (CraneModelError, PlanningError):
             return -np.inf
-        # `crane_model.collision.queries` answers one row per scene primitive in
-        # scene order, then -- if the description has any self-pairs at all --
-        # one for the machine against itself.
+        # queries(): one row per scene primitive in scene order, then -- if the
+        # description has self-pairs -- one for the machine against itself.
         scene_rows = results[: len(bodies)]
         self_rows = results[len(bodies) :]
         if any(row.minimum_distance_m <= 0.0 for row in self_rows):
@@ -320,19 +298,6 @@ class Geometry:
     def is_valid(self, q_a: np.ndarray) -> bool:
         """Clear of the scene by the whole margin, and not folded into itself."""
         return self.clearance(q_a) > self.required
-
-    def travel(self, first: np.ndarray, second: np.ndarray) -> float:
-        """How far the tool moves between two configurations, in metres."""
-        try:
-            one = self.model.forward_kinematics(
-                self.configuration(first), Frame.MOUNTING_BASE, Frame.TCP
-            )
-            other = self.model.forward_kinematics(
-                self.configuration(second), Frame.MOUNTING_BASE, Frame.TCP
-            )
-        except (CraneModelError, PlanningError):
-            return np.inf
-        return float(np.linalg.norm(other.position_m - one.position_m))
 
     def tcp_pose(self, q_a: np.ndarray) -> tuple[np.ndarray, float]:
         """Return the tool centre point's position and yaw at `q_a`, hanging."""
@@ -346,14 +311,14 @@ class Geometry:
 
     def check_path(self, path) -> None:
         """
-        Re-run the certificate on the fitted curve, which is what executes.
+        Run the certificate on the fitted curve. This is the only place it runs.
 
-        The polyline satisfied it by construction; the spline through it is a
-        different curve, so it earns the same two tests -- clearance at every
-        sample, and the step bound between consecutive ones. It is walked with
-        the same adaptive step for the same reason: a sample count read off the
-        tool's travel says nothing about how far the arm moved between two of
-        them.
+        The lifted polyline is not checked -- it only establishes the IK branch
+        and the interpolation bound. The spline through it is a different curve,
+        and it is the curve that executes, so it takes both tests: clearance at
+        every sample, step bound between consecutive ones. Walked with the same
+        adaptive step, because a sample count read off the tool's travel says
+        nothing about how far the arm moved.
         """
         previous = path.position(0.0)
         if not self.is_valid(previous):
@@ -410,20 +375,16 @@ def solve_ik(
     """
     Solve for the planned five that put the tool at `(position_m, yaw)`, hanging.
 
-    One least-squares problem, not a closed form: the passive pair is re-settled
-    at every configuration tested, so what is solved is where the tool actually
-    ends up rather than where it would be if it did not hang. The redundancy the
-    telescope leaves is taken up by a weak pull towards the seed.
+    Least squares, not closed form: the passive pair is re-settled at every
+    configuration tested, so what is solved is where the tool actually ends up.
+    The telescope's redundancy is taken up by a weak pull towards the seed.
 
-    `restarts` is what separates the two callers. The goal is solved cold and
-    spreads its restarts over the telescope range, because that is the coordinate
-    the residual is flat in. Every sample along the line is solved with one
-    restart from its predecessor, which is the right seed -- consecutive
-    questions are about neighbouring poses -- and is also what keeps the lifted
-    path on one IK branch.
+    `restarts` separates the two callers. The goal is cold and spreads restarts
+    over the telescope range -- the coordinate the residual is flat in. Each
+    sample along a corridor takes one restart from its predecessor, the right
+    seed for neighbouring poses, and what keeps the lift on one IK branch.
 
-    This checks reachability and nothing else. Whether the answer is clear is the
-    caller's question, because the caller knows which sample it is.
+    Reachability only. Whether the answer is clear is the caller's question.
     """
     lower = np.where(limits.bounded, limits.lower, seed - 2.0 * np.pi)
     upper = np.where(limits.bounded, limits.upper, seed + 2.0 * np.pi)
@@ -447,23 +408,21 @@ def solve_ik(
 
     def jacobian(q_a):
         """
-        Return the residual's derivative, analytically rather than by differencing.
+        Analytic derivative of the residual, not a finite difference.
 
-        Worth the two dozen lines: a five-parameter finite difference costs six
-        forward-kinematics evaluations per iteration and this costs one
-        Jacobian, which is why the lift stopped being the slowest stage.
+        Worth the lines: differencing five parameters costs six FK evaluations
+        per iteration, this costs one Jacobian. That is why the lift stopped
+        being the slowest stage.
 
-        Two corrections turn the model's answer into this residual's. The
-        Jacobian is LOCAL, so the linear and angular blocks are rotated into
-        `K0_mounting_base`. And the passive pair is not independent: the
-        pendulum hangs at `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, so moving the
-        boom or the arm swings the tip joint back by exactly as much, and the
-        tip column enters those two with a factor of -1.
+        Two corrections. The model's Jacobian is LOCAL, so linear and angular
+        blocks are rotated into `K0_mounting_base`. And the passive pair is not
+        independent -- the pendulum hangs at `q_eq = (pi/2 - q_boom - q_arm,
+        pi/2)`, so boom and arm swing the tip joint back by as much, and the tip
+        column enters those two columns with factor -1.
 
-        The yaw row takes the angular Jacobian's z entry, which is exact only
-        while the tool hangs near-upright. That costs a little convergence and
-        nothing in correctness: the residual it is a derivative of stays exact,
-        and the acceptance test below is on the residual.
+        The yaw row takes the angular Jacobian's z entry, exact only while the
+        tool hangs near-upright. Costs a little convergence, nothing in
+        correctness: the residual stays exact and acceptance is on the residual.
         """
         try:
             q = geometry.configuration(q_a)
@@ -503,11 +462,10 @@ def solve_ik(
             and float(abs(values[3])) <= config.eps_yaw
         )
 
-    # Continuation queries are deliberately close to their seed.  A bounded
-    # Gauss--Newton step with the analytic Jacobian gets them home without
-    # constructing and factorising a fresh scipy trust-region problem for every
-    # collision-certificate sample.  Keep scipy below as the robust fallback
-    # and for the cold, restarted endpoint query.
+    # Continuation queries sit close to their seed, so a bounded Gauss-Newton
+    # step with the analytic Jacobian gets them home without building a fresh
+    # scipy trust-region problem per sample. scipy below stays the fallback, and
+    # handles the cold restarted endpoint query.
     if restarts <= 1:
         current = starts[0].copy()
         values = residual(current)
@@ -545,12 +503,10 @@ def solve_ik(
         error = float(np.linalg.norm(answer.fun[:4]))
         if error < best_error:
             best, best_error = answer.x, error
-        # A solve that already meets the tolerance this function is about to
-        # check is not in a local minimum, and the remaining restarts can only
-        # re-derive an answer already in hand. It is taken as `best` outright:
-        # the selection above mixes three metres with one radian in a single
-        # 4-norm while the acceptance test is two separate scalars, so the
-        # restart that satisfies the test need not be the one holding `best`.
+        # Already inside tolerance: not a local minimum, and further restarts can
+        # only re-derive it. Returned outright rather than via `best`, because the
+        # selection above mixes metres and radians in one 4-norm while acceptance
+        # is two separate scalars -- so the passing restart need not hold `best`.
         if accepted(answer.fun):
             return answer.x
 
@@ -659,9 +615,14 @@ def lift_candidate(
     start_q_a: np.ndarray,
     goal_yaw: float,
     candidate: CartesianCandidate,
-    certify_samples: bool = True,
 ) -> np.ndarray:
-    """Lift one TCP polyline into joint space using continuation IK."""
+    """
+    Lift one TCP polyline into joint space using continuation IK.
+
+    These samples establish a continuous IK branch and the interpolation bound;
+    they are not executed and they are not collision-checked. The certificate
+    runs once, on the fitted C2 curve, because that curve is what executes.
+    """
     positions = _without_repeated_positions(candidate.positions_m)
     if len(positions) < 2:
         raise PlanningError(f"{candidate.name} contains no motion")
@@ -700,12 +661,6 @@ def lift_candidate(
                 waypoints[-1],
                 restarts=1,
             )
-            if certify_samples and not geometry.is_valid(q_a):
-                raise PlanningError(
-                    f"{candidate.name} is blocked on segment {segment}/{segments} "
-                    f"at {along * 100.0:.0f}%: clearance {geometry.clearance(q_a):.3f} m "
-                    f"against {geometry.required:.3f} m required"
-                )
             if geometry.step_bound(waypoints[-1], q_a) > config.margin_interp:
                 step *= 0.5
                 if step < MIN_LIFT_STEP:
@@ -722,56 +677,7 @@ def lift_candidate(
                     "configurations to certify"
                 )
             step *= 1.25
-    # These samples establish a continuous IK branch and the interpolation
-    # bound; they are not executed.  Collision certification is performed once
-    # on the fitted C2 curve below, avoiding a duplicate model query at every
-    # continuation sample while preserving the certificate on the actual path.
     return np.array(waypoints)
-
-
-def plan_geometric_path(
-    geometry: Geometry,
-    limits: Limits,
-    config: PlannerConfig,
-    start_q_a: np.ndarray,
-    goal_position_m: np.ndarray,
-    goal_yaw: float,
-) -> tuple[np.ndarray, str]:
-    """Try the direct path and bounded crane-specific corridors in order."""
-    start_position, _ = geometry.tcp_pose(start_q_a)
-    failures = []
-    candidates = cartesian_candidates(
-        geometry, config, start_position, np.asarray(goal_position_m, dtype=float)
-    )
-    for candidate in candidates:
-        try:
-            waypoints = lift_candidate(
-                geometry, limits, config, start_q_a, goal_yaw, candidate
-            )
-            return waypoints, candidate.name
-        except PlanningError as failure:
-            failures.append(str(failure))
-    summary = "; ".join(failures[:3])
-    if len(failures) > 3:
-        summary += f"; and {len(failures) - 3} more corridor refusals"
-    raise PlanningError(
-        f"none of the {len(candidates)} deterministic tool corridors is clear: {summary}"
-    )
-
-
-def lift(
-    geometry: Geometry,
-    limits: Limits,
-    config: PlannerConfig,
-    start_q_a: np.ndarray,
-    goal_position_m: np.ndarray,
-    goal_yaw: float,
-) -> np.ndarray:
-    """Compatibility wrapper around the complete deterministic geometric stage."""
-    waypoints, _candidate_name = plan_geometric_path(
-        geometry, limits, config, start_q_a, goal_position_m, goal_yaw
-    )
-    return waypoints
 
 
 # ---------------------------------------------------------------------- the fit
@@ -782,69 +688,39 @@ class Path:
     """
     q_a(sigma) on [0, 1], twice differentiable everywhere.
 
-    Twice, and that is the whole point of fitting at all: the timing stage writes
-    `ddq_a = q_a'' sigma_dot^2 + q_a' sigma_ddot`, so at a kink in the polyline
-    q_a'' is unbounded, the admissible path rate collapses to zero and the machine
-    stops dead at every waypoint.
+    Twice, because a kink is not a curve the machine can be asked to follow: at
+    one q_a'' is unbounded, so the certificate's step bound refuses it and any
+    consumer that differentiates the path reads a spike at the waypoint.
     """
 
     spline: BSpline
-    travel_m: float
 
     def position(self, sigma) -> np.ndarray:
         return self.spline(sigma)
 
-    def rate(self, sigma) -> np.ndarray:
-        return self.spline(sigma, 1)
-
-    def curvature(self, sigma) -> np.ndarray:
-        return self.spline(sigma, 2)
-
-    def block(self, sigma, q_tool: float) -> np.ndarray:
-        """Return the `q_a | q_a' | q_a'' | q8` the OCP is told about one sigma."""
-        return np.concatenate(
-            [self.position(sigma), self.rate(sigma), self.curvature(sigma), [q_tool]]
-        )
-
 
 def fit(
-    geometry: Geometry,
     limits: Limits,
     config: PlannerConfig,
     waypoints: np.ndarray,
     dq_start: np.ndarray,
-) -> tuple[Path, float | None]:
+) -> Path:
     """
-    Fit `q_a(sigma)` to the waypoints, and say what sigma_dot(0) must be.
+    Fit `q_a(sigma)` to the waypoints.
 
-    sigma is distributed by how long each chord takes at the slowest axis's own
-    limit, so a segment that is slow in one coordinate gets more of the
-    parameter. That total is a duration, and it is also what pins the start
-    rate: choosing `q_a'(0) = dq_a * L` makes `dq_a = q_a'(0) sigma_dot(0)` hold
-    exactly at `sigma_dot(0) = 1/L`.
+    sigma is distributed by how long each chord takes at its slowest axis's own
+    limit, so a segment slow in one coordinate gets more of the parameter. That
+    total `L` scales the start slope: `q_a'(0) = dq_a * L` is the same motion
+    measured in sigma, so a plan starting from a moving machine leaves along the
+    direction it is already going.
 
-    # Why this approximates instead of interpolating
-
-    A cubic spline forced through every sample ties the number of curve
-    segments to the number of samples, and those two want opposite things. The
-    collision certificate wants samples **dense** -- that is what makes it a
-    proof. The curve wants its first and last intervals **long**, because the
-    path is clamped to leave and arrive at rest in `q_a` and that flattening has
-    to happen somewhere. Interpolating a densely sampled path squeezes the
-    clamp into a sliver of sigma, and `q_a''` at the endpoint blows up: measured
-    at 361 against an interior value of 0.4, a spike the timing OCP then reads
-    at its very first node and refuses.
-
-    A least-squares B-spline with its own knot count breaks the tie. `sigma` is
-    sampled as densely as the certificate demands and the curve carries
-    `path_segments` cubic pieces regardless, so the end intervals stay long and
-    the curvature stays O(1). It also stops the fit chasing inverse-kinematics
-    noise between neighbouring samples.
-
-    The curve no longer passes exactly through the checked configurations, which
-    would matter if the polyline were the thing being certified. It is not:
-    `Geometry.check_path` re-runs the whole certificate on this curve, because
-    this curve is what executes.
+    Approximates, does not interpolate: interpolation ties segment count to
+    sample count, and the certificate wants samples dense while the curve wants
+    its end intervals long for the clamp. Interpolating a dense path spikes
+    `q_a''` at the endpoint -- measured 361 against 0.4 in the interior. A
+    least-squares B-spline with `path_segments` pieces breaks the tie and stops
+    the fit chasing IK noise. The curve then misses the checked configurations,
+    which would matter if the polyline were what is certified; it is not.
     """
     if len(waypoints) < 2:
         raise PlanningError("the lifted path carries fewer than two configurations")
@@ -867,23 +743,19 @@ def fit(
             f"the lifted path cannot be fitted with {segments} segments: {failure}"
         ) from None
 
-    # The endpoints and the end slopes are boundary conditions, not something to
-    # be least-squares fitted. For a clamped B-spline the first and last
-    # coefficients *are* the endpoint values, and the end slope is set by the
-    # one coefficient next to each -- so both are imposed exactly by writing
-    # four coefficients, and every remaining one is left as fitted.
+    # Endpoints and end slopes are boundary conditions, not things to fit. For a
+    # clamped B-spline the outer coefficients *are* the endpoint values and the
+    # next one in sets the slope, so four writes impose both exactly; the rest
+    # stay as fitted.
     coefficients = np.array(spline.c, dtype=float)
     coefficients[0] = waypoints[0]
     coefficients[-1] = waypoints[-1]
-    moving = float(np.linalg.norm(dq_start)) > 1.0e-9
-    start_rate = (
-        np.asarray(dq_start, dtype=float) * total if moving else np.zeros(PLANNED_DOF)
-    )
+    start_rate = np.asarray(dq_start, dtype=float) * total
     coefficients[1] = (
         coefficients[0] + start_rate * (knots[degree + 1] - knots[1]) / degree
     )
-    # Arriving at rest in q_a is what lets sigma_dot stay above its floor while
-    # dq_a = q_a' sigma_dot still reaches zero.
+    # The path arrives at rest in q_a: the goal is a pose to stop at, not one to
+    # pass through.
     coefficients[-2] = coefficients[-1]
     spline = BSpline(knots, coefficients, degree)
 
@@ -902,12 +774,7 @@ def fit(
                 f"configurations cannot be followed with {segments} segments"
             )
 
-    travel = 0.0
-    for one, other in zip(sampled[:-1], sampled[1:]):
-        travel += geometry.travel(one, other)
-    return Path(spline=spline, travel_m=float(travel)), (
-        1.0 / total if moving else None
-    )
+    return Path(spline=spline)
 
 
 def plan_fitted_path(
@@ -918,7 +785,7 @@ def plan_fitted_path(
     goal_position_m: np.ndarray,
     goal_yaw: float,
     dq_start: np.ndarray,
-) -> tuple[Path, float | None, int, str]:
+) -> tuple[Path, int, str]:
     """Lift, fit and certify candidates until the executable curve is clear."""
     start_position, _ = geometry.tcp_pose(start_q_a)
     candidates = cartesian_candidates(
@@ -928,19 +795,13 @@ def plan_fitted_path(
     for candidate in candidates:
         try:
             waypoints = lift_candidate(
-                geometry,
-                limits,
-                config,
-                start_q_a,
-                goal_yaw,
-                candidate,
-                False,
+                geometry, limits, config, start_q_a, goal_yaw, candidate
             )
-            path, sigma_dot_start = fit(geometry, limits, config, waypoints, dq_start)
+            path = fit(limits, config, waypoints, dq_start)
             # The spline is a different curve from its lifted polyline. Only a
-            # successful second certificate makes it executable.
+            # successful certificate on it makes it executable.
             geometry.check_path(path)
-            return path, sigma_dot_start, len(waypoints), candidate.name
+            return path, len(waypoints), candidate.name
         except PlanningError as failure:
             failures.append(f"{candidate.name}: {failure}")
     summary = "; ".join(failures[:3])

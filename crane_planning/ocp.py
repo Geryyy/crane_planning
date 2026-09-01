@@ -5,20 +5,20 @@ The trajectory OCP: its definition, and the solver that answers with it.
 with `theta = T / ocp_horizon` a state whose derivative is zero -- so one solve is
 time-optimal and there is no outer search over the duration.
 
-The definition lives here rather than beside the exporter because this package's
-consumer is Python: `scripts/export_timing_ocp.py` is a command-line front end on
+The definition lives here, not beside the exporter, because this package's
+consumer is Python: `scripts/export_timing_ocp.py` is a CLI front end on
 `build_ocp`, and `TrajectoryOcp` is the same problem with a solver attached.
 
-Every residual row is divided by the limit it is measured against, so a row reads
-1.0 at its bound and `W` is preference alone -- see `weights`. Gauss-Newton builds
-its Hessian from `J' W J`, so one row left in physical units sets the conditioning
-of everything: `tau_a` in newton metres stalled this solve at a stationarity
-residual of 1e6, and the horizon in seconds cost 40-60x on the same measure.
+Every residual row is divided by the limit it is measured against, so 1.0 is the
+bound and `W` is preference alone (see `weights`). Gauss-Newton builds its
+Hessian from `J' W J`, so one row left in physical units sets the conditioning of
+everything: `tau_a` in Nm stalled this solve at a stationarity residual of 1e6,
+and the horizon in seconds cost 40-60x on the same measure.
 
-**There are no obstacle rows.** The geometric stage still certifies a path and
-this solver is handed its endpoints, but it is free to move between them however
-the dynamics prefer -- which is where its speed comes from and what voids the
-clearance proof. The corridor is `q_a`'s box, narrowed, and is not wired yet.
+**No obstacle rows.** The geometric stage certifies a path and this solver is
+handed its endpoints, but it moves between them however the dynamics prefer --
+where its speed comes from, and what voids the clearance proof. The corridor is
+`q_a`'s box narrowed, and is not wired yet.
 """
 
 from __future__ import annotations
@@ -69,6 +69,17 @@ H_SWAY, H_FLOW, NH = 0, 2, 3
 #: Row order of `h_e`: the settled box the caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
+#: The integrator, and the stage count that makes each one order 4: ERK wants 4
+#: stages, Gauss-Legendre IRK 2. ERK4 is far cheaper per node but its stability
+#: region is finite and `theta` scales the step, so the choice is not uniform
+#: over the duration box: at `ocp_duration_max` the pendulum (w = 3.6 rad/s)
+#: sits at w*dt = 1.8, where RK4's per-step amplification is 0.854 -- 500x of
+#: fabricated damping over 40 intervals, pricing the sway rows as if the swing
+#: settled on its own. Gauss-Legendre is symplectic, |R(iy)| = 1 at any step, so
+#: it cannot invent that. At the ~7 s answer ERK4 is within 1.6% over the whole
+#: horizon, which is why this is a knob and not a correction.
+INTEGRATORS = {"ERK": 4, "IRK": 2}
+
 
 def equilibrium(q_a):
     """Return where the tool hangs: a two-hinge pendulum hangs straight down."""
@@ -93,6 +104,11 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     dq_sway_max = np.asarray(parameters["dq_sway_max"], dtype=float)
     ddq_a_max = np.asarray(parameters["ddq_a_max"], dtype=float)
     nominal = float(parameters["ocp_horizon"])
+    integrator = str(parameters["ocp_integrator"]).upper()
+    if integrator not in INTEGRATORS:
+        raise ValueError(
+            f"ocp_integrator is {integrator!r}, not one of {sorted(INTEGRATORS)}"
+        )
 
     # ---------------------------------------------------------------- the model
 
@@ -103,9 +119,8 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     dq_u = x[cs.X_PASSIVE_VELOCITY : cs.X_PASSIVE_VELOCITY + cs.K_PASSIVE_DOF]
     sway = q_u - equilibrium(q_a)
 
-    # `theta = T / T_nominal`: one decision variable shared by every node. acados
-    # fixes `p` for the duration of a solve, so a horizon the solver may choose
-    # cannot live there.
+    # `theta = T / T_nominal`, one decision variable shared by every node. acados
+    # fixes `p` for a solve, so a horizon the solver picks cannot live there.
     theta = ca.SX.sym("theta")
 
     acados_model = AcadosModel()
@@ -114,14 +129,19 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     acados_model.u = u
     acados_model.p = p
     acados_model.f_expl_expr = ca.vertcat(nominal * theta * model.xdot, 0.0)
+    # acados does not derive one form from the other: ERK reads `f_expl_expr`,
+    # IRK reads `f_impl_expr` and errors on an empty one. Both are set here
+    # unconditionally so switching integrator is a solver option, not a re-model.
+    acados_model.xdot = ca.SX.sym("xdot", NX)
+    acados_model.f_impl_expr = acados_model.xdot - acados_model.f_expl_expr
 
     # ----------------------------------------------------------------- the cost
 
     # `tau_a` minus its value at rest on the same configuration. 91% of the raw
-    # effort integral is gravity plus the held load, which no timing choice can
-    # change, so a residual against zero prices holding the block and is blind to
-    # the part that shakes the boom. Substituting the hanging pendulum, zero rates
-    # and zero input into the same graph makes this the dynamic part exactly.
+    # effort integral is gravity plus held load, which no timing choice changes,
+    # so a residual against zero prices holding the block and is blind to what
+    # shakes the boom. Substituting hanging pendulum, zero rates and zero input
+    # into the same graph isolates the dynamic part exactly.
     tau_a = model.tau_a[: cs.K_PLANNED_DOF]
     at_rest = ca.vertcat(
         q_a,
@@ -154,9 +174,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.model = acados_model
     ocp.parameter_values = np.zeros(cs.NP)
 
-    # The yaml's weights, baked as this solver's defaults. They stay
-    # runtime-settable -- the node writes its own onto the built solver -- so a
-    # weight change never needs a re-export.
+    # The yaml's weights baked as defaults. Still runtime-settable -- the node
+    # writes its own onto the built solver -- so a weight change needs no
+    # re-export.
     stage_w, terminal_w = w.matrices(parameters["weights"])
     if (residual.shape[0], terminal_residual.shape[0]) != (w.NY, w.NY_E):
         raise ValueError(
@@ -170,9 +190,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # ---------------------------------------------------------- the constraints
 
-    # Two nonlinear rows and no third: there is deliberately no cylinder-force
-    # constraint in this package, because it was the smaller chamber area times a
-    # relief pressure nothing in this workspace has measured.
+    # Two nonlinear rows, no third: no cylinder-force constraint here, because it
+    # was the smaller chamber area times a relief pressure nothing in this
+    # workspace has measured.
     flow = ca.sum1(
         model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
     )
@@ -183,10 +203,10 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     acados_model.con_h_expr = acados_model.con_h_expr_0
     acados_model.con_h_expr_e = ca.vertcat(sway, dq_u) / scale_e
 
-    # Every bound below is a placeholder the caller overwrites; what is baked is
-    # which rows exist and which are soft. Stage 0's box is the measured state --
-    # over `cs.NX`, not `NX`, because the horizon is the one component of `x` the
-    # solver may pick. `constraints.x0` would pin it and freeze the objective.
+    # Bounds below are placeholders the caller overwrites; what is baked is which
+    # rows exist and which are soft. Stage 0's box is the measured state, over
+    # `cs.NX` not `NX` because the horizon is the one component of `x` the solver
+    # picks. `constraints.x0` would pin it and freeze the objective.
     ocp.constraints.idxbx_0 = np.arange(cs.NX)
     ocp.constraints.lbx_0 = np.zeros(cs.NX)
     ocp.constraints.ubx_0 = np.zeros(cs.NX)
@@ -203,12 +223,11 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.constraints.lh_e = -np.ones(NH_E)
     ocp.constraints.uh_e = np.ones(NH_E)
 
-    # `L1` and never quadratic: a quadratic price is cheap near the boundary and
-    # leaks a little violation everywhere, a linear one with a large enough
-    # coefficient is exact. Soft rows are the ones a caller would rather have
-    # answered late than refused -- sway, the pump, the settled box. The input,
-    # the joint range and the goal stay hard: violating those is not a slower
-    # plan, it is a wrong one.
+    # L1, never quadratic: a quadratic price is cheap near the boundary and leaks
+    # violation everywhere, a linear one with a big enough coefficient is exact.
+    # Soft rows are the ones a caller would rather have late than refused -- sway,
+    # pump, settled box. Input, joint range and goal stay hard: violating those
+    # is not a slower plan, it is a wrong one.
     ocp.constraints.idxsh_0 = np.arange(NH)
     ocp.constraints.idxsh = np.arange(NH)
     ocp.constraints.idxsh_e = np.arange(NH_E)
@@ -227,17 +246,20 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.solver_options.nlp_solver_max_iter = int(parameters["ocp_max_iterations"])
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
-    ocp.solver_options.integrator_type = "ERK"
-    ocp.solver_options.sim_method_num_stages = 4
+    ocp.solver_options.integrator_type = integrator
+    # Read for IRK only. Radau IIA is L-stable and damps the swing harder than
+    # ERK4 already does, which is the wrong direction for an anti-sway problem.
+    ocp.solver_options.collocation_type = "GAUSS_LEGENDRE"
+    ocp.solver_options.sim_method_num_stages = INTEGRATORS[integrator]
     ocp.solver_options.sim_method_num_steps = 1
     ocp.solver_options.globalization = "MERIT_BACKTRACKING"
     ocp.solver_options.regularize_method = "NO_REGULARIZE"
     ocp.solver_options.levenberg_marquardt = float(parameters["levenberg_marquardt"])
-    # Set, not left at acados' 1e-6 default, which is a control-loop number: a
-    # plan is resampled onto a 25 Hz reference and tracked by a controller that
-    # closes the loop on it, so the last two decades buy it nothing and cost it
-    # plenty -- a solve landing at 1.69e-6 spent sixty iterations and eleven
-    # seconds failing to halve it, where one landing at 5.39e-7 finished in six.
+    # Set, not acados' 1e-6 default, which is a control-loop number. A plan is
+    # resampled onto a 25 Hz reference and tracked by a controller closing the
+    # loop on it, so the last two decades buy nothing and cost plenty: a solve
+    # landing at 1.69e-6 spent sixty iterations and eleven seconds failing to
+    # halve it, one landing at 5.39e-7 finished in six.
     tolerance = float(parameters["ocp_tolerance"])
     for condition in ("stat", "eq", "ineq", "comp"):
         setattr(ocp.solver_options, f"nlp_solver_tol_{condition}", tolerance)
@@ -259,7 +281,13 @@ class Trajectory:
     pump_flow: np.ndarray  # (N+1,) as a fraction of the physical pump
     slack: float
     iterations: int
-    solve_time_s: float
+    solve_time_s: float  # wall clock around the call, so it carries Python and load
+    #: acados' `time_tot` and the four KKT residuals it stopped on. Wall clock is
+    #: load-bound -- the same solve measured 0.53 s idle, 4.97 s under a running
+    #: Gazebo -- so read a regression off the iteration count and these residuals
+    #: against `ocp_tolerance`, never off the time.
+    acados_time_s: float
+    residuals: np.ndarray  # (4,) stationarity, equality, inequality, complementarity
 
     @property
     def duration(self) -> float:
@@ -280,9 +308,9 @@ class TrajectoryOcp:
     """
     The generated solver, with the bounds one request needs written onto it.
 
-    Built once. acados regenerates and recompiles into `generated/`, which costs
-    seconds on a warm tree and minutes on a cold one, so this is construction-time
-    work and not per-request work.
+    Built once. acados regenerates and recompiles into `CACHE`, outside the source
+    tree -- seconds on a warm tree, minutes on a cold one. Construction-time work,
+    not per-request work.
     """
 
     def __init__(self, description_xml: str, limits, config, weights: dict):
@@ -292,6 +320,7 @@ class TrajectoryOcp:
             {
                 "ocp_intervals": config.ocp_intervals,
                 "ocp_horizon": config.ocp_horizon,
+                "ocp_integrator": config.ocp_integrator,
                 "ocp_max_iterations": config.ocp_max_iterations,
                 "ocp_tolerance": config.ocp_tolerance,
                 "levenberg_marquardt": config.levenberg_marquardt,
@@ -302,18 +331,18 @@ class TrajectoryOcp:
             },
             {"pump_flow_max": config.pump_flow_max},
         )
-        # The pump row in physical units, off the same graph the solver constrains,
-        # so what is reported and what is bounded cannot drift apart.
+        # The pump row in physical units, off the graph the solver constrains, so
+        # reported and bounded cannot drift apart.
         flow = ca.sum1(
             model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
         )
         self._flow = ca.Function("flow", [model.x, model.u, model.p], [flow])
         self.N = ocp.solver_options.N_horizon
         self.nominal = float(config.ocp_horizon)
-        # **Generated by `scripts/export_timing_ocp.py`, not here.** If the tree is
-        # already built this loads it; if it is not, the first construction builds
-        # it and costs minutes. Regenerating unconditionally would overwrite what
-        # the exporter wrote and make `--check` meaningless.
+        # **Generated by `scripts/export_timing_ocp.py`, not here.** Loads a built
+        # tree; builds one on first construction, costing minutes. Regenerating
+        # unconditionally would overwrite the exporter's output and make `--check`
+        # meaningless.
         tree = CACHE / SOLVER_NAME
         library = tree / f"libacados_ocp_solver_{SOLVER_NAME}.so"
         fresh = not library.is_file()
@@ -427,9 +456,17 @@ class TrajectoryOcp:
             ]
         )
         if status != 0:
+            # The residuals are the whole diagnosis of a non-convergence -- which
+            # of the four stalled says whether it is the dynamics, the goal box or
+            # a soft row -- and this is the one path where no `Trajectory` is
+            # built to carry them, so they go in the message instead.
+            stat, eq, ineq, comp = np.asarray(
+                solver.get_stats("residuals"), dtype=float
+            )
             raise PlanningError(
                 f"the trajectory OCP did not converge: acados status {status} after "
-                f"{solver.get_stats('sqp_iter')} iterations, {elapsed:.2f} s"
+                f"{solver.get_stats('sqp_iter')} iterations, {elapsed:.2f} s, on "
+                f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}"
             )
         return Trajectory(
             time=np.linspace(0.0, duration, N + 1),
@@ -447,4 +484,6 @@ class TrajectoryOcp:
             slack=slack,
             iterations=int(solver.get_stats("sqp_iter")),
             solve_time_s=elapsed,
+            acados_time_s=float(solver.get_stats("time_tot")),
+            residuals=np.asarray(solver.get_stats("residuals"), dtype=float),
         )

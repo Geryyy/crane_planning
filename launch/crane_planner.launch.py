@@ -9,7 +9,6 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description() -> LaunchDescription:
-    tool = LaunchConfiguration("tool")
     use_sim_time = LaunchConfiguration("use_sim_time")
     parameter_file = LaunchConfiguration("parameter_file")
     joint_states_topic = LaunchConfiguration("joint_states_topic")
@@ -22,12 +21,6 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument(
-                "tool",
-                default_value="pzs100",
-                choices=["pzs100", "epsilon7040"],
-                description="Mounted crane tool used by the planner",
-            ),
             DeclareLaunchArgument(
                 "use_sim_time",
                 default_value="false",
@@ -53,7 +46,7 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     parameter_file,
-                    {"tool": tool, "use_sim_time": use_sim_time},
+                    {"use_sim_time": use_sim_time},
                 ],
                 remappings=[("/joint_states", joint_states_topic)],
             ),

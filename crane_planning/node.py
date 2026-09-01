@@ -1,17 +1,17 @@
 """
 The `crane_planner` node: `/a2b_movement`, and the reference it answered with.
 
-It is **not a second writer of the machine**. `crane_velocity_controller` is the
-sole claimant of the six velocity command interfaces and which controller holds
-that claim is the supervisor's decision alone, so this node publishes a
-*reference* and not a command, holds no `controller_manager` client of any kind,
-and is composed beside the manager rather than loaded into it.
+**Not a second writer of the machine.** `crane_velocity_controller` is the sole
+claimant of the six velocity command interfaces, and which controller holds that
+claim is the supervisor's decision alone. So this node publishes a *reference*,
+holds no `controller_manager` client, and is composed beside the manager rather
+than loaded into it.
 
 Every name below is an absolute cross-node contract except `/robot_description`,
-which a deployment remaps: the description composition publishes several and the
-profile decides which one this stack runs on. A planner that solved the
-kinematics of a different description from the one the controllers were
-configured against would place the tool of a different crane.
+which a deployment remaps -- the description composition publishes several and
+the profile picks one. A planner solving the kinematics of a different
+description from the one the controllers were configured against would place the
+tool of a different crane.
 """
 
 from __future__ import annotations
@@ -160,14 +160,12 @@ class CranePlanner(Node):
         """
         Declare every knob `config/crane_planner.yaml` carries.
 
-        The machine's own numbers -- how far and how fast each joint may go --
-        are deliberately absent: they are read out of the description the
-        profile remaps this node onto, because a limit written down beside a
-        node is a limit that drifts away from the description every controller
-        in the same deployment was configured against.
+        The machine's numbers -- how far and how fast each joint may go -- are
+        deliberately absent, read from the description instead: a limit written
+        beside a node drifts away from the description every controller in the
+        same deployment was configured against.
         """
         defaults = PlannerConfig()
-        self.declare_parameter("tool", defaults.tool.value)
         for name in (
             "kappa",
             "eps_pos",
@@ -203,6 +201,7 @@ class CranePlanner(Node):
             "visualization_samples",
         ):
             self.declare_parameter(name, int(getattr(defaults, name)))
+        self.declare_parameter("ocp_integrator", str(defaults.ocp_integrator))
         for name in (
             "q_sway_max",
             "terminal_q_sway_max",
@@ -230,10 +229,10 @@ class CranePlanner(Node):
         """
         Read the cost weights once, and check them once.
 
-        `weights.matrices` is called here and its answer thrown away on purpose:
-        a width that does not match the residual, or a negative price, is a
-        configuration error, and construction is where it should be reported
-        rather than on the first plan a caller asks for.
+        `weights.matrices` is called and its answer discarded on purpose: a width
+        that does not match the residual, or a negative price, is a configuration
+        error and belongs at construction, not on the first plan a caller asks
+        for.
         """
         weights = {
             name: self.get_parameter(f"weights.{name}").value
@@ -243,9 +242,9 @@ class CranePlanner(Node):
         return weights
 
     def _config(self) -> PlannerConfig:
-        config = PlannerConfig(tool=Tool(self.get_parameter("tool").value))
+        config = PlannerConfig()
         for field in vars(config):
-            if field == "tool" or not self.has_parameter(field):
+            if not self.has_parameter(field):
                 continue
             value = self.get_parameter(field).value
             setattr(
@@ -268,17 +267,16 @@ class CranePlanner(Node):
             self.planner = None
             self.get_logger().error(f"the robot description was refused: {failure}")
             return
-        self.joint_names = list(canonical_joints(self.planner.config.tool))
-        self.get_logger().info(f"planning for {self.planner.config.tool.value}")
+        self.joint_names = list(canonical_joints(Tool.PZS100))
+        self.get_logger().info(f"planning for {Tool.PZS100.value}")
 
     def _joint_states(self, message: JointState) -> None:
         """
         Keep the recent messages; which is which is decided when they are read.
 
-        `/joint_states` comes from `joint_state_broadcaster`, actuated and
-        passive joints alike. Which joint is which still needs the joint names,
-        which come from the description -- so routing here would silently drop
-        every state that arrived before it.
+        `/joint_states` carries actuated and passive joints alike, but telling
+        them apart needs the joint names, which come from the description --
+        routing here would silently drop every state that arrived before it.
         """
         self.joint_states.append(message)
 
@@ -432,15 +430,14 @@ class CranePlanner(Node):
         """
         Answer the retained `a2b_movement` contract over the same planner.
 
-        Nothing here plans: `crane_planning.a2b` maps the request onto
-        `Planner.plan` and this runs it. It is the node's only service -- the
-        native `/crane/plan_motion` had no caller anywhere in the workspace and
-        was removed -- so this is also the only path that publishes
+        Nothing here plans: `a2b` maps the request onto `Planner.plan`, this runs
+        it. The node's only service -- the native `/crane/plan_motion` had no
+        caller and was removed -- so also the only path publishing
         `/crane/reference`.
 
-        `CalcMovement.Response` has **no message field**, so a refusal cannot
-        say why in the answer. It goes to the log, and the trajectory is left
-        empty, exactly as the legacy server left it.
+        `CalcMovement.Response` has **no message field**, so a refusal cannot say
+        why. It goes to the log and the trajectory is left empty, as the legacy
+        server left it.
         """
         response.success = False
         response.trajectory = JointTrajectory()
@@ -541,13 +538,12 @@ class CranePlanner(Node):
         """
         Build a trajectory over `indices` of the canonical eight.
 
-        Two callers want two widths, and the difference is not cosmetic. The
-        native reference carries the **actuated six**, which is what
-        `crane_velocity_controller` claims. The retained `a2b_movement` answer
-        carries the **canonical eight**, because the trajectory controller that
-        consumes it is configured with the passive tip and tilt joints as state
-        -- it commands six and tracks eight, and a goal naming only six is a
-        goal it rejects.
+        Two callers, two widths, and the difference is not cosmetic. The native
+        reference carries the **actuated six**, what `crane_velocity_controller`
+        claims. The `a2b_movement` answer carries the **canonical eight**: the
+        trajectory controller consuming it lists the passive tip and tilt joints
+        as state -- it commands six and tracks eight -- so a six-wide goal is
+        rejected.
 
         `header.frame_id` is empty on purpose: joint space has no frame.
         """

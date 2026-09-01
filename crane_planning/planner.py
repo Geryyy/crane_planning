@@ -1,21 +1,18 @@
 """
 Plan a motion, and time it.
 
-Two stages. The tool centre point runs a straight line from where it is to where
-the goal asks for it; every sample of that line is lifted into the five planned
-joint coordinates by inverse kinematics, and the whole machine is checked there.
-A bounded shaped-duration search simulates the passive dynamics and certifies how
-fast the machine may traverse the result.
+Two stages. `geometry` walks a bounded family of TCP corridors, lifts one into
+joint space and certifies the fitted curve; `ocp` is handed that curve's
+endpoints and solves for the time-optimal way between them.
 
 Everything the machine can do -- reach, hang, collide -- is asked of
 `crane_model`; nothing about the machine is written down here.
 
 The passive pair (tip/tilt sway) is never searched over. Where it hangs is a
-closed form -- `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, which
-`crane_mpc/src/mpc_node.cpp` measured to 1e-4 rad across the workspace and found
-independent of slew, telescope, rotator, tool and payload -- and it is a *state*
-of the timing rollout, so the answer is a trajectory the tool arrives nearly
-still from.
+closed form, `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, good to 1e-4 rad across the
+workspace and independent of slew, telescope, rotator, tool and payload. It is a
+*state* of the OCP, so the answer is a trajectory the tool arrives nearly still
+from.
 """
 
 from __future__ import annotations
@@ -32,6 +29,7 @@ from crane_model import (
     CraneModel,
     Frame,
     Payload,
+    Tool,
 )
 from crane_model import symbolic as symbolic_model
 
@@ -43,7 +41,6 @@ from . import weights as crane_weights
 from .config import (
     ARM_AXIS,
     BOOM_AXIS,
-    PATH_BLOCK,
     PLANNED_DOF,
     PLANNED_FRAMES,
     PLANNED_INDICES,
@@ -64,11 +61,9 @@ from .geometry import (
     cartesian_candidates,
     expand_truck,
     fit,
-    lift,
     lift_candidate,
     payload_primitive,
     plan_fitted_path,
-    plan_geometric_path,
     solve_ik,
     wrap,
     yaw_of,
@@ -127,10 +122,10 @@ class Plan:
 
 class Planner:
     """
-    One description, one tool, one set of limits, many requests.
+    One description, one set of limits, many requests.
 
-    Built once from the robot description -- parsing it and constructing the
-    vectorized dynamics rollout both happen here, not per request.
+    Built once: parsing the description and exporting the OCP solver both happen
+    here, not per request.
     """
 
     def __init__(
@@ -140,10 +135,9 @@ class Planner:
         weights: dict | None = None,
     ):
         self.config = config or PlannerConfig()
-        self.model = CraneModel(robot_description_xml, self.config.tool)
+        self.model = CraneModel(robot_description_xml, Tool.PZS100)
         self.limits = read_limits(
             robot_description_xml,
-            self.config.tool,
             self.config.pump_flow_max,
             self.config.pump_flow_planning_factor,
         )
@@ -168,9 +162,9 @@ class Planner:
         """
         Answer a placement goal in `K0_mounting_base` with a timed trajectory.
 
-        The stages refuse; they do not degrade. A goal that cannot be reached, a
-        straight tool path that is blocked or does not resolve, and a path that
-        cannot be timed are three different answers, and each one names itself.
+        Stages refuse, they do not degrade: unreachable goal, no corridor
+        surviving its certificate, and untimeable path are three answers and each
+        names itself.
         """
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
@@ -193,13 +187,11 @@ class Planner:
             payload_shape if avoid_collisions else None,
         )
 
-        # Is the goal pose reachable at all? This solve is cold and spreads its
-        # restarts over the telescope range, which is the coordinate the residual
-        # is flat in -- so it answers "no configuration reaches this" cheaply and
-        # with the miss in millimetres. The configuration it returns is
-        # deliberately **not** kept: which point of the redundant family the arm
-        # ends at is decided by marching there from the start, and pinning an
-        # independently chosen one is a discontinuity no refinement can close.
+        # Reachable at all? Cold solve, restarts spread over the telescope range
+        # -- the coordinate the residual is flat in. Its configuration is
+        # deliberately discarded: which member of the redundant family the arm
+        # ends at is decided by marching there, and pinning an independently
+        # chosen one is a discontinuity no refinement closes.
         solve_ik(
             geometry,
             self.limits,
@@ -216,7 +208,7 @@ class Planner:
                 f"{geometry.required:.3f} m this plan requires"
             )
 
-        path, sigma_dot_start, lifted, candidate_name = plan_fitted_path(
+        path, lifted, candidate_name = plan_fitted_path(
             geometry,
             self.limits,
             self.config,
@@ -244,9 +236,8 @@ class Planner:
                 "is no plan that starts from it"
             )
 
-        # The OCP is handed the geometric stage's endpoints and nothing else: it
-        # is free to move between them however the dynamics prefer, which is where
-        # its speed comes from and why the corridor is still owed.
+        # Endpoints and nothing else. Free to move between them however the
+        # dynamics prefer -- where the speed comes from, why the corridor is owed.
         timing = self.ocp.solve(
             q_a_start=start.q_a,
             q_a_goal=path.position(1.0),
@@ -310,13 +301,12 @@ class Planner:
         """
         Return the static bodies this plan is checked against.
 
-        Not the same list the request carried: the reserved `truck` primitive has
-        become a bed, six runges and a headboard by the time the planner looks at
-        it, and that is invisible to anyone who only sees the scene topic. This
-        is a method and not a private step because the node draws it, and a
-        refusal is far easier to read beside the geometry that caused it.
+        Not the list the request carried: `truck` has become a bed, six runges and
+        a headboard, invisible to anyone watching the scene topic. Public because
+        the node draws it -- a refusal reads far better beside the geometry that
+        caused it.
 
-        What the tool carries is **not** here. It moves, so it is placed at each
+        What the tool carries is **not** here: it moves, so it is placed at each
         configuration checked rather than pinned to the scene once.
         """
         if not avoid_collisions:
@@ -348,22 +338,18 @@ class Planner:
         """
         Where the tool hangs relative to the tip pivot K5, for one yaw.
 
-        The retained `a2b_movement` goal names the pivot and the native goal names
-        the tool, so the adapter needs the vector between them. It is read out of
-        the model at the hanging equilibrium and never written down: the PZS100's
-        rail gripper and the 7040's jaw do not hang at the same offset.
+        `a2b_movement` names the pivot, the native goal names the tool, so the
+        adapter needs the vector between. Read from the model at the hanging
+        equilibrium, never written down.
 
-        The two passive joints make the settled offset independent of the boom and
-        telescope pose -- once the pendulum is settled, only rotation about gravity
-        moves this vector. So the description's own yaw convention is measured at a
-        canonical pose, the slew is turned by the difference, the pendulum is
-        settled again, and the result is *checked* to carry the requested yaw
-        rather than assumed to.
+        The passive pair makes the settled offset independent of boom and
+        telescope pose: once settled, only rotation about gravity moves it. So
+        measure the description's yaw at a canonical pose, turn the slew by the
+        difference, settle again, and *check* the result carries the requested
+        yaw.
 
-        `payload` no longer enters it: the hanging pose is a closed form in the
-        boom and arm angles alone, which is what `crane_mpc` measured it to be.
-        The argument is kept so the adapter's call site stays honest about what it
-        is asking for.
+        `payload` does not enter it -- the hanging pose is closed form in boom and
+        arm angles alone. The argument is kept so the call site stays honest.
         """
         if not (np.isfinite(yaw) and np.isfinite(q_tool)):
             raise PlanningError(
@@ -405,11 +391,11 @@ class Planner:
         """
         Put the answer on the emitted reference's own clock.
 
-        The OCP solves on a uniform grid over its own horizon and the consumer
-        reads at `Ts`, so every row is interpolated against elapsed time. The
-        passive pair is carried as the OCP **planned** it rather than as the pose
-        the tool would settle to: on the way to the goal the tool is swinging, and
-        that is what the trajectory claims.
+        The OCP solves on a uniform grid over its own horizon, the consumer reads
+        at `Ts`, so every row is interpolated against elapsed time. The passive
+        pair is carried as the OCP **planned** it, not as the pose the tool would
+        settle to: on the way to the goal the tool is swinging, and that is what
+        the trajectory claims.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
@@ -483,7 +469,6 @@ __all__ = [
     "Geometry",
     "Limits",
     "PASSIVE_INDICES",
-    "PATH_BLOCK",
     "PAYLOAD_ID",
     "PLANNED_DOF",
     "PLANNED_FRAMES",
@@ -502,14 +487,12 @@ __all__ = [
     "cartesian_candidates",
     "expand_truck",
     "fit",
-    "lift",
     "lift_candidate",
     "passive_equilibrium",
     "payload_parameters",
     "payload_primitive",
     "pin",
     "plan_fitted_path",
-    "plan_geometric_path",
     "read_limits",
     "solve_ik",
     "wrap",

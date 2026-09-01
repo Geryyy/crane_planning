@@ -1,9 +1,9 @@
 """
 What a plan is written in: coordinates, limits and preferences.
 
-The machine's own numbers, the solve's own numbers, and the canonical indices
-both are indexed by. Imported by every other module here and importing none of
-them, which is what keeps `geometry` and `timing` from knowing about each other.
+The machine's numbers, the solve's numbers, and the canonical indices both are
+indexed by. Imported by every other module here and importing none of them,
+which is what keeps `geometry` and `ocp` from knowing about each other.
 """
 
 from __future__ import annotations
@@ -30,20 +30,15 @@ PLANNED_FRAMES = (
 )
 TELESCOPE_AXIS = 3
 
-#: Metres of tip travel per metre of `q4`. **Two, not one.** `q4` is stage-1
-#: travel and `q5_small_telescope` mimics it at multiplier 1, so a chain couples
-#: the second stage and the tip advances `2 q4` -- `wiki/nomenclature.md` 4. A
-#: step bound built on 1.0 lets a telescope-dominated segment move the tool
-#: twice as far as it is checked for, which is the whole margin.
+#: Metres of tip travel per metre of `q4`. **Two, not one:** `q4` is stage-1
+#: travel and `q5_small_telescope` mimics it at multiplier 1, so the tip advances
+#: `2 q4`. A step bound built on 1.0 lets a telescope-dominated segment move the
+#: tool twice as far as it is checked for, which is the whole margin.
 TELESCOPE_TRAVEL_PER_UNIT = 2.0
 
-#: `q_a | q_a' | q_a'' | q8` -- what the OCP needs to know about the path at one
-#: value of sigma, and the only thing it is told about it.
-PATH_BLOCK = 3 * PLANNED_DOF + 1
-
-#: Where the adaptive march starts, and the step at which it gives up. The
-#: first is only a guess -- it halves on the first violation and grows back
-#: over a clear run -- and the second is what a branch change runs into.
+#: Where the adaptive march starts and where it gives up. The first is a guess --
+#: it halves on violation, grows back over a clear run. The second is what an IK
+#: branch change runs into.
 INITIAL_LIFT_STEP = 1.0 / 32.0
 MIN_LIFT_STEP = 1.0e-6
 
@@ -76,7 +71,6 @@ class Limits:
 
 def read_limits(
     description_xml: str,
-    tool: Tool,
     pump_flow_max: float,
     pump_flow_planning_factor: float,
 ) -> Limits:
@@ -94,7 +88,7 @@ def read_limits(
     effort term is divided by, so that `tau_weight` means "a fraction of rated
     effort" on every axis alike.
     """
-    description = parse(description_xml, tool)
+    description = parse(description_xml, Tool.PZS100)
     inner = description.model
     lower = np.empty(PLANNED_DOF)
     upper = np.empty(PLANNED_DOF)
@@ -145,8 +139,6 @@ def read_limits(
 class PlannerConfig:
     """Properties of the solve. Machine numbers are not among them."""
 
-    tool: Tool = Tool.PZS100
-
     # Reservation held back from every physical limit so the controller has
     # authority left to correct with.
     kappa: float = 0.8
@@ -159,10 +151,9 @@ class PlannerConfig:
 
     # --- what "clear" means, in metres ---------------------------------------
     #
-    # The three-way split of the margin. `margin_safety` is the clearance an
-    # answer actually carries; `margin_interp` is what pays for the gap between
-    # two checked configurations; the swing envelope is computed, not configured.
-    # Each is spent once. See `Geometry`.
+    # The margin's three-way split, each part spent once: `margin_safety` is the
+    # clearance the answer carries, `margin_interp` pays for the gap between two
+    # checked configurations, the swing envelope is computed. See `Geometry`.
     margin_safety: float = 0.05
     margin_interp: float = 0.10
     #: How far the tool's collision geometry reaches past the tool centre point.
@@ -182,11 +173,9 @@ class PlannerConfig:
 
     q_sway_max: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2]))
 
-    #: How many cubic segments the path is fitted with, whatever the sample
-    #: count. This is the dial that decouples the two things the old
-    #: interpolating fit welded together: the collision certificate wants
-    #: samples dense, and the curve wants its end intervals long. Approximating
-    #: with far fewer control points than samples gives both.
+    #: Cubic segments in the fitted path, whatever the sample count. Decouples
+    #: the two things interpolation welds together: the certificate wants samples
+    #: dense, the curve wants its end intervals long.
     path_segments: int = 12
 
     # --- the trajectory OCP ---------------------------------------------------
@@ -197,13 +186,18 @@ class PlannerConfig:
     # what actually limits the answer is the duration box below.
     ocp_intervals: int = 40
     ocp_horizon: float = 7.0
+    #: `ERK` or `IRK`, see `ocp.INTEGRATORS`. Both order 4. ERK4 is the cheap
+    #: default and is accurate at the durations the solve actually lands on;
+    #: IRK is Gauss-Legendre, symplectic, and does not damp the swing at the
+    #: long end of the duration box where ERK4 does.
+    ocp_integrator: str = "ERK"
     ocp_duration_min: float = 2.0
     ocp_duration_max: float = 20.0
     ocp_max_iterations: int = 60
-    #: acados' own default is 1e-6 on all four residuals, which is a control-loop
-    #: number: this answer is resampled onto a 25 Hz reference and tracked by a
-    #: controller that closes the loop on it, so the last two decades buy a plan
-    #: nothing and cost it every remaining iteration.
+    #: acados defaults to 1e-6 on all four residuals, a control-loop number. This
+    #: answer is resampled onto a 25 Hz reference and tracked by a controller that
+    #: closes the loop on it, so the last two decades buy nothing and cost every
+    #: remaining iteration.
     ocp_tolerance: float = 1.0e-4
     levenberg_marquardt: float = 1.0e-6
     #: The `L1` price on every soft row -- sway, the pump, the settled box. Linear
@@ -249,14 +243,11 @@ def passive_equilibrium(q_a: np.ndarray) -> np.ndarray:
     """
     Where the tool hangs, in closed form.
 
-    A two-hinge pendulum under gravity hangs straight down, so the tip joint
-    takes up whatever the boom four-bar accumulated and the tilt joint does not
-    move at all. `crane_mpc/src/mpc_node.cpp` measured this against the general
-    5x5-grid-plus-Newton solve and found it good to 1e-4 rad across the
-    workspace, and independent of slew, telescope, rotator, tool and payload --
-    against a sway box half-width of 0.2 rad.
-
-    That solve costs 22.6 ms and this costs two subtractions, which is what makes
-    it affordable to settle the pendulum at every configuration the lift checks.
+    A two-hinge pendulum hangs straight down: the tip joint takes up whatever the
+    boom four-bar accumulated, the tilt joint does not move. Good to 1e-4 rad
+    across the workspace against the general grid-plus-Newton solve it replaces,
+    and independent of slew, telescope, rotator, tool and payload. 22.6 ms
+    against two subtractions -- which is what makes settling the pendulum at
+    every configuration the lift checks affordable.
     """
     return np.array([0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi])

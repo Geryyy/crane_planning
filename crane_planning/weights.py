@@ -1,21 +1,20 @@
 """
 The trajectory OCP's cost weights, and the row layout they sit on.
 
-One place, because three things have to agree about it: `scripts/export_timing_ocp.py`
-bakes these as the generated solver's defaults, the node writes them onto that
-solver at construction from its own ROS parameters, and anything reading a
-residual back has to know which row is which.
+One place, because three things must agree: `export_timing_ocp.py` bakes these as
+the solver's defaults, the node writes its own ROS parameters onto that solver at
+construction, and anything reading a residual back needs to know which row is
+which.
 
 `W` is a **runtime cost field**, not an acados parameter. Parameters carry values
-that enter the model *expressions* -- the dynamics and the constraint rows -- and
-are copied onto every stage before every solve. Weights enter through `W`, which
-is set once when the solver is built, so putting them in `p` would pay per-stage
-copies for numbers that never change within a run.
+entering the model *expressions* and are copied onto every stage before every
+solve; `W` is set once when the solver is built, so putting weights in `p` would
+pay per-stage copies for numbers that never change within a run.
 
-Every residual row is dimensionless: the exporter divides each by the limit it is
-measured against, so a row reads 1.0 at its bound. A weight here is therefore a
-statement of preference and nothing else, and 1.0 everywhere is the honest
-default -- one bound violated costs the same wherever it happens.
+Every residual row is dimensionless -- the exporter divides each by the limit it
+is measured against, so 1.0 is the bound. A weight is preference and nothing
+else, and 1.0 everywhere is the honest default: one bound violated costs the same
+wherever it happens.
 """
 
 from __future__ import annotations
