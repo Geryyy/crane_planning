@@ -40,6 +40,7 @@ from visualization_msgs.msg import MarkerArray
 from timber_crane_planning_interfaces.srv import CalcMovement
 
 from . import markers as viz
+from . import weights as crane_weights
 from .a2b import (
     A2B_MOVEMENT_SERVICE,
     translate_payload,
@@ -112,6 +113,8 @@ class CranePlanner(Node):
     def __init__(self) -> None:
         super().__init__("crane_planner")
         self._declare()
+        #: The OCP's cost weights, read and checked at construction.
+        self.weights = self._weights()
         self.planner: Planner | None = None
         # Both producers land here and are routed when they are read, not when
         # they arrive: the description is what says which joint name is which,
@@ -185,6 +188,8 @@ class CranePlanner(Node):
             "sigma_accel_max",
             "max_wall_clock",
             "tolerance",
+            "duration_step",
+            "max_duration",
             "pump_flow_max",
             "pump_flow_planning_factor",
             "Ts",
@@ -201,6 +206,8 @@ class CranePlanner(Node):
             "path_segments",
             "intervals",
             "max_iterations",
+            "timing_samples",
+            "visualization_samples",
         ):
             self.declare_parameter(name, int(getattr(defaults, name)))
         for name in (
@@ -215,10 +222,32 @@ class CranePlanner(Node):
             self.declare_parameter(
                 name, [float(value) for value in getattr(defaults, name)]
             )
+        # The OCP's cost weights, nested under `weights` as the yaml writes them.
+        # Every residual row is dimensionless, so these are preferences and a
+        # scalar sets a whole block; `weights.time` prices the horizon row and is
+        # the minimum-time objective.
+        for name, value in crane_weights.DEFAULTS.items():
+            self.declare_parameter(f"weights.{name}", float(value))
         self.declare_parameter("max_input_age", 0.5)
         self.declare_parameter("max_scene_age", 10.0)
         self.declare_parameter("pendulum_state_deadline", 0.15)
         self.declare_parameter("payload_estimate_deadline", 1.0)
+
+    def _weights(self) -> dict:
+        """
+        Read the cost weights once, and check them once.
+
+        `weights.matrices` is called here and its answer thrown away on purpose:
+        a width that does not match the residual, or a negative price, is a
+        configuration error, and construction is where it should be reported
+        rather than on the first plan a caller asks for.
+        """
+        weights = {
+            name: self.get_parameter(f"weights.{name}").value
+            for name in crane_weights.DEFAULTS
+        }
+        crane_weights.matrices(weights)
+        return weights
 
     def _config(self) -> PlannerConfig:
         config = PlannerConfig(tool=Tool(self.get_parameter("tool").value))

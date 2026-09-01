@@ -83,7 +83,7 @@ crane_planner:
     corridor_lateral_samples: 2
 
     # **The admissible sway bound, and this is where it lives.** The swing
-    # envelope above is derived from it, and it is the state box the timing OCP
+    # envelope above is derived from it, and it is the state box the timing rollout
     # holds the pendulum inside. A design value: 0.2 rad is half a metre of tool
     # travel on a 2.5 m pendulum.
     q_sway_max: [0.2, 0.2]
@@ -124,71 +124,83 @@ crane_planner:
     # at rest in q_a and that flattening has to happen somewhere. An
     # interpolating fit ties the two together and squeezes the clamp into a
     # sliver of sigma -- measured |q_a''| of 361 at sigma = 0 against 0.4 across
-    # the interior, which the timing OCP reads at its first node and refuses.
+    # the interior, which any dynamic timing stage reads as an acceleration spike.
     # Approximating with far fewer control points than samples gives both, and
     # stops the fit chasing inverse-kinematics noise between neighbours.
     path_segments: 12
 
-    # --- the timing OCP ------------------------------------------------------
-    #
-    # One NLP over the path parameter, not over time. Minimising traversal time
-    # is minimising the integral of dsigma/sigma_dot, so the end time is free --
-    # that integral *is* the end time. The sway is a *state* of the problem
-    # rather than something checked afterwards.
-    #
-    # `intervals` is the whole cost/accuracy dial: the problem is 6*N + 1
-    # variables and the pump row is evaluated at every node.
-    intervals: 40
-    # Traversal time against how much the tool swings on the way.
-    sway_weight: 2.0
-    # **Effort, priced and not bounded.** `tau_a` is the actuated generalized
-    # force of robot_model.md 3.3, normalised per request by what the same path
-    # costs to *hold* -- so this weight is dimensionless and prices the dynamic
-    # effort a fast traversal adds on top of the pose's own gravity load. It is
-    # what carries the machine's inertia into the answer.
-    #
-    # It replaces a hard cylinder-force constraint whose limit was the smaller
-    # chamber area times a relief pressure **nothing in this workspace has ever
-    # measured**. The consequence is deliberate and is the trade: this planner
-    # no longer refuses a move it cannot lift. It plans it, and the machine
-    # stalls on it. Restoring a real bound needs a reading off the power pack or
-    # the identification campaign of hydraulics.md 5.8 -- both human-only.
-    tau_weight: 0.1
-    input_weight: 0.001
-    # **Terminal sway, as a cost.** One control -- the rate along a path the OCP
-    # may not leave -- cannot in general drive four terminal quantities to zero,
-    # and asking for it as a hard equality is what turns a slow answer into
-    # `Infeasible_Problem_Detected`. Normalised by the admissible box, so this
-    # is a multiple of "the whole allowance" and the answer reports the residual
-    # in degrees. Raise it to arrive stiller and later.
-    terminal_sway_weight: 200.0
-    # A terminal cost is useful only if its result is judged. These are the
-    # acceptance bounds: roughly the placement-scale 0.02 rad swing and the
-    # supervisor's 0.04 rad/s settled-rate design value. A converged solve over
-    # either one is refused rather than published as a low-sway trajectory.
+    # --- shaped timing -------------------------------------------------------
+    # A C2 rest-to-rest time law is simulated through the full passive dynamics.
+    # Every candidate uses this many RK4 samples; CasADi evaluates the rollout
+    # and actuator-demand rows as vectorized functions.
+    timing_samples: 120
+    # Search duration in bounded increments. One second is deliberate: it keeps
+    # the common request below two seconds and still samples different pendulum
+    # phases. No candidate beyond max_duration is published.
+    duration_step: 1.0
+    max_duration: 30.0
+    # The result must arrive inside both hard settled-state bounds.
     terminal_q_sway_max: [0.02, 0.02]
     terminal_dq_sway_max: [0.04, 0.04]
-    # The pump row carries L1 slack for the same reason. A move needing a few
-    # percent more flow than the reservation allows should come back slower and
-    # say so in its message, not come back as a refusal.
-    flow_slack_weight: 1000.0
-    # Numerical, not physical: the objective divides by sigma_dot, and at the
-    # endpoints the path is at rest in q_a so nothing else bounds it.
-    sigma_rate_min: 0.02
-    sigma_rate_max: 2.0
-    sigma_accel_max: 20.0
     # rad/s and rad/s^2. The sway rate is control_architecture's own bound; the
     # joint accelerations are a comfort limit the description does not carry.
     dq_sway_max: [1.0, 0.5]
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
-    # Kept below the A2B caller's service timeout after reserving time for IK,
-    # collision certification and output construction.
-    max_wall_clock: 6.0
-    max_iterations: 400
-    tolerance: 1.0e-6
+    # Visualization is not the control reference. Bound authoritative FK calls
+    # while the full JointTrajectory remains at 25 Hz.
+    visualization_samples: 25
 
     # The emitted reference: 25 Hz, the rate the horizon is consumed at.
     Ts: 0.04
+
+    # --- the trajectory OCP --------------------------------------------------
+    #
+    # The generated acados solver `scripts/export_timing_ocp.py` writes. The
+    # problem is posed on normalised time over [0, 1] and solves for its own
+    # horizon, so nothing here is a duration except `ocp_horizon`, which is a
+    # scaling.
+    #
+    # 40 shooting intervals over the horizon is deliberately coarser than the
+    # emitted `Ts`: the answer is resampled onto the 25 Hz reference afterwards,
+    # so solver resolution and reference resolution are independent, and what the
+    # sway rows need is an interval near a fifth of the pendulum period rather
+    # than a fortieth.
+    ocp_intervals: 40
+    # The horizon the solver's `theta` is measured in: `T = theta * ocp_horizon`.
+    # It is a scaling, not a bound -- `theta`'s box is what limits `T` -- and it
+    # exists so the horizon enters the Jacobian at the same magnitude as every
+    # other state instead of an order of magnitude above them.
+    ocp_horizon: 7.0
+    # --- the cost, as preference alone ---------------------------------------
+    #
+    # Every residual row is divided by the limit it is measured against, so a row
+    # reads 1.0 at its bound and these are preferences rather than unit
+    # conversions. 1.0 everywhere is the honest default: one bound violated costs
+    # the same wherever it happens. A scalar sets a whole block.
+    #
+    # `time` is the odd one out and is a **ceiling, not a preference**: it prices
+    # the terminal horizon row, which is the whole minimum-time objective. 0.3
+    # lands the answer at 0.91 of the pump reservation in 17 iterations; above it
+    # the solve asks for more flow than the pump can deliver and stops
+    # converging, which is the regime whose honest answer is "no such plan".
+    weights:
+      dq_a: 1.0
+      sway: 1.0
+      dq_u: 1.0
+      dynamic_tau: 1.0
+      u: 1.0
+      terminal_scale: 1.0
+      time: 0.3
+    ocp_max_iterations: 60
+    # What the SQP stops at. acados' own default is 1e-6 on all four residuals,
+    # which is a control-loop number: the answer here is resampled onto the 25 Hz
+    # reference and tracked by a controller that closes the loop on it, so the
+    # last two decades buy a plan nothing. They cost it plenty -- a horizon that
+    # settles just the wrong side of 1e-6 spends every remaining iteration
+    # failing to halve it.
+    ocp_tolerance: 1.0e-4
+    # acados adds this identically on every iteration; it is not adaptive.
+    levenberg_marquardt: 1.0e-6
 
     # --- freshness -----------------------------------------------------------
     #
