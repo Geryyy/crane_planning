@@ -267,7 +267,7 @@ class CranePlanner(Node):
             self.planner = None
             self.get_logger().error(f"the robot description was refused: {failure}")
             return
-        self.joint_names = list(canonical_joints(Tool.PZS100))
+        self.joint_names = list(canonical_joints())
         self.get_logger().info(f"planning for {Tool.PZS100.value}")
 
     def _joint_states(self, message: JointState) -> None:
