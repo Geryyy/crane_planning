@@ -4,6 +4,7 @@ import numpy as np
 import pinocchio as pin
 import pytest
 from crane_model.collision import CollisionPrimitive
+from crane_planning import geometry as geometry_stage
 from crane_planning import planner as planning
 
 
@@ -41,9 +42,7 @@ class FakeGeometry:
         return np.asarray(q_a[:3], dtype=float), float(q_a[3])
 
     def is_valid(self, q_a):
-        return not (
-            self.blocked and abs(float(q_a[0])) < 0.2 and float(q_a[2]) < 0.45
-        )
+        return not (self.blocked and abs(float(q_a[0])) < 0.2 and float(q_a[2]) < 0.45)
 
     def clearance(self, q_a):
         return 1.0 if self.is_valid(q_a) else 0.0
@@ -58,7 +57,7 @@ def identity_ik(monkeypatch):
         assert restarts == 1
         return np.array([position[0], position[1], position[2], yaw, 0.0])
 
-    monkeypatch.setattr(planning, "solve_ik", solve)
+    monkeypatch.setattr(geometry_stage, "solve_ik", solve)
 
 
 def config() -> planning.PlannerConfig:
@@ -98,11 +97,11 @@ def test_smoothing_failure_advances_to_the_next_candidate(monkeypatch):
     checks = 0
 
     monkeypatch.setattr(
-        planning,
+        geometry_stage,
         "lift_candidate",
         lambda *_args: np.array([start, [1.0, 0.0, 0.0, 0.0, 0.0]]),
     )
-    monkeypatch.setattr(planning, "fit", lambda *_args: (object(), None))
+    monkeypatch.setattr(geometry_stage, "fit", lambda *_args: (object(), None))
 
     def check_path(_path):
         nonlocal checks

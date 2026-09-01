@@ -97,9 +97,9 @@ def test_every_post_the_description_stands_is_inside_a_runge():
                     POST_Z[1],
                 ]
             )
-            assert any(
-                envelops(runge, lower, upper) for runge in runges
-            ), f"no runge covers the post at x={x}, y={side * POST_CENTRE_Y}"
+            assert any(envelops(runge, lower, upper) for runge in runges), (
+                f"no runge covers the post at x={x}, y={side * POST_CENTRE_Y}"
+            )
 
 
 def test_the_headboard_closing_the_cab_end_is_an_obstacle():

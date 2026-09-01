@@ -4,11 +4,10 @@ Plan one motion offline and plot what it asks of the machine.
 
 No ROS, no graph, no clock: this runs the deployment's own `Planner` against
 the checked-in machine descriptions, so what it tunes is what the node solves.
-It exists because the timing OCP has weights, and a weight is tuned by looking
-at the profile it produces -- traversal time against sway against the actuated
-force it asks for and how close the pump comes to its limit.
+It exists so timing and clearance settings are judged from the profile they
+produce -- traversal time, sway, actuated force and pump draw.
 
-    ./scripts/plan_example.py --tool pzs100 --sway-weight 8 --show
+    ./scripts/plan_example.py --tool pzs100 --duration-step 0.5 --show
 
 The goal defaults to a joint-space target that is put through the real inverse
 kinematics as a Cartesian pose, so a run exercises every stage rather than
@@ -19,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import matplotlib
@@ -87,16 +87,11 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--payload-mass", type=float, default=0.0)
     parser.add_argument("--speed-scale", type=float, default=1.0)
 
-    tuning = parser.add_argument_group("the timing OCP")
+    tuning = parser.add_argument_group("shaped timing")
     tuning.add_argument("--kappa", type=float, default=None)
-    tuning.add_argument("--intervals", type=int, default=None)
-    tuning.add_argument("--sway-weight", type=float, default=None)
-    tuning.add_argument("--tau-weight", type=float, default=None)
-    tuning.add_argument("--terminal-sway-weight", type=float, default=None)
-    tuning.add_argument("--input-weight", type=float, default=None)
-    tuning.add_argument("--sigma-accel-max", type=float, default=None)
-    tuning.add_argument("--sigma-rate-max", type=float, default=None)
-    tuning.add_argument("--max-iterations", type=int, default=None)
+    tuning.add_argument("--timing-samples", type=int, default=None)
+    tuning.add_argument("--duration-step", type=float, default=None)
+    tuning.add_argument("--max-duration", type=float, default=None)
 
     clearance = parser.add_argument_group('what "clear" means, in metres')
     clearance.add_argument("--margin-safety", type=float, default=None)
@@ -112,14 +107,9 @@ def configure(options) -> PlannerConfig:
     config = PlannerConfig(tool=Tool(options.tool))
     for name in (
         "kappa",
-        "intervals",
-        "sway_weight",
-        "tau_weight",
-        "terminal_sway_weight",
-        "input_weight",
-        "sigma_accel_max",
-        "sigma_rate_max",
-        "max_iterations",
+        "timing_samples",
+        "duration_step",
+        "max_duration",
         "margin_safety",
         "margin_interp",
     ):
@@ -138,13 +128,12 @@ def figure(planner: Planner, plan, options):
     t = timing.time
     names = [f"q{index + 1}" for index in PLANNED_INDICES]
 
-    fig, axes = plt.subplots(4, 2, figsize=(13, 15), sharex=True)
+    fig, axes = plt.subplots(3, 2, figsize=(13, 11), sharex=True)
 
     for axis in range(len(PLANNED_INDICES)):
         axes[0, 0].plot(t, timing.q_a[:, axis], label=names[axis])
         axes[0, 1].plot(t, timing.dq_a[:, axis], label=names[axis])
         axes[1, 0].plot(t, timing.ddq_a[:, axis], label=names[axis])
-        axes[3, 0].plot(t, timing.tau[:, axis] * 1e-3, label=names[axis])
         colour = axes[0, 1].lines[-1].get_color()
         bound = config.kappa * options.speed_scale * limits.dq_max[axis]
         for sign in (1.0, -1.0):
@@ -158,18 +147,6 @@ def figure(planner: Planner, plan, options):
     axes[0, 0].set_ylabel("position [rad, m]")
     axes[0, 1].set_ylabel("velocity [rad/s, m/s]")
     axes[1, 0].set_ylabel("acceleration")
-    # No limit lines: `tau_a` is priced by the OCP's cost and not bounded, so
-    # there is no force limit left to draw it against.
-    axes[3, 0].set_ylabel(r"actuated force $\tau_a$ [kN$\,$m]")
-    axes[3, 0].set_title("priced, not bounded", fontsize=8, loc="left")
-
-    axes[1, 1].plot(t, timing.sigma_dot, label=r"$\dot\sigma$")
-    axes[1, 1].plot(t, timing.sigma_ddot, label=r"$\ddot\sigma$")
-    twin = axes[1, 1].twinx()
-    twin.plot(t, timing.sigma, color="0.6", ls="--")
-    twin.set_ylabel(r"$\sigma$", color="0.5")
-    axes[1, 1].set_ylabel("path rate")
-
     offset = timing.q_u - timing.q_u_eq
     for index, label in enumerate(("tip", "tilt")):
         axes[2, 0].plot(t, offset[:, index], label=label)
@@ -185,27 +162,29 @@ def figure(planner: Planner, plan, options):
     axes[2, 0].set_ylabel(r"sway offset $q_u - q_u^{eq}$ [rad]")
     axes[2, 1].set_ylabel("sway rate [rad/s]")
 
-    axes[3, 1].plot(t, timing.pump_flow * 1e3, color="tab:red", label="sum")
-    axes[3, 1].plot(
-        t, timing.flow_slack * 1e3, color="tab:orange", ls="--", label="slack"
+    # `pump_flow` is already a fraction of the physical pump, which is the row
+    # the OCP constrains; the reservation is what it may actually use.
+    axes[1, 1].plot(t, timing.pump_flow, color="tab:red", label="sum")
+    axes[1, 1].axhline(
+        config.kappa * limits.flow_max / config.pump_flow_max,
+        color="tab:red",
+        ls=":",
+        lw=0.7,
+        label="reservation",
     )
-    axes[3, 1].axhline(
-        config.kappa * limits.flow_max * 1e3, color="tab:red", ls=":", lw=0.7
-    )
-    axes[3, 1].set_ylabel("pump flow [L/s]")
+    axes[1, 1].set_ylabel("pump draw / physical limit")
 
     for row in axes:
         for cell in row:
             cell.grid(alpha=0.3)
             if cell.get_legend_handles_labels()[0]:
                 cell.legend(fontsize=7, ncol=3)
-    for cell in axes[3]:
+    for cell in axes[2]:
         cell.set_xlabel("time [s]")
 
     fig.suptitle(
         f"{planner.config.tool.value}: {timing.duration:.2f} s, "
-        f"{timing.iterations} IPOPT iterations in {timing.solve_time_s:.2f} s, "
-        f"sway weight {config.sway_weight}, tau weight {config.tau_weight}, "
+        f"{timing.iterations} shaped durations in {timing.solve_time_s:.2f} s, "
         f"kappa {config.kappa}; arrives "
         f"{np.degrees(timing.terminal_sway):.2f} deg off rest"
     )
@@ -252,6 +231,7 @@ def main() -> int:
     )
 
     payload = Payload(mass_kg=options.payload_mass, valid=options.payload_mass > 0.0)
+    planning_started = time.monotonic()
     try:
         plan = planner.plan(
             start,
@@ -265,11 +245,13 @@ def main() -> int:
     except PlanningError as refusal:
         print(f"refused: {refusal}")
         return 1
+    planning_elapsed = time.monotonic() - planning_started
 
     print(plan.message)
+    print(f"end-to-end planning latency {planning_elapsed:.3f} s")
     print(
         f"terminal sway {np.degrees(plan.timing.terminal_sway):.2f} deg, "
-        f"peak pump slack {max(0.0, np.max(plan.timing.flow_slack)) * 1e3:.3f} L/s"
+        f"slack {plan.timing.slack:.3f} of a soft row"
     )
     if options.csv is not None:
         header = "time_s," + ",".join(

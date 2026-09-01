@@ -129,17 +129,10 @@ crane_planner:
     # stops the fit chasing inverse-kinematics noise between neighbours.
     path_segments: 12
 
-    # --- shaped timing -------------------------------------------------------
-    # A C2 rest-to-rest time law is simulated through the full passive dynamics.
-    # Every candidate uses this many RK4 samples; CasADi evaluates the rollout
-    # and actuator-demand rows as vectorized functions.
-    timing_samples: 120
-    # Search duration in bounded increments. One second is deliberate: it keeps
-    # the common request below two seconds and still samples different pendulum
-    # phases. No candidate beyond max_duration is published.
-    duration_step: 1.0
-    max_duration: 30.0
-    # The result must arrive inside both hard settled-state bounds.
+    # --- what "settled" and "admissible" mean --------------------------------
+    # The box the answer must arrive inside, and the boxes it may not leave on
+    # the way. Both are rows of the OCP: the settled pair softly, at the terminal
+    # node; the sway pair as a state box at every node.
     terminal_q_sway_max: [0.02, 0.02]
     terminal_dq_sway_max: [0.04, 0.04]
     # rad/s and rad/s^2. The sway rate is control_architecture's own bound; the
@@ -192,6 +185,11 @@ crane_planner:
       terminal_scale: 1.0
       time: 0.3
     ocp_max_iterations: 60
+    # The duration box the solver's `theta` is limited by, in seconds.
+    ocp_duration_min: 2.0
+    ocp_duration_max: 20.0
+    # The L1 price on every soft row: sway, the pump, the settled box.
+    ocp_slack_price: 1.0e3
     # What the SQP stops at. acados' own default is 1e-6 on all four residuals,
     # which is a control-loop number: the answer here is resampled onto the 25 Hz
     # reference and tracked by a controller that closes the loop on it, so the

@@ -178,18 +178,12 @@ class CranePlanner(Node):
             "corridor_clearance",
             "corridor_height_step",
             "corridor_lateral_step",
-            "sway_weight",
-            "tau_weight",
-            "input_weight",
-            "terminal_sway_weight",
-            "flow_slack_weight",
-            "sigma_rate_min",
-            "sigma_rate_max",
-            "sigma_accel_max",
-            "max_wall_clock",
-            "tolerance",
-            "duration_step",
-            "max_duration",
+            "ocp_horizon",
+            "ocp_duration_min",
+            "ocp_duration_max",
+            "ocp_tolerance",
+            "ocp_slack_price",
+            "levenberg_marquardt",
             "pump_flow_max",
             "pump_flow_planning_factor",
             "Ts",
@@ -204,9 +198,8 @@ class CranePlanner(Node):
             "corridor_height_samples",
             "corridor_lateral_samples",
             "path_segments",
-            "intervals",
-            "max_iterations",
-            "timing_samples",
+            "ocp_intervals",
+            "ocp_max_iterations",
             "visualization_samples",
         ):
             self.declare_parameter(name, int(getattr(defaults, name)))
@@ -270,7 +263,7 @@ class CranePlanner(Node):
 
     def _description(self, message: String) -> None:
         try:
-            self.planner = Planner(message.data, self._config())
+            self.planner = Planner(message.data, self._config(), self.weights)
         except Exception as failure:  # a bad description is not a crash
             self.planner = None
             self.get_logger().error(f"the robot description was refused: {failure}")
