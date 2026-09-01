@@ -23,7 +23,9 @@ sys.path.insert(0, str(PACKAGE.parent / "crane_ocp" / "scripts"))
 sys.path.insert(0, str(PACKAGE))
 
 import crane_ocp_export as ox  # noqa: E402
+from acados_template import AcadosOcpSolver  # noqa: E402
 from crane_planning.ocp import (  # noqa: E402
+    CACHE,
     DESCRIPTION,
     GENERATED_HEADER,
     H_FLOW,
@@ -32,6 +34,7 @@ from crane_planning.ocp import (  # noqa: E402
     HE_SWAY_RATE,
     NH,
     NH_E,
+    SOLVER_NAME,
     X_HORIZON,
     build_ocp,
 )
@@ -101,20 +104,53 @@ def generate(
     ox.finalise(output, README)
 
 
+def compile_solver(descriptions: Path, parameters: dict, hydraulics: dict) -> None:
+    """
+    Compile the solver into the cache the planner loads from.
+
+    Exporting without this leaves the first request to pay for a code generation
+    and a C build -- thirteen seconds on a warm toolchain and minutes on a cold
+    one, inside whatever asked for the plan. Doing it here means a node is ready
+    when it starts.
+
+    It is a second `build_ocp` and a second code generation on purpose: what
+    `output` gets is the pruned, normalised tree `--check` reviews, and
+    `crane_ocp`'s `finalise` reads every file it ships as text, so a compiled
+    `.so` cannot live there. Same problem, two artifacts.
+    """
+    ocp, _, _ = build_ocp(
+        (descriptions / DESCRIPTION).read_text(), parameters, hydraulics
+    )
+    CACHE.mkdir(parents=True, exist_ok=True)
+    ocp.code_export_directory = str(CACHE / SOLVER_NAME)
+    AcadosOcpSolver(ocp, json_file=str(CACHE / f"{SOLVER_NAME}.json"), verbose=False)
+    print(f"compiled {CACHE / SOLVER_NAME}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
     ox.add_arguments(parser, PACKAGE)
+    parser.add_argument(
+        "--no-compile",
+        action="store_true",
+        help="write the tree but do not compile the solver into the cache",
+    )
     arguments = parser.parse_args()
 
     parameters = ox.read_ros_parameters(
         PACKAGE / "config" / "crane_planner.yaml", "crane_planner"
     )
-    return ox.run(
+    status = ox.run(
         arguments.output,
         arguments.check,
         lambda output: generate(output, arguments.descriptions, parameters, parameters),
         "export_timing_ocp.py",
     )
+    # `--check` compares two trees and must not touch the cache; a real export
+    # leaves a compiled solver behind so the node does not build one on demand.
+    if status == 0 and not arguments.check and not arguments.no_compile:
+        compile_solver(arguments.descriptions, parameters, parameters)
+    return status
 
 
 if __name__ == "__main__":
