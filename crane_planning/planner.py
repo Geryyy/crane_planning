@@ -98,6 +98,9 @@ class Limits:
     dq_max: np.ndarray  # velocity, per planned coordinate
     tau_max: np.ndarray  # rated actuated effort, per planned coordinate
     flow_max: float  # summed pump draw
+    tool_lower: float  # held tool-coordinate position
+    tool_upper: float
+    tool_bounded: bool
 
 
 def read_limits(
@@ -143,6 +146,14 @@ def read_limits(
             "the description gives a planned joint no finite positive effort limit, "
             "which is what the OCP's effort term is measured against"
         )
+    tool_slot = description.drives[TOOL_INDEX][0].slot
+    tool_bounded = tool_slot.nq == 1
+    tool_lower = (
+        float(inner.lowerPositionLimit[tool_slot.idx_q]) if tool_bounded else -np.inf
+    )
+    tool_upper = (
+        float(inner.upperPositionLimit[tool_slot.idx_q]) if tool_bounded else np.inf
+    )
     return Limits(
         lower=lower,
         upper=upper,
@@ -150,6 +161,9 @@ def read_limits(
         dq_max=dq_max,
         tau_max=tau_max,
         flow_max=float(pump_flow_max) * float(pump_flow_planning_factor),
+        tool_lower=tool_lower,
+        tool_upper=tool_upper,
+        tool_bounded=tool_bounded,
     )
 
 
@@ -179,7 +193,7 @@ class PlannerConfig:
     # two checked configurations; the swing envelope is computed, not configured.
     # Each is spent once. See `Geometry`.
     margin_safety: float = 0.05
-    margin_interp: float = 0.05
+    margin_interp: float = 0.10
     #: How far the tool's collision geometry reaches past the tool centre point.
     #: It enters the step bound as an over-estimate of the machine's outermost
     #: point, so too large costs samples and too small is unsound.
@@ -187,6 +201,13 @@ class PlannerConfig:
     #: The cap on lifted samples. Reaching it means the arm reconfigures faster
     #: than the line resolves -- usually an IK branch jump -- and is a refusal.
     max_lift_samples: int = 4096
+
+    # Bounded crane-specific alternatives to the direct tool line.
+    corridor_clearance: float = 0.15
+    corridor_height_step: float = 0.35
+    corridor_height_samples: int = 3
+    corridor_lateral_step: float = 0.50
+    corridor_lateral_samples: int = 2
 
     q_sway_max: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2]))
 
@@ -208,6 +229,12 @@ class PlannerConfig:
     #: than a slow trajectory. Normalised by the admissible bounds, so this
     #: weight is a multiple of "the whole box".
     terminal_sway_weight: float = 200.0
+    terminal_q_sway_max: np.ndarray = field(
+        default_factory=lambda: np.array([0.02, 0.02])
+    )
+    terminal_dq_sway_max: np.ndarray = field(
+        default_factory=lambda: np.array([0.04, 0.04])
+    )
     #: The pump row carries L1 slack for the same reason: a move that needs
     #: 5% more flow than the reservation allows should come back slower and say
     #: so, not come back as `Infeasible_Problem_Detected`.
@@ -219,7 +246,7 @@ class PlannerConfig:
     ddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.7, 0.5, 1.0, 6.0])
     )
-    max_wall_clock: float = 30.0
+    max_wall_clock: float = 6.0
     max_iterations: int = 400
     tolerance: float = 1.0e-6
 
@@ -760,7 +787,191 @@ def solve_ik(
     return best
 
 
-# ------------------------------------------------------- the straight tool path
+# ---------------------------------------------------------- geometric candidates
+
+
+@dataclass(frozen=True)
+class CartesianCandidate:
+    """A named TCP polyline in the mounting-base frame."""
+
+    name: str
+    positions_m: tuple[np.ndarray, ...]
+
+
+def _primitive_top(primitive) -> float:
+    """Highest mounting-base z point of an oriented primitive's bounding box."""
+    pose = primitive.pose_in_mounting_base
+    extent = np.asarray(primitive.dimensions_m, dtype=float)
+    half_height = 0.5 * float(np.sum(np.abs(pose.rotation[2, :]) * extent))
+    return float(pose.translation[2]) + half_height
+
+
+def cartesian_candidates(
+    geometry: Geometry,
+    config: PlannerConfig,
+    start_position_m: np.ndarray,
+    goal_position_m: np.ndarray,
+) -> list[CartesianCandidate]:
+    """Return the bounded deterministic set of tool corridors to try."""
+    start = np.asarray(start_position_m, dtype=float)
+    goal = np.asarray(goal_position_m, dtype=float)
+    candidates = [CartesianCandidate("direct tool line", (start, goal))]
+
+    transfer_z = max(float(start[2]), float(goal[2])) + float(
+        config.corridor_clearance
+    )
+    if geometry.scene:
+        transfer_z = max(
+            transfer_z,
+            max(_primitive_top(body) for body in geometry.scene)
+            + float(config.corridor_clearance)
+            + float(geometry.required),
+        )
+
+    horizontal = goal[:2] - start[:2]
+    horizontal_length = float(np.linalg.norm(horizontal))
+    perpendicular = (
+        np.array([-horizontal[1], horizontal[0]]) / horizontal_length
+        if horizontal_length > 1.0e-9
+        else np.array([0.0, 1.0])
+    )
+
+    for level in range(max(1, int(config.corridor_height_samples))):
+        height = transfer_z + level * float(config.corridor_height_step)
+        start_high = np.array([start[0], start[1], height])
+        goal_high = np.array([goal[0], goal[1], height])
+        candidates.append(
+            CartesianCandidate(
+                f"lift/traverse/descend at z={height:.2f} m",
+                (start, start_high, goal_high, goal),
+            )
+        )
+        for lateral in range(1, max(0, int(config.corridor_lateral_samples)) + 1):
+            distance = lateral * float(config.corridor_lateral_step)
+            for sign, side in ((1.0, "left"), (-1.0, "right")):
+                offset = sign * distance * perpendicular
+                start_side = start_high.copy()
+                goal_side = goal_high.copy()
+                start_side[:2] += offset
+                goal_side[:2] += offset
+                candidates.append(
+                    CartesianCandidate(
+                        f"{side} corridor {distance:.2f} m at z={height:.2f} m",
+                        (start, start_high, start_side, goal_side, goal_high, goal),
+                    )
+                )
+    return candidates
+
+
+def _without_repeated_positions(positions) -> list[np.ndarray]:
+    unique: list[np.ndarray] = []
+    for position in positions:
+        point = np.asarray(position, dtype=float)
+        if not unique or np.linalg.norm(point - unique[-1]) > 1.0e-9:
+            unique.append(point)
+    return unique
+
+
+def lift_candidate(
+    geometry: Geometry,
+    limits: Limits,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_yaw: float,
+    candidate: CartesianCandidate,
+) -> np.ndarray:
+    """Lift one TCP polyline into joint space using continuation IK."""
+    positions = _without_repeated_positions(candidate.positions_m)
+    if len(positions) < 2:
+        raise PlanningError(f"{candidate.name} contains no motion")
+    _start_position, start_yaw = geometry.tcp_pose(start_q_a)
+    yaw_sweep = _wrap(float(goal_yaw) - start_yaw)
+    lengths = np.array(
+        [
+            np.linalg.norm(right - left)
+            for left, right in zip(positions[:-1], positions[1:])
+        ],
+        dtype=float,
+    )
+    total_length = float(np.sum(lengths))
+    if total_length <= 1.0e-9:
+        lengths[:] = 1.0
+        total_length = float(len(lengths))
+    segment_starts = np.concatenate([[0.0], np.cumsum(lengths[:-1])]) / total_length
+
+    waypoints = [np.asarray(start_q_a, dtype=float)]
+    segments = len(lengths)
+    for segment, (left, right, segment_length, progress_start) in enumerate(
+        zip(positions[:-1], positions[1:], lengths, segment_starts), start=1
+    ):
+        fraction, step = 0.0, INITIAL_LIFT_STEP
+        while fraction < 1.0:
+            step = min(step, 1.0 - fraction)
+            along = fraction + step
+            position = (1.0 - along) * left + along * right
+            progress = progress_start + along * segment_length / total_length
+            q_a = solve_ik(
+                geometry,
+                limits,
+                config,
+                position,
+                start_yaw + progress * yaw_sweep,
+                waypoints[-1],
+                restarts=1,
+            )
+            if not geometry.is_valid(q_a):
+                raise PlanningError(
+                    f"{candidate.name} is blocked on segment {segment}/{segments} "
+                    f"at {along * 100.0:.0f}%: clearance {geometry.clearance(q_a):.3f} m "
+                    f"against {geometry.required:.3f} m required"
+                )
+            if geometry.step_bound(waypoints[-1], q_a) > config.margin_interp:
+                step *= 0.5
+                if step < MIN_LIFT_STEP:
+                    raise PlanningError(
+                        f"the arm reconfigures faster than {candidate.name} resolves on "
+                        f"segment {segment}/{segments} -- a singularity or IK branch change"
+                    )
+                continue
+            waypoints.append(q_a)
+            fraction += step
+            if len(waypoints) > int(config.max_lift_samples):
+                raise PlanningError(
+                    f"{candidate.name} needs more than {config.max_lift_samples} "
+                    "configurations to certify"
+                )
+            step *= 1.25
+    return np.array(waypoints)
+
+
+def plan_geometric_path(
+    geometry: Geometry,
+    limits: Limits,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_position_m: np.ndarray,
+    goal_yaw: float,
+) -> tuple[np.ndarray, str]:
+    """Try the direct path and bounded crane-specific corridors in order."""
+    start_position, _ = geometry.tcp_pose(start_q_a)
+    failures = []
+    candidates = cartesian_candidates(
+        geometry, config, start_position, np.asarray(goal_position_m, dtype=float)
+    )
+    for candidate in candidates:
+        try:
+            waypoints = lift_candidate(
+                geometry, limits, config, start_q_a, goal_yaw, candidate
+            )
+            return waypoints, candidate.name
+        except PlanningError as failure:
+            failures.append(str(failure))
+    summary = "; ".join(failures[:3])
+    if len(failures) > 3:
+        summary += f"; and {len(failures) - 3} more corridor refusals"
+    raise PlanningError(
+        f"none of the {len(candidates)} deterministic tool corridors is clear: {summary}"
+    )
 
 
 def lift(
@@ -771,89 +982,11 @@ def lift(
     goal_position_m: np.ndarray,
     goal_yaw: float,
 ) -> np.ndarray:
-    """
-    Run the tool centre point down a straight line, and lift it into joint space.
-
-    The line is in `K0_mounting_base`: position interpolates linearly and yaw
-    along the shortest arc. Every sample is placed by inverse kinematics seeded
-    from the one before it, and the whole machine is checked there.
-
-    Where samples land is decided by the certificate in `Geometry` and not by a
-    fixed count: the step is halved until `step_bound` fits inside
-    `margin_interp`, and allowed to grow again over a clear run. That is the only
-    resolution rule, and it is the one that has to hold -- a small step for the
-    tool is not a small step for the arm. Near a singularity, or across the null
-    space the redundant telescope leaves, the tool can barely move while the boom
-    swings through it.
-
-    # Why this marches instead of bisecting
-
-    The five planned coordinates are one more than the four the tool pose fixes,
-    so every pose on the line is reached by a one-parameter family of
-    configurations and the inverse kinematics picks one of them by continuity
-    from its seed. That makes the **goal configuration an output of the walk, not
-    an input to it**: solving the goal separately picks its own point on that
-    family, and no amount of refinement can close the finite jump between two
-    different branches. So the goal pose is what is specified here, the endpoint
-    configuration is whatever marching to it produces, and the caller's cold
-    solve is used to establish that the pose is reachable at all -- not to pin
-    where the arm ends up.
-
-    A genuine branch change still cannot pass unnoticed: it is a large joint step
-    for an arbitrarily small tool step, so the step collapses to the floor and is
-    refused. The resolution test and the continuity guard are one test.
-    """
-    start_position, start_yaw = geometry.tcp_pose(start_q_a)
-    goal_position = np.asarray(goal_position_m, dtype=float)
-    sweep = _wrap(float(goal_yaw) - start_yaw)
-
-    def lift_at(fraction: float, seed: np.ndarray) -> np.ndarray:
-        position = (1.0 - fraction) * start_position + fraction * goal_position
-        q_a = solve_ik(
-            geometry,
-            limits,
-            config,
-            position,
-            start_yaw + fraction * sweep,
-            seed,
-            restarts=1,
-        )
-        if not geometry.is_valid(q_a):
-            raise PlanningError(
-                f"the straight tool path is blocked {fraction * 100.0:.0f}% of the way "
-                f"to the goal: the machine clears the scene there by "
-                f"{geometry.clearance(q_a):.3f} m against the "
-                f"{geometry.required:.3f} m this plan requires"
-            )
-        return q_a
-
-    waypoints = [np.asarray(start_q_a, dtype=float)]
-    fraction, step = 0.0, INITIAL_LIFT_STEP
-    while fraction < 1.0:
-        step = min(step, 1.0 - fraction)
-        candidate = lift_at(fraction + step, waypoints[-1])
-        if geometry.step_bound(waypoints[-1], candidate) > config.margin_interp:
-            step *= 0.5
-            if step < MIN_LIFT_STEP:
-                raise PlanningError(
-                    f"the arm reconfigures faster than the straight tool path resolves "
-                    f"at {fraction * 100.0:.0f}% of the way to the goal -- a "
-                    "singularity or an inverse-kinematics branch change, and either "
-                    "way it is not a path this certifies"
-                )
-            continue
-        waypoints.append(candidate)
-        fraction += step
-        if len(waypoints) > int(config.max_lift_samples):
-            raise PlanningError(
-                f"the straight tool path needs more than {config.max_lift_samples} "
-                f"configurations to resolve at the {config.margin_interp:.3f} m "
-                "interpolation margin"
-            )
-        # Grow again, so one tight corner does not hold the rest of a clear run
-        # at the step it needed.
-        step *= 1.25
-    return np.array(waypoints)
+    """Compatibility wrapper around the complete deterministic geometric stage."""
+    waypoints, _candidate_name = plan_geometric_path(
+        geometry, limits, config, start_q_a, goal_position_m, goal_yaw
+    )
+    return waypoints
 
 
 # ---------------------------------------------------------------------- the fit
@@ -992,6 +1125,44 @@ def fit(
     )
 
 
+def plan_fitted_path(
+    geometry: Geometry,
+    limits: Limits,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_position_m: np.ndarray,
+    goal_yaw: float,
+    dq_start: np.ndarray,
+) -> tuple[Path, float | None, int, str]:
+    """Lift, fit and certify candidates until the executable curve is clear."""
+    start_position, _ = geometry.tcp_pose(start_q_a)
+    candidates = cartesian_candidates(
+        geometry, config, start_position, np.asarray(goal_position_m, dtype=float)
+    )
+    failures = []
+    for candidate in candidates:
+        try:
+            waypoints = lift_candidate(
+                geometry, limits, config, start_q_a, goal_yaw, candidate
+            )
+            path, sigma_dot_start = fit(
+                geometry, limits, config, waypoints, dq_start
+            )
+            # The spline is a different curve from its lifted polyline. Only a
+            # successful second certificate makes it executable.
+            geometry.check_path(path)
+            return path, sigma_dot_start, len(waypoints), candidate.name
+        except PlanningError as failure:
+            failures.append(f"{candidate.name}: {failure}")
+    summary = "; ".join(failures[:3])
+    if len(failures) > 3:
+        summary += f"; and {len(failures) - 3} more corridor refusals"
+    raise PlanningError(
+        f"none of the {len(candidates)} deterministic tool corridors survives "
+        f"lifting, C2 fitting and collision certification: {summary}"
+    )
+
+
 # ------------------------------------------------------------------- the timing OCP
 
 
@@ -1023,6 +1194,11 @@ class Timing:
     def terminal_sway(self) -> float:
         """How far the tool still hangs off its rest pose at the goal, in radians."""
         return float(np.max(np.abs(self.q_u[-1] - self.q_u_eq[-1])))
+
+    @property
+    def terminal_sway_rate(self) -> float:
+        """Largest passive rate remaining at the goal, in radians per second."""
+        return float(np.max(np.abs(self.dq_u[-1])))
 
 
 class TimingOcp:
@@ -1492,6 +1668,7 @@ class Planner:
         """
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
+        self._validate_start(start)
         if avoid_collisions and scene is None:
             raise PlanningError(
                 "avoid_collisions was asked for with no collision scene: a plan "
@@ -1533,18 +1710,15 @@ class Planner:
                 f"{geometry.required:.3f} m this plan requires"
             )
 
-        waypoints = lift(
+        path, sigma_dot_start, lifted, candidate_name = plan_fitted_path(
             geometry,
             self.limits,
             self.config,
             start.q_a,
             np.asarray(goal_position_m, dtype=float),
             float(goal_yaw),
+            start.dq_a,
         )
-        path, sigma_dot_start = fit(
-            geometry, self.limits, self.config, waypoints, start.dq_a
-        )
-        geometry.check_path(path)
 
         nodes = np.linspace(0.0, 1.0, int(self.config.intervals) + 1)
         equilibrium = np.array(
@@ -1577,7 +1751,56 @@ class Planner:
             sigma_dot_start,
             speed_scale,
         )
-        return self._resample(geometry, path, timing, start, len(waypoints))
+        terminal_offset = np.abs(timing.q_u[-1] - timing.q_u_eq[-1])
+        terminal_rate = np.abs(timing.dq_u[-1])
+        if np.any(terminal_offset > self.config.terminal_q_sway_max) or np.any(
+            terminal_rate > self.config.terminal_dq_sway_max
+        ):
+            raise PlanningError(
+                "the timing solve converged but did not arrive settled: terminal sway "
+                f"offset {terminal_offset.tolist()} rad against "
+                f"{self.config.terminal_q_sway_max.tolist()}, rate "
+                f"{terminal_rate.tolist()} rad/s against "
+                f"{self.config.terminal_dq_sway_max.tolist()}"
+            )
+        return self._resample(
+            geometry, path, timing, start, lifted, candidate_name
+        )
+
+    def _validate_start(self, start: Start) -> None:
+        """Refuse a measured state that is not one state of this description."""
+        q = np.asarray(start.q, dtype=float).reshape(-1)
+        dq_a = np.asarray(start.dq_a, dtype=float).reshape(-1)
+        dq_u = np.asarray(start.dq_u, dtype=float).reshape(-1)
+        if q.size != GENERALIZED_DOF or not np.all(np.isfinite(q)):
+            raise PlanningError(
+                f"the start must contain {GENERALIZED_DOF} finite canonical positions"
+            )
+        if dq_a.size != PLANNED_DOF or not np.all(np.isfinite(dq_a)):
+            raise PlanningError(
+                f"the start must contain {PLANNED_DOF} finite planned-joint rates"
+            )
+        if dq_u.size != len(PASSIVE_INDICES) or not np.all(np.isfinite(dq_u)):
+            raise PlanningError("the start must contain two finite passive sway rates")
+        q_a = q[list(PLANNED_INDICES)]
+        outside = self.limits.bounded & (
+            (q_a < self.limits.lower) | (q_a > self.limits.upper)
+        )
+        if np.any(outside):
+            axis = int(np.flatnonzero(outside)[0])
+            raise PlanningError(
+                f"planned coordinate {axis} is measured at {q_a[axis]:.6f}, outside "
+                f"[{self.limits.lower[axis]:.6f}, {self.limits.upper[axis]:.6f}]; "
+                "planning from a projected state would not match the machine"
+            )
+        if self.limits.tool_bounded and not (
+            self.limits.tool_lower <= start.q_tool <= self.limits.tool_upper
+        ):
+            raise PlanningError(
+                f"the tool coordinate is measured at {start.q_tool:.6f}, outside "
+                f"[{self.limits.tool_lower:.6f}, {self.limits.tool_upper:.6f}]; "
+                "fix the simulated state or the description instead of projecting it"
+            )
 
     def prepare_scene(self, scene, avoid_collisions: bool) -> list:
         """
@@ -1666,7 +1889,15 @@ class Planner:
             )
         return offset
 
-    def _resample(self, geometry, path, timing, start: Start, lifted: int) -> Plan:
+    def _resample(
+        self,
+        geometry,
+        path,
+        timing,
+        start: Start,
+        lifted: int,
+        candidate_name: str,
+    ) -> Plan:
         """
         Put the answer on the emitted reference's own clock.
 
@@ -1709,14 +1940,16 @@ class Planner:
         )
         slack = float(np.max(timing.flow_slack)) / self.limits.flow_max
         message = (
-            f"{timing.duration:.2f} s over {path.travel_m:.2f} m of tool travel, "
+            f"{candidate_name}; {timing.duration:.2f} s over "
+            f"{path.travel_m:.2f} m of tool travel, "
             f"{lifted} lifted configurations, {len(stamps)} points at "
             f"{Ts * 1e3:.0f} ms; IPOPT converged in {timing.iterations} iterations and "
             f"{timing.solve_time_s:.2f} s; peak pump draw "
             f"{np.max(timing.pump_flow) / self.limits.flow_max:.2f} of the physical "
             f"limit at kappa = {self.config.kappa}"
             + (f", exceeding the reservation by {slack:.3f}" if slack > 1e-9 else "")
-            + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest"
+            + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest "
+            + f"at {timing.terminal_sway_rate:.3f} rad/s"
         )
         return Plan(time=stamps, q=q, dq=dq, tcp=tcp, timing=timing, message=message)
 

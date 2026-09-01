@@ -21,7 +21,7 @@ setup(
     zip_safe=True,
     maintainer="Architecture maintainers",
     maintainer_email="maintainers@example.invalid",
-    description="OMPL geometry and a CasADi/IPOPT timing OCP for the crane_planner node.",
+    description="Deterministic crane corridors and a CasADi/IPOPT timing OCP.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

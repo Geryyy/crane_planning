@@ -37,11 +37,11 @@ crane_planner:
 
     # --- the geometric stage, and what "clear" means -------------------------
     #
-    # **There is no sampling planner.** The tool centre point runs a straight
-    # line from where it is to where the goal asks for it; every sample of that
-    # line is lifted into the five planned coordinates by inverse kinematics and
-    # the whole machine is checked there. A blocked line is a refusal, not a
-    # cue to search around it.
+    # **There is no stochastic sampling planner.** The direct TCP line is tried
+    # first. If it is blocked, a bounded deterministic family of
+    # lift/traverse/descend paths follows at successively higher transfer planes,
+    # including symmetric lateral corridors. Every segment is lifted into the
+    # five planned coordinates by continuation IK and checked there.
     #
     # Sampling does not prove clearance on its own. What makes it a proof is a
     # margin paired with a bound on how far anything can move between two
@@ -61,7 +61,7 @@ crane_planner:
     # Halving `margin_interp` roughly doubles the lifted configurations and so
     # the geometric stage's cost. Raising it spends clearance on resolution.
     margin_safety: 0.05
-    margin_interp: 0.05
+    margin_interp: 0.10
     # How far the tool's collision geometry reaches past the tool centre point.
     # It enters the step bound as an over-estimate of the machine's outermost
     # point: too large only costs samples, too small is unsound. The carried
@@ -72,6 +72,15 @@ crane_planner:
     # inverse-kinematics branch change -- and is a refusal. It is the same test
     # that sets the resolution, which is why a branch jump cannot pass unseen.
     max_lift_samples: 4096
+
+    # Clearance above the highest scene primitive, additional transfer planes,
+    # and lateral offsets tried on each plane. The result remains bounded:
+    # 1 + height_samples * (1 + 2*lateral_samples) candidates at most.
+    corridor_clearance: 0.15
+    corridor_height_step: 0.35
+    corridor_height_samples: 3
+    corridor_lateral_step: 0.50
+    corridor_lateral_samples: 2
 
     # **The admissible sway bound, and this is where it lives.** The swing
     # envelope above is derived from it, and it is the state box the timing OCP
@@ -153,6 +162,12 @@ crane_planner:
     # is a multiple of "the whole allowance" and the answer reports the residual
     # in degrees. Raise it to arrive stiller and later.
     terminal_sway_weight: 200.0
+    # A terminal cost is useful only if its result is judged. These are the
+    # acceptance bounds: roughly the placement-scale 0.02 rad swing and the
+    # supervisor's 0.04 rad/s settled-rate design value. A converged solve over
+    # either one is refused rather than published as a low-sway trajectory.
+    terminal_q_sway_max: [0.02, 0.02]
+    terminal_dq_sway_max: [0.04, 0.04]
     # The pump row carries L1 slack for the same reason. A move needing a few
     # percent more flow than the reservation allows should come back slower and
     # say so in its message, not come back as a refusal.
@@ -166,7 +181,9 @@ crane_planner:
     # joint accelerations are a comfort limit the description does not carry.
     dq_sway_max: [1.0, 0.5]
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
-    max_wall_clock: 30.0
+    # Kept below the A2B caller's service timeout after reserving time for IK,
+    # collision certification and output construction.
+    max_wall_clock: 6.0
     max_iterations: 400
     tolerance: 1.0e-6
 

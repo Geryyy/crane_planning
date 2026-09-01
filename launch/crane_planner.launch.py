@@ -12,6 +12,7 @@ def generate_launch_description() -> LaunchDescription:
     tool = LaunchConfiguration("tool")
     use_sim_time = LaunchConfiguration("use_sim_time")
     parameter_file = LaunchConfiguration("parameter_file")
+    joint_states_topic = LaunchConfiguration("joint_states_topic")
 
     default_parameter_file = (
         PathSubstitution(FindPackageShare("crane_planning"))
@@ -37,6 +38,14 @@ def generate_launch_description() -> LaunchDescription:
                 default_value=default_parameter_file,
                 description="Planner parameter YAML file",
             ),
+            DeclareLaunchArgument(
+                "joint_states_topic",
+                default_value="/joint_states",
+                description=(
+                    "Canonical joint-state input. PZS100 EPSCOPE simulation must pass "
+                    "/joint_states_rviz, whose adapter removes the opening state factor."
+                ),
+            ),
             Node(
                 package="crane_planning",
                 executable="crane_planner_node",
@@ -46,6 +55,7 @@ def generate_launch_description() -> LaunchDescription:
                     parameter_file,
                     {"tool": tool, "use_sim_time": use_sim_time},
                 ],
+                remappings=[("/joint_states", joint_states_topic)],
             ),
         ]
     )

@@ -172,6 +172,9 @@ class CranePlanner(Node):
             "margin_safety",
             "margin_interp",
             "tool_radius",
+            "corridor_clearance",
+            "corridor_height_step",
+            "corridor_lateral_step",
             "sway_weight",
             "tau_weight",
             "input_weight",
@@ -193,6 +196,8 @@ class CranePlanner(Node):
         for name in (
             "ik_restarts",
             "max_lift_samples",
+            "corridor_height_samples",
+            "corridor_lateral_samples",
             "path_segments",
             "intervals",
             "max_iterations",
@@ -200,6 +205,8 @@ class CranePlanner(Node):
             self.declare_parameter(name, int(getattr(defaults, name)))
         for name in (
             "q_sway_max",
+            "terminal_q_sway_max",
+            "terminal_dq_sway_max",
             "dq_sway_max",
             "ddq_a_max",
             "truck_runge_dimensions",

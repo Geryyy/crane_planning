@@ -2,11 +2,11 @@
 <package format="3">
   <name>crane_planning</name>
   <version>0.1.0</version>
-  <description>The `crane_planner` node: an OMPL geometric search over the five
-    planned joint coordinates, a C2 fit, and one CasADi/IPOPT optimal control
-    problem that decides how fast the path may be traversed. Provides
-    `/crane/plan_motion`; grip motion is owned by
-    concrete_block_motion_planning.</description>
+  <description>The `crane_planner` node: deterministic collision-checked tool
+    corridors lifted into the five planned joint coordinates, a C2 fit, and one
+    CasADi/IPOPT optimal control problem that decides how fast the path may be traversed. Provides
+    the legacy-compatible `/a2b_movement` service and publishes `/crane/reference`;
+    grip motion is owned by concrete_block_motion_planning.</description>
   <maintainer email="maintainers@example.invalid">Architecture maintainers</maintainer>
   <license>Apache-2.0</license>
 

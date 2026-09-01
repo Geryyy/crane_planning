@@ -4,18 +4,17 @@ The `crane_planner` node. Two stages and one dependency that matters.
 
 ```
 plan(goal position and yaw in K0_mounting_base)
-  -> the straight tool path    a line for the tool, lifted into the five planned
-                               joint coordinates, certified clear, fitted C2
+  -> deterministic corridors  direct first, then lift/traverse/descend and
+                               lateral alternatives, lifted and certified C2
   -> CasADi/IPOPT timing OCP   how fast that curve may be traversed
   -> JointTrajectory on /crane/reference
 ```
 
-**There is no sampling planner.** The tool centre point runs a straight line from
-where it is to where the goal asks for it, and a blocked line is a refusal rather
-than a cue to search around it. That is a deliberate narrowing: what the block
-stack asks for are placements in an uncluttered volume, and a search that could
-find its way around a runge cost an OMPL dependency, a shortcut pass and a
-resolution rule that could not be proved.
+**There is no stochastic sampling planner.** The tool centre point first tries a
+straight line. A blocked line triggers a bounded family of crane-specific
+alternatives: lift to a transfer plane, traverse, descend, with symmetric lateral
+corridors and successively higher planes. The common case stays deterministic and
+cheap, while a runge in the direct corridor is no longer an automatic refusal.
 
 Everything the machine can do -- reach, hang, collide -- is asked of
 `crane_model`. Nothing about the machine is written down here: joint ranges and
@@ -24,13 +23,21 @@ onto, the equations of motion come from `crane_model.symbolic`, and the one
 number the description does not carry (the pump limit) is in
 `config/crane_planner.yaml` with its evidence beside it.
 
-## The straight tool path
+## The deterministic tool corridors
 
-The line is in `K0_mounting_base`: position interpolates linearly, yaw along the
-shortest arc. Every sample of it is lifted into the five planned coordinates by
-one least-squares inverse kinematics **seeded from its predecessor**, and the
-whole machine is collision-checked there. The tool axis q8 is not planned; it is
-held by the low-level controller and rides the path at the value it started at.
+Every candidate is a TCP polyline in `K0_mounting_base`; yaw follows the shortest
+arc over its Cartesian length. Every sample is lifted into the five planned
+coordinates by one least-squares inverse kinematics **seeded from its
+predecessor**, and the whole machine is collision-checked there. The tool axis q8
+is not planned; it is held by the low-level controller and rides the path at the
+value it started at.
+
+The direct candidate is first. Transfer planes begin above the highest scene
+primitive plus the complete clearance requirement, then rise by
+`corridor_height_step`. Each plane gets a straight traverse and configured
+left/right offsets. The first candidate whose lifted polyline **and fitted C2
+curve** pass the certificate is timed. A smoothing failure advances to the next
+candidate instead of discarding a collision-free polyline and ending the call.
 
 The inverse kinematics is not a closed form: the passive pair is re-settled at
 every configuration tested, so what is solved is where the tool actually ends up
@@ -180,7 +187,8 @@ drive four terminal quantities to zero. Asking for it as a hard equality does no
 produce a slower trajectory; it produces `Infeasible_Problem_Detected`. So it is
 priced, normalised by the admissible box, which makes `terminal_sway_weight` a
 multiple of "the whole allowance" and lets the answer report the residual in
-degrees. On a 2.2 m move the tool arrives about 0.05 deg off rest.
+degrees. The converged result is still refused unless it finishes inside the
+configured 0.02 rad displacement and 0.04 rad/s settled-rate bounds.
 
 ### Effort is priced, not bounded
 
@@ -229,18 +237,17 @@ asking for half speed the very same trajectory back.
 
 ## What it costs
 
-PZS100, a 2.2 m tool move with a truck in the scene, at the shipped defaults
-(`intervals = 40`, `margin_interp = 0.05`):
+PZS100, the checked-in offline example in a clear scene at the shipped defaults
+(`intervals = 40`, `margin_interp = 0.10`), measured on this development image:
 
 | | |
 |---|---|
-| lifted configurations | 199 |
-| geometric stage | ~4.7 s |
-| IPOPT | 5.4 s over 48 iterations |
-| end to end | ~11.5 s |
-| trajectory duration | 10.3 s |
-| terminal sway | 0.05 deg off rest |
-| peak pump draw | 0.17 of the physical limit |
+| lifted configurations | 177 |
+| IPOPT | 4.9 s over 41 iterations |
+| planner call | 8.3 s |
+| trajectory duration | 5.44 s |
+| terminal sway | 0.02 deg off rest |
+| peak pump draw | 0.80 of the physical limit |
 
 Halving `margin_interp` roughly doubles the lifted configurations and so the
 geometric stage. Coarsening `intervals` does **not** buy time the way it looks
@@ -280,6 +287,14 @@ turn out to be unreachable.
 | subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
 | frame | `K0_mounting_base` for every goal and every published pose; nothing is converted |
 
+The PZS100 Gazebo actuator reports q9 as total opening with an EPSCOPE
+`state_factor` of two, while the URDF and collision model use one rail's joint
+coordinate. Its bringup already publishes the canonical conversion on
+`/joint_states_rviz`; launch this planner with
+`joint_states_topic:=/joint_states_rviz`. A raw reported value such as 1.261858
+then becomes the actual 0.420929 m rail coordinate. The planner refuses either
+coordinate outside the URDF range and never projects it.
+
 `/a2b_movement` is the only service. The native `/crane/plan_motion` it used to
 sit beside had no caller anywhere in the workspace and was removed; the reference
 it published is unchanged, so anything reading `/crane/reference` reads the same
@@ -298,8 +313,8 @@ by joint name, never by index. The passive pair has its own freshness deadline:
 stale or absent sway measurement is a refusal rather than a zero.
 
 Every refusal names itself and leaves the standing reference alone: a goal that
-cannot be reached, a straight tool path that is blocked or does not resolve, and
-a path that cannot be timed are three different answers.
+cannot be reached, no deterministic corridor surviving its fitted-path
+certificate, and a path that cannot be timed are three different answers.
 
 ## What the tool is carrying
 
