@@ -699,6 +699,21 @@ class Path:
         return self.spline(sigma)
 
 
+def _densify(waypoints: np.ndarray, count: int) -> np.ndarray:
+    """Resample a joint-space polyline to `count` points along its own chords."""
+    lengths = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+    nodes = np.concatenate([[0.0], np.cumsum(lengths)])
+    if nodes[-1] <= 0.0:
+        raise PlanningError("the lifted path does not move")
+    target = np.linspace(0.0, nodes[-1], count)
+    return np.column_stack(
+        [
+            np.interp(target, nodes, waypoints[:, axis])
+            for axis in range(waypoints.shape[1])
+        ]
+    )
+
+
 def fit(
     limits: Limits,
     config: PlannerConfig,
@@ -709,10 +724,11 @@ def fit(
     Fit `q_a(sigma)` to the waypoints.
 
     sigma is distributed by how long each chord takes at its slowest axis's own
-    limit, so a segment slow in one coordinate gets more of the parameter. That
-    total `L` scales the start slope: `q_a'(0) = dq_a * L` is the same motion
-    measured in sigma, so a plan starting from a moving machine leaves along the
-    direction it is already going.
+    limit, so a segment slow in one coordinate gets more of the parameter. The
+    OCP moves along this curve rather than beside it, so that distribution is
+    also what its input sees: measured on the shipped defaults `|q_a'|` in the
+    `dq_max` metric varies by 1.05 over the whole path, which is arclength in
+    that metric without anyone having reparametrised anything.
 
     Approximates, does not interpolate: interpolation ties segment count to
     sample count, and the certificate wants samples dense while the curve wants
@@ -731,9 +747,14 @@ def fit(
     nodes[-1] = 1.0
 
     degree = 3
-    # One coefficient per segment plus the degree, and never more than the data
-    # can determine.
-    segments = int(np.clip(config.path_segments, 1, max(1, len(waypoints) - degree)))
+    # Exactly `path_segments`, never fewer: the OCP is code-generated against a
+    # parameter vector that many cubics wide, so a short lift answered with
+    # fewer pieces is a different problem, not a smaller one. Resampling the
+    # polyline along its own chords is free -- it is not what gets certified,
+    # only what the least-squares fit is pulled towards.
+    segments = int(config.path_segments)
+    if len(waypoints) < segments + degree:
+        waypoints = _densify(waypoints, segments + degree)
     interior = np.linspace(0.0, 1.0, segments + 1)[1:-1]
     knots = np.concatenate([np.zeros(degree + 1), interior, np.ones(degree + 1)])
     try:
@@ -743,22 +764,32 @@ def fit(
             f"the lifted path cannot be fitted with {segments} segments: {failure}"
         ) from None
 
-    # Endpoints and end slopes are boundary conditions, not things to fit. For a
-    # clamped B-spline the outer coefficients *are* the endpoint values and the
-    # next one in sets the slope, so four writes impose both exactly; the rest
-    # stay as fitted.
+    # Endpoints are boundary conditions, not things to fit: for a clamped
+    # B-spline the outer coefficients *are* the endpoint values, so two writes
+    # impose them exactly.
     coefficients = np.array(spline.c, dtype=float)
     coefficients[0] = waypoints[0]
     coefficients[-1] = waypoints[-1]
-    start_rate = np.asarray(dq_start, dtype=float) * total
-    coefficients[1] = (
-        coefficients[0] + start_rate * (knots[degree + 1] - knots[1]) / degree
-    )
-    # The path arrives at rest in q_a: the goal is a pose to stop at, not one to
-    # pass through.
-    coefficients[-2] = coefficients[-1]
+    # The start slope is a boundary condition only while the machine is moving.
+    # The OCP follows this curve, so `dq_a = q_a'(sigma) * v` can only leave
+    # along the tangent and the tangent has to be the measured direction;
+    # `q_a'(0) = dq_a * L` is that same motion measured in sigma. From rest
+    # there is no direction to honour, and writing one anyway sets `q_a'(0) = 0`,
+    # where `ddq_a = q_a'' v^2 + q_a' a` contains no `a`: a singular input, not
+    # a slow one. The goal end is never clamped for the same reason -- arriving
+    # stopped is `v = 0`, a condition on the timing, and asking the geometry for
+    # it as well is asking twice and paying twice.
+    if np.any(np.asarray(dq_start, dtype=float) != 0.0):
+        start_rate = np.asarray(dq_start, dtype=float) * total
+        coefficients[1] = (
+            coefficients[0] + start_rate * (knots[degree + 1] - knots[1]) / degree
+        )
     spline = BSpline(knots, coefficients, degree)
 
+    # Load-bearing, and a scan rather than a certificate: the OCP has no `q_a`
+    # to box, so nothing downstream would see an overshoot between two samples.
+    # `check_path` carries the Lipschitz bound that would close that; range has
+    # none.
     dense = np.linspace(0.0, 1.0, max(129, len(waypoints)))
     sampled = spline(dense)
     slack = 1.0e-6

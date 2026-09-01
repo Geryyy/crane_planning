@@ -2,8 +2,8 @@
 Plan a motion, and time it.
 
 Two stages. `geometry` walks a bounded family of TCP corridors, lifts one into
-joint space and certifies the fitted curve; `ocp` is handed that curve's
-endpoints and solves for the time-optimal way between them.
+joint space and certifies the fitted curve; `ocp` is handed that curve and solves
+for the time-optimal way *along* it. What executes is what was certified.
 
 Everything the machine can do -- reach, hang, collide -- is asked of
 `crane_model`; nothing about the machine is written down here.
@@ -68,7 +68,7 @@ from .geometry import (
     wrap,
     yaw_of,
 )
-from .ocp import Trajectory, TrajectoryOcp
+from .ocp import Trajectory, TrajectoryOcp, power_coefficients
 
 # ------------------------------------------------------------------ the planner
 
@@ -236,11 +236,10 @@ class Planner:
                 "is no plan that starts from it"
             )
 
-        # Endpoints and nothing else. Free to move between them however the
-        # dynamics prefer -- where the speed comes from, why the corridor is owed.
+        # The certified curve itself, not its endpoints. The solve moves along it
+        # and decides only how fast, so what executes is what was proved clear.
         timing = self.ocp.solve(
-            q_a_start=start.q_a,
-            q_a_goal=path.position(1.0),
+            coefficients=power_coefficients(path, self.ocp.segments),
             q_u_start=q_u_start,
             dq_a_start=np.asarray(start.dq_a, dtype=float),
             dq_u_start=dq_u_start,

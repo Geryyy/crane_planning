@@ -1,9 +1,27 @@
 """
 The trajectory OCP: its definition, and the solver that answers with it.
 
-`x = [q_a, q_u, dq_a, dq_u, theta]`, `u = ddq_a`, on normalised time over [0, 1]
-with `theta = T / ocp_horizon` a state whose derivative is zero -- so one solve is
+`x = [sigma, q_u, v, dq_u, theta]`, `u = a`, on normalised time over [0, 1] with
+`theta = T / ocp_horizon` a state whose derivative is zero -- so one solve is
 time-optimal and there is no outer search over the duration.
+
+**The machine stays on the certified curve.** `q_a` is not a decision variable:
+the geometric stage hands over `c(sigma)`, the curve `Geometry.check_path`
+certified, and this solver decides only how fast to move along it.
+
+    q_a   = c(sigma)
+    dq_a  = c'(sigma) v
+    ddq_a = c''(sigma) v^2 + c'(sigma) a         with  v = d sigma/dt,  a = dv/dt
+
+So the executed curve *is* the certified curve and the clearance proof holds
+verbatim -- no obstacle rows, no corridor, nothing to re-prove. The stage this
+replaced planned `q_a` freely between two endpoints and left that curve by
+0.84-1.29 m of machine displacement against 0.05 m of spare clearance, which
+voided the proof; measured against it, staying on the curve costs 0.4-4.4% of
+duration and half the SQP iterations.
+
+What it costs is lateral authority: sway can now only be damped by *timing*.
+That is the whole price, and the numbers above are what it comes to.
 
 The definition lives here, not beside the exporter, because this package's
 consumer is Python: `scripts/export_timing_ocp.py` is a CLI front end on
@@ -14,15 +32,12 @@ bound and `W` is preference alone (see `weights`). Gauss-Newton builds its
 Hessian from `J' W J`, so one row left in physical units sets the conditioning of
 everything: `tau_a` in Nm stalled this solve at a stationarity residual of 1e6,
 and the horizon in seconds cost 40-60x on the same measure.
-
-**No obstacle rows.** The geometric stage certifies a path and this solver is
-handed its endpoints, but it moves between them however the dynamics prefer --
-where its speed comes from, and what voids the clearance proof. The corridor is
-`q_a`'s box narrowed, and is not wired yet.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import tempfile
 import time
@@ -60,14 +75,43 @@ GENERATED_HEADER = "crane_planning_ocp_generated.h"
 BOOM_AXIS = 1
 ARM_AXIS = 2
 
-#: `x` gains the horizon as its last component, with `dT/ds = 0`.
-X_HORIZON = cs.NX
-NX = cs.NX + 1
+#: Row order of `x`. `theta` is last, as the one component the solver picks.
+X_SIGMA, X_PASSIVE, X_SPEED, X_PASSIVE_RATE, X_HORIZON = 0, 1, 3, 4, 6
+NX, NU = 7, 1
 
-#: Row order of `h`, which the caller reads back and must not re-derive.
-H_SWAY, H_FLOW, NH = 0, 2, 3
+#: Row order of `h`, which the caller reads back and must not re-derive. The
+#: rate and input blocks were boxes on `x` and `u` when `q_a` was planned; they
+#: are nonlinear rows now because what they bound is an expression in `sigma`.
+H_SWAY, H_FLOW, H_RATE, H_INPUT = 0, 2, 3, 3 + cs.K_PLANNED_DOF
+NH = 3 + 2 * cs.K_PLANNED_DOF
 #: Row order of `h_e`: the settled box the caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
+
+#: Cubic path, so four power-basis coefficients per segment.
+ORDER = 4
+
+#: Box on `a`, a numerical guard and not a physical limit -- `sigma''` is bounded
+#: only through the `ddq_a` rows, and where the tangent is short that leaves its
+#: column nearly free. Measured at 0.01-0.02 of this across the shipped defaults
+#: and `speed_scale` 0.9; `solve` refuses rather than answer if it ever binds,
+#: because a duration this constant decided is not the machine's.
+SIGMA_INPUT_MAX = 20.0
+
+#: What the compiled solver's structure depends on. `weights` is deliberately
+#: absent: `W` is a runtime cost field the node writes onto the built solver, so
+#: hashing it would rebuild for a number that changes nothing.
+BAKED = (
+    "ocp_intervals",
+    "ocp_horizon",
+    "ocp_integrator",
+    "ocp_max_iterations",
+    "ocp_tolerance",
+    "levenberg_marquardt",
+    "q_sway_max",
+    "dq_sway_max",
+    "ddq_a_max",
+    "path_segments",
+)
 
 #: The integrator, and the stage count that makes each one order 4: ERK wants 4
 #: stages, Gauss-Legendre IRK 2. ERK4 is far cheaper per node but its stability
@@ -96,6 +140,102 @@ def description_limits(model) -> tuple:
     )
 
 
+def cache_tree(parameters: dict, hydraulics: dict) -> Path:
+    """
+    Where this configuration's solver is built, named so a stale one cannot load.
+
+    A cached `.so` is loaded, not compared. Every value that enters the
+    *expressions* or the dimensions therefore has to move the directory, or a
+    changed `ocp_integrator` -- or a changed `path_segments`, which changes the
+    parameter vector itself -- silently answers with the previous build.
+    """
+    baked = {}
+    for key in BAKED:
+        value = parameters[key]
+        baked[key] = value.tolist() if hasattr(value, "tolist") else value
+    baked["pump_flow_max"] = float(hydraulics["pump_flow_max"])
+    digest = hashlib.sha1(json.dumps(baked, sort_keys=True).encode()).hexdigest()
+    return CACHE / f"{SOLVER_NAME}_{digest[:10]}"
+
+
+# -------------------------------------------------------------------- the path
+
+
+def power_coefficients(path, segments: int) -> np.ndarray:
+    """
+    `(segments, 4, 5)`: `c(sigma) = sum_m a[k, m] (sigma - k/S)^m` on segment k.
+
+    A power basis on uniform breakpoints, not the B-spline basis, because the
+    solver has to select a segment symbolically and uniform breakpoints make that
+    a `floor` instead of a knot search. `geometry.fit` places its interior knots
+    on `linspace(0, 1, path_segments + 1)` and always uses all of them, so nothing
+    is approximated here -- the conversion is exact, and it is checked.
+    """
+    spline = path.spline
+    breaks = np.unique(spline.t)
+    if len(breaks) - 1 != segments or not np.allclose(
+        breaks, np.linspace(0.0, 1.0, segments + 1)
+    ):
+        raise PlanningError(
+            f"the fitted path carries {len(breaks) - 1} segments, but the solver "
+            f"was generated for {segments}; its parameter vector is that shape"
+        )
+    rows, derivative, factorial = [], spline, 1.0
+    for order in range(ORDER):
+        if order:
+            factorial *= order
+            derivative = derivative.derivative()
+        rows.append(np.atleast_2d(derivative(breaks[:-1])) / factorial)
+    return np.stack(rows, axis=1)
+
+
+def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
+    """
+    `c(sigma)` and its derivatives, from the coefficients the solver is handed.
+
+    Deliberately a mirror of `path_expression` and not a call into the spline:
+    what is reported back has to be what was constrained, and the two would drift
+    the moment the segment lookup differed.
+    """
+    sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+    segments = coefficients.shape[0]
+    index = np.clip(np.floor(sigma * segments).astype(int), 0, segments - 1)
+    local = sigma - index / segments
+    out = np.zeros((sigma.size, coefficients.shape[2]))
+    for m in range(order, ORDER):
+        scale = float(np.prod([m - k for k in range(order)])) if order else 1.0
+        out += scale * (local[:, None] ** (m - order)) * coefficients[index, m, :]
+    return out
+
+
+def path_expression(sigma, coefficients, segments: int) -> list:
+    """Return `[c, c', c'']` as `casadi.SX`, coefficients left symbolic."""
+    index = ca.fmin(ca.fmax(ca.floor(sigma * segments), 0.0), segments - 1)
+    local = sigma - index / segments
+    value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(3)]
+    for segment in range(segments):
+        # A comparison carries no derivative in casadi, so `d/dsigma` of the sum
+        # is the selected polynomial's own derivative -- which is what is wanted,
+        # and correct at a breakpoint because the curve is C2 across it.
+        on = index == segment
+        for m in range(ORDER):
+            first = (segment * ORDER + m) * cs.K_PLANNED_DOF
+            block = on * coefficients[first : first + cs.K_PLANNED_DOF]
+            value[0] += block if m == 0 else block * local**m
+            if m >= 1:
+                value[1] += m * block if m == 1 else m * block * local ** (m - 1)
+            if m >= 2:
+                value[2] += (
+                    m * (m - 1) * block
+                    if m == 2
+                    else m * (m - 1) * block * local ** (m - 2)
+                )
+    return value
+
+
+# --------------------------------------------------------------------- the OCP
+
+
 def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     """Assemble the OCP. Returns `(ocp, scale, model)` as the sibling exporter does."""
     model = cs.CraneSymbolicModel(description_xml, TOOL)
@@ -104,6 +244,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     dq_sway_max = np.asarray(parameters["dq_sway_max"], dtype=float)
     ddq_a_max = np.asarray(parameters["ddq_a_max"], dtype=float)
     nominal = float(parameters["ocp_horizon"])
+    segments = int(parameters["path_segments"])
     integrator = str(parameters["ocp_integrator"]).upper()
     if integrator not in INTEGRATORS:
         raise ValueError(
@@ -112,23 +253,46 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # ---------------------------------------------------------------- the model
 
-    x, u, p = model.x, model.u, model.p
-    q_a = x[cs.X_PLANNED_POSITION : cs.X_PLANNED_POSITION + cs.K_PLANNED_DOF]
-    q_u = x[cs.X_PASSIVE_POSITION : cs.X_PASSIVE_POSITION + cs.K_PASSIVE_DOF]
-    dq_a = x[cs.X_PLANNED_VELOCITY : cs.X_PLANNED_VELOCITY + cs.K_PLANNED_DOF]
-    dq_u = x[cs.X_PASSIVE_VELOCITY : cs.X_PASSIVE_VELOCITY + cs.K_PASSIVE_DOF]
-    sway = q_u - equilibrium(q_a)
-
+    sigma = ca.SX.sym("sigma")
+    q_u = ca.SX.sym("q_u", cs.K_PASSIVE_DOF)
+    speed = ca.SX.sym("v")
+    dq_u = ca.SX.sym("dq_u", cs.K_PASSIVE_DOF)
     # `theta = T / T_nominal`, one decision variable shared by every node. acados
     # fixes `p` for a solve, so a horizon the solver picks cannot live there.
     theta = ca.SX.sym("theta")
+    acceleration = ca.SX.sym("a")
+    #: The path, as `p`: `path_segments` fixes the knot vector, so only these
+    #: numbers change between requests and the solver is generated once.
+    coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
+
+    centre, tangent, curvature = path_expression(sigma, coefficients, segments)
+    q_a = centre
+    dq_a = tangent * speed
+    ddq_a = curvature * speed * speed + tangent * acceleration
+    sway = q_u - equilibrium(q_a)
+
+    # Everything about the machine is `crane_model`'s, reached by substituting the
+    # eliminated coordinates into its graph rather than by rebuilding it.
+    planned = ca.vertcat(model.x, model.u)
+    moving = ca.vertcat(q_a, q_u, dq_a, dq_u, ddq_a)
+    ddq_u = ca.substitute(model.ddq_u, planned, moving)
+    tau_a = ca.substitute(model.tau_a[: cs.K_PLANNED_DOF], planned, moving)
+    flow = ca.substitute(
+        ca.sum1(
+            model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
+        ),
+        planned,
+        moving,
+    )
 
     acados_model = AcadosModel()
     acados_model.name = SOLVER_NAME
-    acados_model.x = ca.vertcat(x, theta)
-    acados_model.u = u
-    acados_model.p = p
-    acados_model.f_expl_expr = ca.vertcat(nominal * theta * model.xdot, 0.0)
+    acados_model.x = ca.vertcat(sigma, q_u, speed, dq_u, theta)
+    acados_model.u = acceleration
+    acados_model.p = ca.vertcat(model.p, coefficients)
+    acados_model.f_expl_expr = ca.vertcat(
+        nominal * theta * ca.vertcat(speed, dq_u, acceleration, ddq_u), 0.0
+    )
     # acados does not derive one form from the other: ERK reads `f_expl_expr`,
     # IRK reads `f_impl_expr` and errors on an empty one. Both are set here
     # unconditionally so switching integrator is a solver option, not a re-model.
@@ -142,26 +306,24 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # so a residual against zero prices holding the block and is blind to what
     # shakes the boom. Substituting hanging pendulum, zero rates and zero input
     # into the same graph isolates the dynamic part exactly.
-    tau_a = model.tau_a[: cs.K_PLANNED_DOF]
     at_rest = ca.vertcat(
         q_a,
         equilibrium(q_a),
         ca.SX.zeros(cs.K_PLANNED_DOF),
         ca.SX.zeros(cs.K_PASSIVE_DOF),
+        ca.SX.zeros(cs.NU),
     )
-    tau_static = ca.substitute(
-        tau_a, ca.vertcat(x, u), ca.vertcat(at_rest, ca.SX.zeros(cs.NU))
-    )
+    tau_static = ca.substitute(model.tau_a[: cs.K_PLANNED_DOF], planned, at_rest)
 
     # Each row over its own limit, so 1.0 means "at the bound" on every row alike.
-    # No `q_a` row: the goal is a terminal box, and tracking it as well only adds
-    # a stiff direction to a Hessian that has little else in it.
+    # No `q_a` row: the goal is the end of the curve, and tracking a position the
+    # machine is on by construction only adds a stiff direction to the Hessian.
     residual = ca.vertcat(
         dq_a / dq_max,
         sway / q_sway_max,
         dq_u / dq_sway_max,
         (tau_a - tau_static) / tau_max,
-        u / ddq_a_max,
+        ddq_a / ddq_a_max,
     )
     terminal_residual = ca.vertcat(
         dq_a / dq_max, sway / q_sway_max, dq_u / dq_sway_max, theta
@@ -172,7 +334,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     ocp = AcadosOcp()
     ocp.model = acados_model
-    ocp.parameter_values = np.zeros(cs.NP)
+    ocp.parameter_values = np.zeros(cs.NP + segments * ORDER * cs.K_PLANNED_DOF)
 
     # The yaml's weights baked as defaults. Still runtime-settable -- the node
     # writes its own onto the built solver -- so a weight change needs no
@@ -190,35 +352,35 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # ---------------------------------------------------------- the constraints
 
-    # Two nonlinear rows, no third: no cylinder-force constraint here, because it
-    # was the smaller chamber area times a relief pressure nothing in this
-    # workspace has measured.
-    flow = ca.sum1(
-        model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
-    )
+    # No cylinder-force row: it was the smaller chamber area times a relief
+    # pressure nothing in this workspace has measured. No `q_a` range row either
+    # -- `q_a` is on the certified curve for every `sigma` in [0, 1], and `fit`
+    # already refuses a curve that leaves joint range.
     pump_max = float(hydraulics["pump_flow_max"])
-    scale = np.concatenate([q_sway_max, [pump_max]])
+    scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max])
     scale_e = np.concatenate([q_sway_max, dq_sway_max])
-    acados_model.con_h_expr_0 = ca.vertcat(sway / q_sway_max, flow / pump_max)
+    acados_model.con_h_expr_0 = ca.vertcat(
+        sway / q_sway_max, flow / pump_max, dq_a / dq_max, ddq_a / ddq_a_max
+    )
     acados_model.con_h_expr = acados_model.con_h_expr_0
     acados_model.con_h_expr_e = ca.vertcat(sway, dq_u) / scale_e
 
     # Bounds below are placeholders the caller overwrites; what is baked is which
     # rows exist and which are soft. Stage 0's box is the measured state, over
-    # `cs.NX` not `NX` because the horizon is the one component of `x` the solver
-    # picks. `constraints.x0` would pin it and freeze the objective.
-    ocp.constraints.idxbx_0 = np.arange(cs.NX)
-    ocp.constraints.lbx_0 = np.zeros(cs.NX)
-    ocp.constraints.ubx_0 = np.zeros(cs.NX)
+    # `NX - 1` because the horizon is the one component of `x` the solver picks.
+    # `constraints.x0` would pin it and freeze the objective.
+    ocp.constraints.idxbx_0 = np.arange(NX - 1)
+    ocp.constraints.lbx_0 = np.zeros(NX - 1)
+    ocp.constraints.ubx_0 = np.zeros(NX - 1)
     for stage in ("", "_e"):
         setattr(ocp.constraints, f"idxbx{stage}", np.arange(NX))
         setattr(ocp.constraints, f"lbx{stage}", -np.ones(NX))
         setattr(ocp.constraints, f"ubx{stage}", np.ones(NX))
-    ocp.constraints.idxbu = np.arange(cs.NU)
-    ocp.constraints.lbu = -np.ones(cs.NU)
-    ocp.constraints.ubu = np.ones(cs.NU)
+    ocp.constraints.idxbu = np.arange(NU)
+    ocp.constraints.lbu = -np.full(NU, SIGMA_INPUT_MAX)
+    ocp.constraints.ubu = np.full(NU, SIGMA_INPUT_MAX)
     for stage in ("_0", ""):
-        setattr(ocp.constraints, f"lh{stage}", np.concatenate([-np.ones(2), [0.0]]))
+        setattr(ocp.constraints, f"lh{stage}", -np.ones(NH))
         setattr(ocp.constraints, f"uh{stage}", np.ones(NH))
     ocp.constraints.lh_e = -np.ones(NH_E)
     ocp.constraints.uh_e = np.ones(NH_E)
@@ -226,12 +388,13 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # L1, never quadratic: a quadratic price is cheap near the boundary and leaks
     # violation everywhere, a linear one with a big enough coefficient is exact.
     # Soft rows are the ones a caller would rather have late than refused -- sway,
-    # pump, settled box. Input, joint range and goal stay hard: violating those
-    # is not a slower plan, it is a wrong one.
-    ocp.constraints.idxsh_0 = np.arange(NH)
-    ocp.constraints.idxsh = np.arange(NH)
+    # pump, settled box. Rate, input and progress stay hard: violating those is
+    # not a slower plan, it is a wrong one.
+    soft = np.arange(H_RATE)
+    ocp.constraints.idxsh_0 = soft
+    ocp.constraints.idxsh = soft
     ocp.constraints.idxsh_e = np.arange(NH_E)
-    for stage, rows in (("_0", NH), ("", NH), ("_e", NH_E)):
+    for stage, rows in (("_0", soft.size), ("", soft.size), ("_e", NH_E)):
         setattr(ocp.cost, f"Zl{stage}", np.zeros(rows))
         setattr(ocp.cost, f"Zu{stage}", np.zeros(rows))
         setattr(ocp.cost, f"zl{stage}", np.ones(rows))
@@ -274,7 +437,7 @@ class Trajectory:
     time: np.ndarray  # (N+1,)
     q_a: np.ndarray  # (N+1, 5)
     dq_a: np.ndarray
-    ddq_a: np.ndarray  # the input, and what the acceleration box bounds
+    ddq_a: np.ndarray  # what the acceleration rows bound
     q_u: np.ndarray  # (N+1, 2)
     dq_u: np.ndarray
     q_u_eq: np.ndarray
@@ -308,31 +471,32 @@ class TrajectoryOcp:
     """
     The generated solver, with the bounds one request needs written onto it.
 
-    Built once. acados regenerates and recompiles into `CACHE`, outside the source
-    tree -- seconds on a warm tree, minutes on a cold one. Construction-time work,
-    not per-request work.
+    Built once. acados regenerates and recompiles into `cache_tree`, outside the
+    source tree -- seconds on a warm tree, minutes on a cold one. Construction-time
+    work, not per-request work.
     """
 
     def __init__(self, description_xml: str, limits, config, weights: dict):
         self.limits, self.config = limits, config
+        self.segments = int(config.path_segments)
+        baked = {
+            "ocp_intervals": config.ocp_intervals,
+            "ocp_horizon": config.ocp_horizon,
+            "ocp_integrator": config.ocp_integrator,
+            "ocp_max_iterations": config.ocp_max_iterations,
+            "ocp_tolerance": config.ocp_tolerance,
+            "levenberg_marquardt": config.levenberg_marquardt,
+            "q_sway_max": config.q_sway_max,
+            "dq_sway_max": config.dq_sway_max,
+            "ddq_a_max": config.ddq_a_max,
+            "path_segments": config.path_segments,
+        }
+        hydraulics = {"pump_flow_max": config.pump_flow_max}
         ocp, self.scale, model = build_ocp(
-            description_xml,
-            {
-                "ocp_intervals": config.ocp_intervals,
-                "ocp_horizon": config.ocp_horizon,
-                "ocp_integrator": config.ocp_integrator,
-                "ocp_max_iterations": config.ocp_max_iterations,
-                "ocp_tolerance": config.ocp_tolerance,
-                "levenberg_marquardt": config.levenberg_marquardt,
-                "q_sway_max": config.q_sway_max,
-                "dq_sway_max": config.dq_sway_max,
-                "ddq_a_max": config.ddq_a_max,
-                "weights": weights,
-            },
-            {"pump_flow_max": config.pump_flow_max},
+            description_xml, {**baked, "weights": weights}, hydraulics
         )
-        # The pump row in physical units, off the graph the solver constrains, so
-        # reported and bounded cannot drift apart.
+        # The pump row in the *unreduced* coordinates, off the graph the solver
+        # constrains, so reported and bounded cannot drift apart.
         flow = ca.sum1(
             model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
         )
@@ -343,23 +507,39 @@ class TrajectoryOcp:
         # tree; builds one on first construction, costing minutes. Regenerating
         # unconditionally would overwrite the exporter's output and make `--check`
         # meaningless.
-        tree = CACHE / SOLVER_NAME
+        tree = cache_tree(baked, hydraulics)
         library = tree / f"libacados_ocp_solver_{SOLVER_NAME}.so"
         fresh = not library.is_file()
         CACHE.mkdir(parents=True, exist_ok=True)
         ocp.code_export_directory = str(tree)
         self.solver = AcadosOcpSolver(
             ocp,
-            json_file=str(CACHE / f"{SOLVER_NAME}.json"),
+            json_file=str(tree.with_suffix(".json")),
             generate=fresh,
             build=fresh,
             verbose=False,
         )
 
+    def start_speed(self, coefficients: np.ndarray, dq_a_start) -> tuple:
+        """
+        Return `v(0)` from the measured start velocity, and how much is lost.
+
+        A motion confined to the path can only leave along its tangent, so a
+        start velocity off it is not representable at all. The projection is the
+        best available answer and the residual says how wrong it is; `solve`
+        refuses rather than start from a state the machine is not in.
+        """
+        tangent = evaluate(coefficients, 0.0, order=1)[0]
+        dq_a_start = np.asarray(dq_a_start, dtype=float)
+        squared = float(tangent @ tangent)
+        if squared <= 0.0:
+            return 0.0, float(np.max(np.abs(dq_a_start)))
+        speed = float(tangent @ dq_a_start) / squared
+        return speed, float(np.max(np.abs(tangent * speed - dq_a_start)))
+
     def solve(
         self,
-        q_a_start: np.ndarray,
-        q_a_goal: np.ndarray,
+        coefficients: np.ndarray,
         q_u_start: np.ndarray,
         dq_a_start: np.ndarray,
         dq_u_start: np.ndarray,
@@ -369,63 +549,100 @@ class TrajectoryOcp:
     ) -> Trajectory:
         """Solve one request, or refuse with what the solver said."""
         cfg, lim, N = self.config, self.limits, self.N
-        solver = self.solver
-        big = 1.0e6
-        dq_max = cfg.kappa * speed_scale * lim.dq_max
-        ddq_max = cfg.kappa * speed_scale**2 * cfg.ddq_a_max
+        solver, big = self.solver, 1.0e6
+        rate_hi = cfg.kappa * speed_scale
+        input_hi = cfg.kappa * speed_scale**2
         flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
         theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
 
-        lower = np.where(lim.bounded, lim.lower, -big)
-        upper = np.where(lim.bounded, lim.upper, big)
-        lbx = np.concatenate(
-            [lower, [-big, -big], -dq_max, -cfg.dq_sway_max, theta[:1]]
+        speed_start, unrepresentable = self.start_speed(coefficients, dq_a_start)
+        # 1e-6 rad/s is measurement noise; above it the path's tangent is not the
+        # direction the machine is already going, and projecting silently would
+        # put the solve on a state it is not in.
+        if unrepresentable > 1.0e-6:
+            raise PlanningError(
+                f"the measured start velocity is {unrepresentable:.3e} rad/s off "
+                "the path tangent, and a motion confined to the path cannot leave "
+                "in any other direction"
+            )
+
+        # `sigma` in [0, 1] and `v >= 0`: the machine may not run backwards along
+        # its own curve, which is the one thing the certificate says nothing
+        # about.
+        lbx = np.concatenate([[0.0], [-big, -big], [0.0], -cfg.dq_sway_max, theta[:1]])
+        ubx = np.concatenate([[1.0], [big, big], [big], cfg.dq_sway_max, theta[1:]])
+        x0 = np.concatenate([[0.0], q_u_start, [speed_start], dq_u_start])
+        planned = cs.K_PLANNED_DOF
+        lh = np.concatenate(
+            [
+                -np.ones(2),
+                [0.0],
+                np.full(planned, -rate_hi),
+                np.full(planned, -input_hi),
+            ]
         )
-        ubx = np.concatenate([upper, [big, big], dq_max, cfg.dq_sway_max, theta[1:]])
-        x0 = np.concatenate([q_a_start, q_u_start, dq_a_start, dq_u_start])
-        lh = np.concatenate([-np.ones(2), [0.0]])
-        uh = np.concatenate([np.ones(2), [flow_hi]])
+        uh = np.concatenate(
+            [
+                np.ones(2),
+                [flow_hi],
+                np.full(planned, rate_hi),
+                np.full(planned, input_hi),
+            ]
+        )
         settled = np.concatenate(
             [
                 cfg.terminal_q_sway_max / cfg.q_sway_max,
                 cfg.terminal_dq_sway_max / cfg.dq_sway_max,
             ]
         )
-        parameters = np.concatenate([[q_tool], payload])
+        parameters = np.concatenate(
+            [[q_tool], payload, np.asarray(coefficients, dtype=float).reshape(-1)]
+        )
         price = float(cfg.ocp_slack_price)
+        soft = H_RATE
 
-        # A straight line in joint space with the pendulum hanging: no rollout and
-        # nothing that knows the answer, which is all this problem has needed.
+        # Uniform progress with the pendulum hanging: no rollout and nothing that
+        # knows the answer, which is all this problem has needed.
         solver.reset()
         for node in range(N + 1):
-            ramp = node / N
-            guess = q_a_start + ramp * (q_a_goal - q_a_start)
+            sigma = node / N
+            guess = evaluate(coefficients, sigma)[0]
             solver.set(node, "p", parameters)
             solver.set(
                 node,
                 "x",
-                np.concatenate([guess, passive_equilibrium(guess), np.zeros(7), [1.0]]),
+                np.concatenate(
+                    [
+                        [sigma],
+                        passive_equilibrium(guess),
+                        [1.0 / self.nominal],
+                        np.zeros(cs.K_PASSIVE_DOF),
+                        [1.0],
+                    ]
+                ),
             )
             if node < N:
-                solver.set(node, "u", np.zeros(cs.NU))
-                solver.constraints_set(node, "lbu", -ddq_max)
-                solver.constraints_set(node, "ubu", ddq_max)
+                solver.set(node, "u", np.zeros(NU))
                 solver.constraints_set(node, "lh", lh)
                 solver.constraints_set(node, "uh", uh)
-                solver.cost_set(node, "zl", np.full(NH, price))
-                solver.cost_set(node, "zu", np.full(NH, price))
+                solver.cost_set(node, "zl", np.full(soft, price))
+                solver.cost_set(node, "zu", np.full(soft, price))
             if 0 < node < N:
                 solver.constraints_set(node, "lbx", lbx)
                 solver.constraints_set(node, "ubx", ubx)
         solver.constraints_set(0, "lbx", x0)
         solver.constraints_set(0, "ubx", x0)
-        # The goal is a hard terminal box, and arriving stopped with it. The tool
-        # may hang where it likes; how still it has to be is `h_e`, softly.
+        # The goal is the end of the curve, arrived at stopped. The tool may hang
+        # where it likes; how still it has to be is `h_e`, softly.
         solver.constraints_set(
-            N, "lbx", np.concatenate([q_a_goal, [-big, -big], np.zeros(7), theta[:1]])
+            N,
+            "lbx",
+            np.concatenate([[1.0], [-big, -big], [0.0], np.zeros(2), theta[:1]]),
         )
         solver.constraints_set(
-            N, "ubx", np.concatenate([q_a_goal, [big, big], np.zeros(7), theta[1:]])
+            N,
+            "ubx",
+            np.concatenate([[1.0], [big, big], [0.0], np.zeros(2), theta[1:]]),
         )
         solver.constraints_set(N, "lh", -settled)
         solver.constraints_set(N, "uh", settled)
@@ -437,24 +654,41 @@ class TrajectoryOcp:
         elapsed = time.monotonic() - started
 
         state = np.array([solver.get(node, "x") for node in range(N + 1)])
+        control = np.array([solver.get(node, "u") for node in range(N)])
+        control = np.vstack([control, control[-1]])
+        guard = float(np.max(np.abs(control))) / SIGMA_INPUT_MAX
         duration = float(state[0, X_HORIZON]) * self.nominal
-        q_a = state[:, cs.X_PLANNED_POSITION : cs.X_PLANNED_POSITION + cs.K_PLANNED_DOF]
-        q_u = state[:, cs.X_PASSIVE_POSITION : cs.X_PASSIVE_POSITION + cs.K_PASSIVE_DOF]
+        sigma = state[:, X_SIGMA]
+        speed = state[:, X_SPEED]
+        q_a = evaluate(coefficients, sigma)
+        tangent = evaluate(coefficients, sigma, order=1)
+        curvature = evaluate(coefficients, sigma, order=2)
+        dq_a = tangent * speed[:, None]
+        ddq_a = curvature * speed[:, None] ** 2 + tangent * control
+        q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
+        dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
         slack = max(
             float(np.max(solver.get(node, "sl"), initial=0.0)) for node in range(N + 1)
         )
-        control = np.array([solver.get(node, "u") for node in range(N)])
         flow = np.array(
             [
                 float(
                     self._flow(
-                        state[node, : cs.NX], control[min(node, N - 1)], parameters
+                        np.concatenate([q_a[node], q_u[node], dq_a[node], dq_u[node]]),
+                        ddq_a[node],
+                        parameters[: cs.NP],
                     )
                 )
                 / cfg.pump_flow_max
                 for node in range(N + 1)
             ]
         )
+        if guard > 0.99:
+            raise PlanningError(
+                f"the sigma'' guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
+                "duration this answer carries is partly that constant's and not the "
+                "machine's"
+            )
         if status != 0:
             # The residuals are the whole diagnosis of a non-convergence -- which
             # of the four stalled says whether it is the dynamics, the goal box or
@@ -471,14 +705,10 @@ class TrajectoryOcp:
         return Trajectory(
             time=np.linspace(0.0, duration, N + 1),
             q_a=q_a,
-            dq_a=state[
-                :, cs.X_PLANNED_VELOCITY : cs.X_PLANNED_VELOCITY + cs.K_PLANNED_DOF
-            ],
-            ddq_a=np.vstack([control, control[-1]]),
+            dq_a=dq_a,
+            ddq_a=ddq_a,
             q_u=q_u,
-            dq_u=state[
-                :, cs.X_PASSIVE_VELOCITY : cs.X_PASSIVE_VELOCITY + cs.K_PASSIVE_DOF
-            ],
+            dq_u=dq_u,
             q_u_eq=np.array([passive_equilibrium(row) for row in q_a]),
             pump_flow=flow,
             slack=slack,

@@ -29,14 +29,16 @@ from crane_planning.ocp import (  # noqa: E402
     DESCRIPTION,
     GENERATED_HEADER,
     H_FLOW,
+    H_INPUT,
+    H_RATE,
     H_SWAY,
     HE_SWAY,
     HE_SWAY_RATE,
     NH,
     NH_E,
-    SOLVER_NAME,
     X_HORIZON,
     build_ocp,
+    cache_tree,
 )
 
 # ------------------------------------------------------------------ generation
@@ -75,6 +77,8 @@ def write_header(output: Path, parameters: dict, scale: np.ndarray) -> Path:
                 "",
                 f"#define CRANE_PLANNING_OCP_H_SWAY {H_SWAY}",
                 f"#define CRANE_PLANNING_OCP_H_FLOW {H_FLOW}",
+                f"#define CRANE_PLANNING_OCP_H_RATE {H_RATE}",
+                f"#define CRANE_PLANNING_OCP_H_INPUT {H_INPUT}",
                 f"#define CRANE_PLANNING_OCP_NH {NH}",
                 f"#define CRANE_PLANNING_OCP_HE_SWAY {HE_SWAY}",
                 f"#define CRANE_PLANNING_OCP_HE_SWAY_RATE {HE_SWAY_RATE}",
@@ -122,9 +126,13 @@ def compile_solver(descriptions: Path, parameters: dict, hydraulics: dict) -> No
         (descriptions / DESCRIPTION).read_text(), parameters, hydraulics
     )
     CACHE.mkdir(parents=True, exist_ok=True)
-    ocp.code_export_directory = str(CACHE / SOLVER_NAME)
-    AcadosOcpSolver(ocp, json_file=str(CACHE / f"{SOLVER_NAME}.json"), verbose=False)
-    print(f"compiled {CACHE / SOLVER_NAME}")
+    # Named by what is baked, not by the tool alone: a cached `.so` is loaded and
+    # not compared, so a changed `path_segments` or integrator has to land in a
+    # different directory or the node answers with the previous build.
+    tree = cache_tree(parameters, hydraulics)
+    ocp.code_export_directory = str(tree)
+    AcadosOcpSolver(ocp, json_file=str(tree.with_suffix(".json")), verbose=False)
+    print(f"compiled {tree}")
 
 
 def main() -> int:

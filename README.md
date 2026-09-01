@@ -5,7 +5,7 @@ The `crane_planner` node. Two stages, one dependency that matters.
 ```
 plan(goal position + yaw in K0_mounting_base)
   -> deterministic corridors   direct first, then lift/traverse/descend + lateral
-  -> time-optimal OCP          acados, horizon as a state, endpoints only
+  -> time-optimal OCP          acados, horizon as a state, along that curve
   -> JointTrajectory on /crane/reference
 ```
 
@@ -124,16 +124,26 @@ is unbounded there, so the step bound refuses it.
 
 It approximates rather than interpolates. Interpolation ties segment count to
 sample count, and those want opposite things -- the certificate wants samples
-dense, the curve wants long end intervals for the clamp. A fixed
-`path_segments` breaks the tie and stops the fit chasing IK noise.
+dense, the curve wants long end intervals. A fixed `path_segments` breaks the
+tie and stops the fit chasing IK noise -- and it is structural besides: the OCP
+is code-generated against a parameter vector that many cubics wide, so a short
+lift is resampled along its own chords rather than fitted with fewer pieces.
 
-Endpoints and end slopes are imposed exactly by writing four coefficients; the
-rest are left as fitted. The chord total `L` scales the start slope --
-`q_a'(0) = dq_a*L` is the same motion measured in sigma, so a plan starting from
-a moving machine leaves along the direction it is already going.
+Endpoints are imposed exactly by writing the two outer coefficients; the rest are
+left as fitted. The start slope is written too, but **only while the machine is
+moving**: the OCP follows this curve, so `dq_a = q_a'(sigma)*v` can only leave
+along the tangent and the tangent has to be the measured direction --
+`q_a'(0) = dq_a*L` is that same motion measured in sigma. From rest there is no
+direction to honour, and writing one anyway sets `q_a'(0) = 0`, where
+`ddq_a = q_a'' v^2 + q_a' a` contains no `a`: a singular input, not a slow one.
 
-`Path` carries `position(sigma)` and nothing else. No consumer wants a
-derivative.
+The goal end is never clamped, for the same reason. Arriving stopped is `v = 0`,
+a condition on the timing; asking the geometry for it as well is asking twice and
+paying twice. What comes out is within 5% of unit speed in the `dq_max` metric
+over the whole path -- arclength in that metric, without anyone reparametrising.
+
+`Path` carries `position(sigma)`. The OCP wants derivatives and reads the spline
+itself, once, through `ocp.power_coefficients`.
 
 ## The timing OCP
 
@@ -142,15 +152,33 @@ whose derivative is zero: a single solve is time-optimal, no outer duration
 search. Every residual row is divided by the limit it is measured against, so
 1.0 is the bound on all of them alike.
 
-It is handed the geometric stage's two endpoints and nothing else.
+**`q_a` is not a decision variable.** It is handed the certified curve and moves
+*along* it, deciding only how fast:
 
-**No obstacle rows.** It moves between those endpoints however the dynamics
-prefer -- where its speed comes from, and what voids the clearance proof the
-stage above just produced: the certified curve is not the published curve.
-Wiring the corridor is `docs/features/corridor-mpc/brief.md`, and it is not done.
+    q_a = c(sigma)   dq_a = c'(sigma) v   ddq_a = c''(sigma) v^2 + c'(sigma) a
 
-Joint velocity/acceleration, reserved pump flow and the sway box are constraints
-in the solve. Terminal sway offset and rate are checked after it against
+with `v = dsigma/dt` a state and `a` the input, so `x` is 7 wide and `u` is 1.
+The executed curve is the certified curve, so the clearance proof holds verbatim
+-- no obstacle rows, no corridor, nothing to re-prove.
+
+The stage this replaced planned `q_a` freely between the curve's two endpoints.
+Measured against it, on the shipped defaults: that freedom took the machine
+**0.84-1.29 m** of displacement off the certified curve, against a 0.303 m
+clearance requirement of which 0.05 m is spare -- the proof was void by roughly
+25x the margin. Giving it up costs **0.4-4.4% of duration** and halves the SQP
+iterations. It also converges where the larger problem did not: `speed_scale 0.5`
+and `kappa 0.3` both stalled at 60 iterations before and now answer in 22 and 20.
+
+What it costs is lateral authority: sway is damped by timing alone. The
+duration numbers above are the whole price. `docs/features/corridor-mpc/brief.md`
+is the design for buying some of that authority back with a corridor; on this
+evidence it is not owed.
+
+Joint velocity and acceleration, reserved pump flow and the sway box are
+constraints in the solve; `sigma` is boxed to [0, 1] and `v >= 0`, because the
+machine may not run backwards along its own curve. `q_a` needs no range row --
+it is on the curve, and `fit` already refused a curve leaving joint range.
+Terminal sway offset and rate are checked after the solve against
 `terminal_q_sway_max`/`terminal_dq_sway_max`; a near miss is refused, not
 published.
 
@@ -162,11 +190,11 @@ development image:
 | | |
 |---|---|
 | lifted configurations | 177 |
-| OCP solve | 0.18 s, 22 SQP iterations |
+| OCP solve | 0.07-0.20 s, 14 SQP iterations |
 | planner call | 1.1-1.2 s |
-| trajectory duration | 6.19 s |
-| terminal sway | 0.29 deg, 0.000 rad/s |
-| peak pump draw | 0.72 of the limit at kappa = 0.8 |
+| trajectory duration | 6.28 s |
+| terminal sway | 0.39 deg, 0.000 rad/s |
+| peak pump draw | 0.76 of the limit at kappa = 0.8 |
 
 The geometric stage is nearly all of it: one IK solve plus one collision query
 per lifted configuration. `margin_interp` is the knob -- halving it roughly
