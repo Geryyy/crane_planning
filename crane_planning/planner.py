@@ -68,7 +68,7 @@ from .geometry import (
     wrap,
     yaw_of,
 )
-from .ocp import Trajectory, TrajectoryOcp, power_coefficients
+from .ocp import Trajectory, TrajectoryOcp, evaluate, power_coefficients
 
 # ------------------------------------------------------------------ the planner
 
@@ -93,6 +93,34 @@ class Start:
     @property
     def q_u(self) -> np.ndarray:
         return self.q[list(PASSIVE_INDICES)]
+
+
+def actuated_samples(timing, stamps: np.ndarray) -> tuple:
+    """
+    `q_a` and `dq_a` at `stamps`, on the curve rather than on the chord.
+
+    `q_a = c(sigma)` is an identity the solve never leaves, so `q_a` is not a row
+    to interpolate: between two nodes the straight line joining them is off the
+    curve, and off the curve the certificate was run on. Reconstruct `sigma`
+    instead and evaluate.
+
+    The reconstruction is exact, not an interpolation of its own. acados holds
+    the input constant across an interval and `sigma'' = a` there, so `sigma` is
+    quadratic in elapsed time on each interval and `v` is linear.
+    """
+    node = np.clip(
+        np.searchsorted(timing.time, stamps, side="right") - 1,
+        0,
+        len(timing.time) - 2,
+    )
+    dt = stamps - timing.time[node]
+    a = timing.acceleration[node]
+    sigma = timing.sigma[node] + timing.speed[node] * dt + 0.5 * a * dt * dt
+    speed = timing.speed[node] + a * dt
+    return (
+        evaluate(timing.coefficients, sigma),
+        evaluate(timing.coefficients, sigma, order=1) * speed[:, None],
+    )
 
 
 @dataclass
@@ -395,6 +423,15 @@ class Planner:
         pair is carried as the OCP **planned** it, not as the pose the tool would
         settle to: on the way to the goal the tool is swinging, and that is what
         the trajectory claims.
+
+        `q_a` is the exception and it is the whole point of the method. It is not
+        an independent row: `q_a = c(sigma)` is an identity the solve never
+        leaves, so interpolating it between nodes reports the chord and not the
+        curve -- configurations the plan never contained, off the curve the
+        certificate was run on. So `sigma` is reconstructed and the curve is
+        evaluated at it. The reconstruction is exact rather than interpolated:
+        acados holds the input constant across an interval, and `sigma'' = a`
+        there, so `sigma` is quadratic and `v` linear on each interval.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
@@ -409,10 +446,14 @@ class Planner:
                 ]
             ).T
 
+        q_a, dq_a = actuated_samples(timing, stamps)
+
         q = np.zeros((len(stamps), GENERALIZED_DOF))
         dq = np.zeros_like(q)
-        q[:, list(PLANNED_INDICES)] = sample(timing.q_a)
-        dq[:, list(PLANNED_INDICES)] = sample(timing.dq_a)
+        q[:, list(PLANNED_INDICES)] = q_a
+        dq[:, list(PLANNED_INDICES)] = dq_a
+        # No closed form for the passive pair: it is an integrated state, not a
+        # function of `sigma`, so interpolating it is the only option here.
         q[:, list(PASSIVE_INDICES)] = sample(timing.q_u)
         dq[:, list(PASSIVE_INDICES)] = sample(timing.dq_u)
         q[:, TOOL_INDEX] = start.q_tool

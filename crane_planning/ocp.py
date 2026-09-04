@@ -438,6 +438,17 @@ class Trajectory:
     q_a: np.ndarray  # (N+1, 5)
     dq_a: np.ndarray
     ddq_a: np.ndarray  # what the acceleration rows bound
+    #: The path state itself, and the coefficients it indexes. `q_a` is a
+    #: function of these and not an independent answer, so a consumer that has to
+    #: resample must resample `sigma` and evaluate the curve -- interpolating
+    #: `q_a` leaves the certified curve for the chord between two of its points.
+    #: `acceleration` is the solver's own input, repeated at `N` so every array
+    #: here is `N+1` long; acados holds it constant across an interval, which
+    #: makes `sigma` exactly quadratic in time there.
+    sigma: np.ndarray  # (N+1,)
+    speed: np.ndarray  # (N+1,)
+    acceleration: np.ndarray  # (N+1,)
+    coefficients: np.ndarray  # (segments, ORDER, 5)
     q_u: np.ndarray  # (N+1, 2)
     dq_u: np.ndarray
     q_u_eq: np.ndarray
@@ -719,6 +730,10 @@ class TrajectoryOcp:
             q_a=q_a,
             dq_a=dq_a,
             ddq_a=ddq_a,
+            sigma=sigma,
+            speed=speed,
+            acceleration=control[:, 0],
+            coefficients=coefficients,
             q_u=q_u,
             dq_u=dq_u,
             q_u_eq=np.array([passive_equilibrium(row) for row in q_a]),
