@@ -229,6 +229,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument(
+        "--kappa",
+        type=float,
+        default=None,
+        help="override the deployment reservation, to attribute what it costs",
+    )
+    parser.add_argument(
         "--only", default=None, help="one move name from the shipped set"
     )
     parser.add_argument(
@@ -243,8 +249,11 @@ def main() -> int:
     if not moves:
         raise SystemExit(f"no move named {options.only!r}")
 
+    config = PlannerConfig()
+    if options.kappa is not None:
+        config.kappa = options.kappa
     built = time.perf_counter()
-    planner = Planner(description(), PlannerConfig())
+    planner = Planner(description(), config)
     print(f"planner built in {time.perf_counter() - built:.1f} s")
 
     if options.emit_requests is not None:
