@@ -43,6 +43,11 @@ from .config import (
 TRUCK_ID = "truck"
 PAYLOAD_ID = "payload"
 
+#: The two passive hinges the tool hangs on, in `q_sway_max` / `PASSIVE_INDICES`
+#: order. Orthogonal axes 0.223 m apart, so their swings do not add -- see
+#: `Geometry._envelope`.
+PASSIVE_PIVOTS = (Frame.TIP, Frame.TILT)
+
 
 # ------------------------------------------------------------------ the scene
 
@@ -209,10 +214,29 @@ class Geometry:
         """
         Return how far the farthest carried point can swing, in metres.
 
-        Measured from the passive pivot to that point, **not to the TCP**: a
-        gripped block hangs below the TCP, so it swings on a longer pendulum for
-        the same `q_sway_max`. Everything between pivot and TCP is closer in and
-        swings less, which is why only the carried body is added.
+        The tool hangs on **two** hinges, not one: `theta6_tip` at `Frame.TIP`
+        and `theta7_tilt` 0.223 m below it at `Frame.TILT`. Their axes are
+        orthogonal -- a Cardan joint, which is what `K6_double_joint_link` is
+        named for -- and `q_sway_max` bounds them separately with nothing
+        coupling them, so both reach their bound at once.
+
+        Each hinge swings the carried point about its own pivot and the two
+        displacements are perpendicular, so they compose as a hypotenuse. The
+        *upper* hinge has the *longer* lever, so dropping it understates the
+        swing rather than erring safe: on the PZS100 one hinge gives 0.153 m
+        where two give 0.251 m.
+
+        Per hinge the term is the **chord** `2 L sin(theta/2)`, not `L sin
+        theta`. The difference is 0.5%, and it is the difference between a bound
+        and an estimate: `sin` undershoots the swept sway box by a few tens of
+        microns, which a bound may not do.
+
+        Levers are read **at the hanging equilibrium**, which is where the sway
+        box is centred. `|TILT -> TCP|` is rigid and does not care, but
+        `|TIP -> TCP|` bends with the tilt hinge and reads 0.802 m instead of
+        0.994 m at a raw zero configuration. Neither depends on boom, arm or
+        telescope, so one configuration is enough. A gripped block hangs below
+        the TCP and lengthens both levers alike.
 
         The sway box is shared with the controller, so this is not a conservative
         allowance for a swing that will not happen -- it is a state the machine is
@@ -220,11 +244,17 @@ class Geometry:
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
-        hinge = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TILT)
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q[list(PLANNED_INDICES)])
         tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
-        length = float(np.linalg.norm(tcp.position_m - hinge.position_m))
-        length += self._carried_reach()
-        return length * float(np.sin(np.max(np.abs(self.config.q_sway_max))))
+        reach = self._carried_reach()
+        swing = []
+        for pivot, bound in zip(
+            PASSIVE_PIVOTS, np.abs(self.config.q_sway_max), strict=True
+        ):
+            origin = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, pivot)
+            lever = float(np.linalg.norm(tcp.position_m - origin.position_m)) + reach
+            swing.append(lever * 2.0 * float(np.sin(0.5 * bound)))
+        return float(np.hypot(*swing))
 
     def _radii(self) -> np.ndarray:
         """
