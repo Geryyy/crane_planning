@@ -87,8 +87,15 @@ NH = 3 + 2 * cs.K_PLANNED_DOF
 #: Row order of `h_e`: the settled box the caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
-#: Cubic path, so four power-basis coefficients per segment.
-ORDER = 4
+#: Quintic path, so six power-basis coefficients per segment. Degree 5 with
+#: simple interior knots is `C4` in `sigma`, which is what C3's flat inversion
+#: needs -- continuity becomes a property of the parameterization rather than
+#: something a constraint has to enforce.
+ORDER = 6
+
+#: How many derivative levels the solver builds off the path: `c` through its
+#: fourth, because `q_a(t) = c(sigma(t))` differentiated four times reaches it.
+PATH_DERIVATIVES = 5
 
 #: Box on `a`, a numerical guard and not a physical limit -- `sigma''` is bounded
 #: only through the `ddq_a` rows, and where the tangent is short that leaves its
@@ -154,6 +161,10 @@ def cache_tree(parameters: dict, hydraulics: dict) -> Path:
         value = parameters[key]
         baked[key] = value.tolist() if hasattr(value, "tolist") else value
     baked["pump_flow_max"] = float(hydraulics["pump_flow_max"])
+    # Not a parameter, so it cannot come from `BAKED`, and it sets the parameter
+    # vector's width: a warm cache built at a different `ORDER` would be handed a
+    # coefficient block of the wrong shape.
+    baked["path_order"] = ORDER
     digest = hashlib.sha1(json.dumps(baked, sort_keys=True).encode()).hexdigest()
     return CACHE / f"{SOLVER_NAME}_{digest[:10]}"
 
@@ -163,7 +174,7 @@ def cache_tree(parameters: dict, hydraulics: dict) -> Path:
 
 def power_coefficients(path, segments: int) -> np.ndarray:
     """
-    `(segments, 4, 5)`: `c(sigma) = sum_m a[k, m] (sigma - k/S)^m` on segment k.
+    `(segments, ORDER, 5)`: `c(sigma) = sum_m a[k, m] (sigma - k/S)^m` on segment k.
 
     A power basis on uniform breakpoints, not the B-spline basis, because the
     solver has to select a segment symbolically and uniform breakpoints make that
@@ -179,6 +190,14 @@ def power_coefficients(path, segments: int) -> np.ndarray:
         raise PlanningError(
             f"the fitted path carries {len(breaks) - 1} segments, but the solver "
             f"was generated for {segments}; its parameter vector is that shape"
+        )
+    # `geometry.fit`'s degree and `ORDER` are one number written in two places,
+    # and the failure if they drift is silent: a shorter power basis truncates
+    # the curve instead of refusing it.
+    if spline.k != ORDER - 1:
+        raise PlanningError(
+            f"the fitted path is degree {spline.k}, but the solver carries "
+            f"{ORDER} coefficients per segment, which is degree {ORDER - 1}"
         )
     rows, derivative, factorial = [], spline, 1.0
     for order in range(ORDER):
@@ -209,26 +228,29 @@ def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
 
 
 def path_expression(sigma, coefficients, segments: int) -> list:
-    """Return `[c, c', c'']` as `casadi.SX`, coefficients left symbolic."""
+    """
+    `PATH_DERIVATIVES` levels of the path as `casadi.SX`, coefficients symbolic.
+
+    One loop over derivative order rather than a branch per level, so raising
+    `ORDER` is a constant change and not an edit here. It is the symbolic mirror
+    of `evaluate` and the two must agree at every level.
+    """
     index = ca.fmin(ca.fmax(ca.floor(sigma * segments), 0.0), segments - 1)
     local = sigma - index / segments
-    value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(3)]
+    value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(PATH_DERIVATIVES)]
     for segment in range(segments):
         # A comparison carries no derivative in casadi, so `d/dsigma` of the sum
         # is the selected polynomial's own derivative -- which is what is wanted,
-        # and correct at a breakpoint because the curve is C2 across it.
+        # and correct at a breakpoint because the curve is C4 across it.
         on = index == segment
         for m in range(ORDER):
             first = (segment * ORDER + m) * cs.K_PLANNED_DOF
             block = on * coefficients[first : first + cs.K_PLANNED_DOF]
-            value[0] += block if m == 0 else block * local**m
-            if m >= 1:
-                value[1] += m * block if m == 1 else m * block * local ** (m - 1)
-            if m >= 2:
-                value[2] += (
-                    m * (m - 1) * block
-                    if m == 2
-                    else m * (m - 1) * block * local ** (m - 2)
+            for order in range(min(PATH_DERIVATIVES, m + 1)):
+                scale = float(np.prod([m - k for k in range(order)]))
+                power = m - order
+                value[order] += (
+                    scale * block if power == 0 else scale * block * local**power
                 )
     return value
 
@@ -265,7 +287,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     #: numbers change between requests and the solver is generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
 
-    centre, tangent, curvature = path_expression(sigma, coefficients, segments)
+    centre, tangent, curvature = path_expression(sigma, coefficients, segments)[:3]
     q_a = centre
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration

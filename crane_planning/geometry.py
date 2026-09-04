@@ -770,21 +770,37 @@ def fit(
     """
     if len(waypoints) < 2:
         raise PlanningError("the lifted path carries fewer than two configurations")
+
+    # Degree 5, not 3. With simple interior knots a degree-`d` B-spline is
+    # `C(d-1)`, so a quintic is `C4` in sigma -- the derivative count C3's flat
+    # inversion needs, obtained from the parameterization rather than enforced.
+    # It must match `ocp.ORDER`, which is `degree + 1`.
+    degree = 5
+    # Exactly `path_segments`, never fewer: the OCP is code-generated against a
+    # parameter vector that many polynomials wide, so a short lift answered with
+    # fewer pieces is a different problem, not a smaller one. Resampling the
+    # polyline along its own chords is free -- it is not what gets certified,
+    # only what the least-squares fit is pulled towards.
+    segments = int(config.path_segments)
+    # `segments + degree` coefficients, and a least-squares fit needs data in
+    # every knot interval (Schoenberg-Whitney), not merely as many points as
+    # coefficients: at degree 5 that many points is exactly determined and
+    # `make_lsq_spline` refuses with "Need more x points". Four per segment is
+    # the sample spacing the higher degree asks for, and it costs nothing --
+    # the added points are on the polyline already, so the fit is pulled towards
+    # the same shape, only sampled better.
+    minimum = 4 * segments + degree
+    if len(waypoints) < minimum:
+        waypoints = _densify(waypoints, minimum)
+
+    # After densifying, never before: `nodes` indexes the waypoints and the two
+    # have to be the same length.
     spans = np.max(np.abs(np.diff(waypoints, axis=0)) / limits.dq_max, axis=1)
     spans = np.maximum(spans, 1.0e-9)
     total = float(np.sum(spans))
     nodes = np.concatenate([[0.0], np.cumsum(spans) / total])
     nodes[-1] = 1.0
 
-    degree = 3
-    # Exactly `path_segments`, never fewer: the OCP is code-generated against a
-    # parameter vector that many cubics wide, so a short lift answered with
-    # fewer pieces is a different problem, not a smaller one. Resampling the
-    # polyline along its own chords is free -- it is not what gets certified,
-    # only what the least-squares fit is pulled towards.
-    segments = int(config.path_segments)
-    if len(waypoints) < segments + degree:
-        waypoints = _densify(waypoints, segments + degree)
     interior = np.linspace(0.0, 1.0, segments + 1)[1:-1]
     knots = np.concatenate([np.zeros(degree + 1), interior, np.ones(degree + 1)])
     try:
