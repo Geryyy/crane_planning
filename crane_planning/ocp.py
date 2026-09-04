@@ -519,6 +519,18 @@ class TrajectoryOcp:
             build=fresh,
             verbose=False,
         )
+        # `W` reaches the generated code only at export time, and a cached `.so`
+        # is *loaded*, not regenerated -- so without this the weights a caller
+        # passes are inert on every run but the one that built the tree, and
+        # `BAKED` excludes them so nothing invalidates the cache either. Swept
+        # `weights.time` over 0.3 to 10 on a warm cache and got durations equal
+        # to the centisecond; rebuilt cold at 10, two moves that had refused
+        # converged and durations fell 17-18%. Writing it here is what the
+        # `BAKED` docstring already claims happens.
+        stage_w, terminal_w = w.matrices(weights)
+        for node in range(self.N):
+            self.solver.cost_set(node, "W", stage_w)
+        self.solver.cost_set(self.N, "W", terminal_w)
 
     def start_speed(self, coefficients: np.ndarray, dq_a_start) -> tuple:
         """

@@ -33,6 +33,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
 from crane_model import Frame  # noqa: E402
 from crane_planning import Planner, PlannerConfig, PlanningError, Start  # noqa: E402
 from crane_planning import planner as planner_module  # noqa: E402
+from crane_planning import weights as crane_weights  # noqa: E402
 from crane_planning.planner import (  # noqa: E402
     ACTUATED_INDICES,
     PLANNED_INDICES,
@@ -229,6 +230,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument(
+        "--time-weight",
+        type=float,
+        default=None,
+        help="override weights.time; only has effect since the W cost_set fix",
+    )
+    parser.add_argument(
         "--kappa",
         type=float,
         default=None,
@@ -252,8 +259,11 @@ def main() -> int:
     config = PlannerConfig()
     if options.kappa is not None:
         config.kappa = options.kappa
+    weights = dict(crane_weights.DEFAULTS)
+    if options.time_weight is not None:
+        weights["time"] = options.time_weight
     built = time.perf_counter()
-    planner = Planner(description(), config)
+    planner = Planner(description(), config, weights)
     print(f"planner built in {time.perf_counter() - built:.1f} s")
 
     if options.emit_requests is not None:
