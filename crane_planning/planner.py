@@ -105,8 +105,8 @@ def actuated_samples(timing, stamps: np.ndarray) -> tuple:
     instead and evaluate.
 
     The reconstruction is exact, not an interpolation of its own. acados holds
-    the input constant across an interval and `sigma'' = a` there, so `sigma` is
-    quadratic in elapsed time on each interval and `v` is linear.
+    the input constant across an interval and `sigma'''' = s` there, so `sigma`
+    is quartic in elapsed time on each interval.
     """
     node = np.clip(
         np.searchsorted(timing.time, stamps, side="right") - 1,
@@ -114,9 +114,16 @@ def actuated_samples(timing, stamps: np.ndarray) -> tuple:
         len(timing.time) - 2,
     )
     dt = stamps - timing.time[node]
-    a = timing.acceleration[node]
-    sigma = timing.sigma[node] + timing.speed[node] * dt + 0.5 * a * dt * dt
-    speed = timing.speed[node] + a * dt
+    v, a = timing.speed[node], timing.acceleration[node]
+    j, s = timing.jerk[node], timing.snap[node]
+    sigma = (
+        timing.sigma[node]
+        + v * dt
+        + a * dt**2 / 2.0
+        + j * dt**3 / 6.0
+        + s * dt**4 / 24.0
+    )
+    speed = v + a * dt + j * dt**2 / 2.0 + s * dt**3 / 6.0
     return (
         evaluate(timing.coefficients, sigma),
         evaluate(timing.coefficients, sigma, order=1) * speed[:, None],

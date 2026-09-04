@@ -1,7 +1,8 @@
 """
 The trajectory OCP: its definition, and the solver that answers with it.
 
-`x = [sigma, q_u, v, dq_u, theta]`, `u = a`, on normalised time over [0, 1] with
+`x = [sigma, v, a, j, q_u, dq_u, theta]`, `u = s`, on normalised time over [0, 1]
+with
 `theta = T / ocp_horizon` a state whose derivative is zero -- so one solve is
 time-optimal and there is no outer search over the duration.
 
@@ -11,7 +12,12 @@ certified, and this solver decides only how fast to move along it.
 
     q_a   = c(sigma)
     dq_a  = c'(sigma) v
-    ddq_a = c''(sigma) v^2 + c'(sigma) a         with  v = d sigma/dt,  a = dv/dt
+    ddq_a = c''(sigma) v^2 + c'(sigma) a
+
+with `sigma` integrated four times, so the input is the snap and `q_a(t)` is C4 --
+the derivative count C3's flat inversion consumes. Holding the *acceleration*
+constant per interval, as an input is held, left `q_a(t)` C1 whatever the curve
+was.
 
 So the executed curve *is* the certified curve and the clearance proof holds
 verbatim -- no obstacle rows, no corridor, nothing to re-prove. The stage this
@@ -75,9 +81,11 @@ GENERATED_HEADER = "crane_planning_ocp_generated.h"
 BOOM_AXIS = 1
 ARM_AXIS = 2
 
-#: Row order of `x`. `theta` is last, as the one component the solver picks.
-X_SIGMA, X_PASSIVE, X_SPEED, X_PASSIVE_RATE, X_HORIZON = 0, 1, 3, 4, 6
-NX, NU = 7, 1
+#: Row order of `x`. The `sigma` chain is contiguous and leads, the passive pair
+#: follows, `theta` is last as the one component the solver picks.
+X_SIGMA, X_SPEED, X_ACCEL, X_JERK = 0, 1, 2, 3
+X_PASSIVE, X_PASSIVE_RATE, X_HORIZON = 4, 6, 8
+NX, NU = 9, 1
 
 #: Row order of `h`, which the caller reads back and must not re-derive. The
 #: rate and input blocks were boxes on `x` and `u` when `q_a` was planned; they
@@ -97,12 +105,24 @@ ORDER = 6
 #: fourth, because `q_a(t) = c(sigma(t))` differentiated four times reaches it.
 PATH_DERIVATIVES = 5
 
-#: Box on `a`, a numerical guard and not a physical limit -- `sigma''` is bounded
-#: only through the `ddq_a` rows, and where the tangent is short that leaves its
-#: column nearly free. Measured at 0.01-0.02 of this across the shipped defaults
-#: and `speed_scale` 0.9; `solve` refuses rather than answer if it ever binds,
-#: because a duration this constant decided is not the machine's.
-SIGMA_INPUT_MAX = 20.0
+#: Box on the input, a numerical guard and not a physical limit. `solve` refuses
+#: rather than answer if it binds, because a duration this constant decided is
+#: not the machine's.
+#:
+#: It bounded `a` while `a` was the input, at 20.0, where `a` reached 0.01-0.02
+#: of it. It bounds the **snap** now and the old value is two derivatives too
+#: small: at 20.0 four of five bench moves refuse with the guard at exactly 1.00.
+#: Swept 20 / 200 / 2000 / 20000 on the shipped defaults at `speed_scale` 0.9:
+#: the box stops binding at 200, and above it the answer is identical to the
+#: hundredth -- same durations, same `max|s|` of 24.5 / 131.8 / 51.3 / 41.2. So
+#: the solve's own demand is ~132 and 2000 is ~15x headroom, which is what a
+#: guard should be.
+#:
+#: **Nothing else bounds the jerk or the snap.** Until issue 113 puts a physical
+#: row on them, this constant is the only thing between the solver and an
+#: arbitrarily sharp reference, and the numbers above say it is not doing that
+#: job -- it is simply out of the way.
+SIGMA_INPUT_MAX = 2000.0
 
 #: What the compiled solver's structure depends on. `weights` is deliberately
 #: absent: `W` is a runtime cost field the node writes onto the built solver, so
@@ -165,6 +185,9 @@ def cache_tree(parameters: dict, hydraulics: dict) -> Path:
     # vector's width: a warm cache built at a different `ORDER` would be handed a
     # coefficient block of the wrong shape.
     baked["path_order"] = ORDER
+    # Same reasoning for the state count: it is the solver's shape, not a
+    # parameter, and a cached `.so` is loaded rather than compared.
+    baked["nx"] = NX
     digest = hashlib.sha1(json.dumps(baked, sort_keys=True).encode()).hexdigest()
     return CACHE / f"{SOLVER_NAME}_{digest[:10]}"
 
@@ -282,13 +305,23 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # `theta = T / T_nominal`, one decision variable shared by every node. acados
     # fixes `p` for a solve, so a horizon the solver picks cannot live there.
     theta = ca.SX.sym("theta")
+    # The chain: `a` and `j` are states now, `s` is the input. Holding the
+    # *acceleration* constant per interval, as acados does with an input, made
+    # `ddq_a` discontinuous and `q_a(t)` C1 whatever the curve was; holding the
+    # snap constant leaves `q_a(t)` C4, which is what C3's inversion consumes.
     acceleration = ca.SX.sym("a")
+    jerk = ca.SX.sym("j")
+    snap = ca.SX.sym("s")
     #: The path, as `p`: `path_segments` fixes the knot vector, so only these
     #: numbers change between requests and the solver is generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
 
     centre, tangent, curvature = path_expression(sigma, coefficients, segments)[:3]
     q_a = centre
+    # No `theta` here: `f_expl_expr` carries `nominal * theta`, so `v` is
+    # d sigma/dt in physical seconds already and these are the physical
+    # derivatives the limits are written against. The two levels above `ddq_a`
+    # exist in the chain but have no row yet -- issue 113 bounds them.
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration
     sway = q_u - equilibrium(q_a)
@@ -309,11 +342,12 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     acados_model = AcadosModel()
     acados_model.name = SOLVER_NAME
-    acados_model.x = ca.vertcat(sigma, q_u, speed, dq_u, theta)
-    acados_model.u = acceleration
+    acados_model.x = ca.vertcat(sigma, speed, acceleration, jerk, q_u, dq_u, theta)
+    acados_model.u = snap
     acados_model.p = ca.vertcat(model.p, coefficients)
     acados_model.f_expl_expr = ca.vertcat(
-        nominal * theta * ca.vertcat(speed, dq_u, acceleration, ddq_u), 0.0
+        nominal * theta * ca.vertcat(speed, acceleration, jerk, snap, dq_u, ddq_u),
+        0.0,
     )
     # acados does not derive one form from the other: ERK reads `f_expl_expr`,
     # IRK reads `f_impl_expr` and errors on an empty one. Both are set here
@@ -464,12 +498,14 @@ class Trajectory:
     #: function of these and not an independent answer, so a consumer that has to
     #: resample must resample `sigma` and evaluate the curve -- interpolating
     #: `q_a` leaves the certified curve for the chord between two of its points.
-    #: `acceleration` is the solver's own input, repeated at `N` so every array
-    #: here is `N+1` long; acados holds it constant across an interval, which
-    #: makes `sigma` exactly quadratic in time there.
+    #: `snap` is the solver's own input, repeated at `N` so every array here is
+    #: `N+1` long; acados holds it constant across an interval, which makes
+    #: `sigma` exactly quartic in time there.
     sigma: np.ndarray  # (N+1,)
     speed: np.ndarray  # (N+1,)
     acceleration: np.ndarray  # (N+1,)
+    jerk: np.ndarray  # (N+1,)
+    snap: np.ndarray  # (N+1,)
     coefficients: np.ndarray  # (segments, ORDER, 5)
     q_u: np.ndarray  # (N+1, 2)
     dq_u: np.ndarray
@@ -614,9 +650,12 @@ class TrajectoryOcp:
         # `sigma` in [0, 1] and `v >= 0`: the machine may not run backwards along
         # its own curve, which is the one thing the certificate says nothing
         # about.
-        lbx = np.concatenate([[0.0], [-big, -big], [0.0], -cfg.dq_sway_max, theta[:1]])
-        ubx = np.concatenate([[1.0], [big, big], [big], cfg.dq_sway_max, theta[1:]])
-        x0 = np.concatenate([[0.0], q_u_start, [speed_start], dq_u_start])
+        free = np.full(4, big)
+        lbx = np.concatenate([[0.0, 0.0], -free, -cfg.dq_sway_max, theta[:1]])
+        ubx = np.concatenate([[1.0, big], free, cfg.dq_sway_max, theta[1:]])
+        # No measured acceleration or jerk: the machine reports a velocity, so
+        # the chain starts flat above it rather than from an invented number.
+        x0 = np.concatenate([[0.0, speed_start, 0.0, 0.0], q_u_start, dq_u_start])
         planned = cs.K_PLANNED_DOF
         lh = np.concatenate(
             [
@@ -658,9 +697,8 @@ class TrajectoryOcp:
                 "x",
                 np.concatenate(
                     [
-                        [sigma],
+                        [sigma, 1.0 / self.nominal, 0.0, 0.0],
                         passive_equilibrium(guess),
-                        [1.0 / self.nominal],
                         np.zeros(cs.K_PASSIVE_DOF),
                         [1.0],
                     ]
@@ -668,6 +706,12 @@ class TrajectoryOcp:
             )
             if node < N:
                 solver.set(node, "u", np.zeros(NU))
+                # The input box is written here, not left to the export. Set
+                # only on the `AcadosOcp` it is baked into the `.so`, and it is
+                # not in the cache hash, so changing the constant on a warm tree
+                # would be inert -- the same failure the weights had.
+                solver.constraints_set(node, "lbu", -np.full(NU, SIGMA_INPUT_MAX))
+                solver.constraints_set(node, "ubu", np.full(NU, SIGMA_INPUT_MAX))
                 solver.constraints_set(node, "lh", lh)
                 solver.constraints_set(node, "uh", uh)
                 solver.cost_set(node, "zl", np.full(soft, price))
@@ -682,12 +726,14 @@ class TrajectoryOcp:
         solver.constraints_set(
             N,
             "lbx",
-            np.concatenate([[1.0], [-big, -big], [0.0], np.zeros(2), theta[:1]]),
+            np.concatenate(
+                [[1.0, 0.0, 0.0, 0.0], [-big, -big], np.zeros(2), theta[:1]]
+            ),
         )
         solver.constraints_set(
             N,
             "ubx",
-            np.concatenate([[1.0], [big, big], [0.0], np.zeros(2), theta[1:]]),
+            np.concatenate([[1.0, 0.0, 0.0, 0.0], [big, big], np.zeros(2), theta[1:]]),
         )
         solver.constraints_set(N, "lh", -settled)
         solver.constraints_set(N, "uh", settled)
@@ -705,11 +751,12 @@ class TrajectoryOcp:
         duration = float(state[0, X_HORIZON]) * self.nominal
         sigma = state[:, X_SIGMA]
         speed = state[:, X_SPEED]
+        accel = state[:, X_ACCEL]
         q_a = evaluate(coefficients, sigma)
         tangent = evaluate(coefficients, sigma, order=1)
         curvature = evaluate(coefficients, sigma, order=2)
         dq_a = tangent * speed[:, None]
-        ddq_a = curvature * speed[:, None] ** 2 + tangent * control
+        ddq_a = curvature * speed[:, None] ** 2 + tangent * accel[:, None]
         q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
         dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
         slack = max(
@@ -730,7 +777,7 @@ class TrajectoryOcp:
         )
         if guard > 0.99:
             raise PlanningError(
-                f"the sigma'' guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
+                f"the snap guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
                 "duration this answer carries is partly that constant's and not the "
                 "machine's"
             )
@@ -754,7 +801,9 @@ class TrajectoryOcp:
             ddq_a=ddq_a,
             sigma=sigma,
             speed=speed,
-            acceleration=control[:, 0],
+            acceleration=accel,
+            jerk=state[:, X_JERK],
+            snap=control[:, 0],
             coefficients=coefficients,
             q_u=q_u,
             dq_u=dq_u,

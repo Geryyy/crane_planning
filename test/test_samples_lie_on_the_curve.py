@@ -31,7 +31,7 @@ COEFFICIENTS[0, 3] = [0.60, -0.30, 0.40, -0.50, 0.25]
 
 
 def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
-    """A solved chain over `[0, duration]`: constant input, so `sigma` is exact."""
+    """A solved chain over `[0, duration]`: constant acceleration, zero above it."""
     time = np.linspace(0.0, duration, nodes + 1)
     a = 2.0 / duration**2  # sigma(0) = 0, sigma(T) = 1, from rest
     return SimpleNamespace(
@@ -39,6 +39,8 @@ def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
         sigma=0.5 * a * time**2,
         speed=a * time,
         acceleration=np.full(nodes + 1, a),
+        jerk=np.zeros(nodes + 1),
+        snap=np.zeros(nodes + 1),
         coefficients=COEFFICIENTS,
     )
 
