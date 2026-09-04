@@ -34,10 +34,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "joint_states_topic",
                 default_value="/joint_states",
-                description=(
-                    "Canonical joint-state input. PZS100 EPSCOPE simulation must pass "
-                    "/joint_states_rviz, whose adapter removes the opening state factor."
-                ),
+                description="Canonical joint-state input.",
             ),
             Node(
                 package="crane_planning",
