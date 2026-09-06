@@ -125,6 +125,25 @@ crane_planner:
     # joint accelerations are a comfort limit the description does not carry.
     dq_sway_max: [1.0, 0.5]
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
+    # rad/s^3 (m/s^3 on the telescope), and the one limit here that is not a
+    # comfort choice: it is what the C3 feedforward can pay for. The inversion is
+    # u = v + (2 zeta / w_n) v' + v'' / w_n^2, so a third derivative the command
+    # cannot afford saturates the valve and the feedforward stops being one --
+    # controller_design.md 4.4, "nothing on this page is shippable without it".
+    # Budget the command: dddq_a_max = w_n^2 (u_max - kappa dq_max - 2 zeta / w_n
+    # ddq_a_max), with w_n and zeta from c3_full_model.json and u_max the
+    # identified command domain of compensator_map.md section 3.
+    #   slew      w_n 8.66  zeta 0.102  u_max 0.936  ->  21.2
+    #   boom      w_n 8.05  zeta 0.364  u_max 0.526  ->   2.72
+    #   arm       w_n 9.71  zeta 0.395  u_max 0.866  ->  12.5
+    #   telescope w_n 82.2  zeta 0.662  u_max 0.555  -> 236.0
+    #   rotator   w_n 12.1  zeta 0.402  u_max 2.397  ->  44.4
+    # Boom and arm are the weak entries: compensator_map identifies a domain for
+    # slewing, the rotator and the telescope only ("still open on the boom -- the
+    # arity differs"), so `u_max` falls back to the description velocity limit
+    # for those two and their budget is an assumption, not a measurement. The
+    # boom is also the axis that comes closest to its bound in practice.
+    dddq_a_max: [21.2, 2.72, 12.5, 236.0, 44.4]
     # Visualization is not the control reference: bound the authoritative FK calls
     # while the full JointTrajectory stays at 25 Hz.
     visualization_samples: 25
@@ -171,7 +190,8 @@ crane_planner:
       sway: 1.0
       dq_u: 1.0
       dynamic_tau: 1.0
-      u: 1.0
+      ddq_a: 1.0
+      dddq_a: 1.0
       terminal_scale: 1.0
       time: 0.3
     ocp_max_iterations: 60

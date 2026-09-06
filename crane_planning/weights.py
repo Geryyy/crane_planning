@@ -21,8 +21,18 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Stage residual, in row order: `y = [dq_a, sway, dq_u, dynamic_tau, u]`.
-STAGE_BLOCKS = (("dq_a", 5), ("sway", 2), ("dq_u", 2), ("dynamic_tau", 5), ("u", 5))
+#: Stage residual, in row order:
+#: `y = [dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]`. `ddq_a` was called `u`
+#: while the acceleration was the input; it is a state expression now and the
+#: input is the snap, so the name would have been actively wrong.
+STAGE_BLOCKS = (
+    ("dq_a", 5),
+    ("sway", 2),
+    ("dq_u", 2),
+    ("dynamic_tau", 5),
+    ("ddq_a", 5),
+    ("dddq_a", 5),
+)
 #: Terminal residual: no input, so no effort row; `theta` carries minimum time.
 TERMINAL_BLOCKS = (("dq_a", 5), ("sway", 2), ("dq_u", 2), ("time", 1))
 
@@ -38,7 +48,8 @@ DEFAULTS = {
     "sway": 1.0,
     "dq_u": 1.0,
     "dynamic_tau": 1.0,
-    "u": 1.0,
+    "ddq_a": 1.0,
+    "dddq_a": 1.0,
     "terminal_scale": 1.0,
     "time": 0.3,
 }

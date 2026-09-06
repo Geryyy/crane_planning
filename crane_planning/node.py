@@ -208,6 +208,7 @@ class CranePlanner(Node):
             "terminal_dq_sway_max",
             "dq_sway_max",
             "ddq_a_max",
+            "dddq_a_max",
             "truck_runge_dimensions",
             "truck_runge_stations",
         ):

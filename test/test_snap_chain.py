@@ -29,6 +29,7 @@ from crane_planning.ocp import (
     X_JERK,
     X_SIGMA,
     X_SPEED,
+    baked_parameters,
     build_ocp,
     evaluate,
 )
@@ -57,19 +58,7 @@ def description() -> str:
 
 def test_the_state_layout_is_what_the_model_carries():
     config = PlannerConfig()
-    baked = {
-        "ocp_intervals": config.ocp_intervals,
-        "ocp_horizon": config.ocp_horizon,
-        "ocp_integrator": config.ocp_integrator,
-        "ocp_max_iterations": config.ocp_max_iterations,
-        "ocp_tolerance": config.ocp_tolerance,
-        "levenberg_marquardt": config.levenberg_marquardt,
-        "q_sway_max": config.q_sway_max,
-        "dq_sway_max": config.dq_sway_max,
-        "ddq_a_max": config.ddq_a_max,
-        "path_segments": config.path_segments,
-        "weights": crane_weights.DEFAULTS,
-    }
+    baked = {**baked_parameters(config), "weights": crane_weights.DEFAULTS}
     ocp, _scale, _model = build_ocp(
         description(), baked, {"pump_flow_max": config.pump_flow_max}
     )

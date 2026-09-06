@@ -76,6 +76,47 @@ MOVES = (
     ("across", (-0.7, 0.3, 0.4, 0.9, -0.3), (0.8, 0.8, 1.0, 1.5, 0.5)),
 )
 
+#: One pose every `wide` move leaves from or arrives at, comfortably interior to
+#: the intersection above so that a move built off it is about the axis it names
+#: and not about a limit.
+BASE = (0.0, 0.5, 0.6, 1.0, 0.0)
+
+#: A spread `MOVES` deliberately is not. Those five are all long multi-axis
+#: moves, which is the regime a continuity constraint costs least in: measured,
+#: the C4 jerk bound reaches only 0.75 of itself on the worst of them. Four
+#: regimes here, and the reason each is in the set:
+#:
+#: - **single axis** -- which axis decides a duration, one at a time.
+#: - **short** -- displacements of 0.05-0.3 rad. A short move has to accelerate
+#:   and stop inside a fraction of a sway period, so it is where a bound on the
+#:   third derivative actually binds and where an inversion-driven feedforward
+#:   is most likely to ask for command it does not have.
+#: - **near limit** -- against the shared box, especially the boom, whose floor
+#:   is `a2b_ilqr_server`'s and not the description's.
+#: - **long** -- `MOVES` itself, kept as the anchor between the two sets.
+WIDE_MOVES = (
+    # single axis, from one pose
+    ("ax_slew", BASE, (2.5, 0.5, 0.6, 1.0, 0.0)),
+    ("ax_boom", BASE, (0.0, 1.2, 0.6, 1.0, 0.0)),
+    ("ax_arm", BASE, (0.0, 0.5, 1.2, 1.0, 0.0)),
+    ("ax_tele", BASE, (0.0, 0.5, 0.6, 2.0, 0.0)),
+    ("ax_rot", BASE, (0.0, 0.5, 0.6, 1.0, 1.5)),
+    # short -- the regime the jerk bound is for
+    ("sh_slew", BASE, (0.1, 0.5, 0.6, 1.0, 0.0)),
+    ("sh_boom", BASE, (0.0, 0.55, 0.6, 1.0, 0.0)),
+    ("sh_tele", BASE, (0.0, 0.5, 0.6, 1.1, 0.0)),
+    ("sh_multi", BASE, (0.1, 0.55, 0.65, 1.1, 0.1)),
+    # near the shared box, boom especially
+    ("lim_boom_low", BASE, (0.0, 0.12, 0.6, 1.0, 0.0)),
+    ("lim_boom_high", BASE, (0.0, 1.45, 0.6, 1.0, 0.0)),
+    ("lim_tele_out", BASE, (0.0, 0.5, 0.6, 2.15, 0.0)),
+    ("lim_arm_out", BASE, (0.0, 1.3, 1.2, 1.8, 0.0)),
+    # pairs and reconfigurations
+    ("pair_slew_lift", BASE, (1.2, 1.0, 0.9, 1.0, 0.0)),
+    ("pair_reach", BASE, (0.0, 0.3, 0.2, 2.0, 0.0)),
+    ("pair_tuck", (1.0, 1.2, 1.0, 2.0, 0.5), (0.0, 0.2, 0.1, 0.2, 0.0)),
+)
+
 #: Timed separately, in call order. `plan` runs them as module-level functions
 #: and two methods, so wrapping the names is enough -- no production edit, which
 #: is the point of a baseline.
@@ -144,7 +185,7 @@ def goal_pose(planner: Planner, coordinates, frame=Frame.TCP) -> tuple:
     return pose.position_m, yaw_of(rotation)
 
 
-def emit_requests(planner: Planner, path: Path) -> None:
+def emit_requests(planner: Planner, path: Path, moves) -> None:
     """
     Write the same moves as `CalcMovement` fields, for the service benchmark.
 
@@ -156,7 +197,7 @@ def emit_requests(planner: Planner, path: Path) -> None:
     import json
 
     requests = []
-    for name, start_q, goal_q in MOVES:
+    for name, start_q, goal_q in moves:
         position, yaw = goal_pose(planner, goal_q, Frame.TIP)
         requests.append(
             {
@@ -245,6 +286,14 @@ def main() -> int:
         "--only", default=None, help="one move name from the shipped set"
     )
     parser.add_argument(
+        "--set",
+        dest="move_set",
+        choices=("core", "wide", "all"),
+        default="core",
+        help="`core` is the five long moves, `wide` adds single-axis, short and "
+        "near-limit ones; `all` is both",
+    )
+    parser.add_argument(
         "--emit-requests",
         type=Path,
         default=None,
@@ -252,7 +301,8 @@ def main() -> int:
     )
     options = parser.parse_args()
 
-    moves = [m for m in MOVES if options.only in (None, m[0])]
+    catalogue = {"core": MOVES, "wide": WIDE_MOVES, "all": MOVES + WIDE_MOVES}
+    moves = [m for m in catalogue[options.move_set] if options.only in (None, m[0])]
     if not moves:
         raise SystemExit(f"no move named {options.only!r}")
 
@@ -267,7 +317,7 @@ def main() -> int:
     print(f"planner built in {time.perf_counter() - built:.1f} s")
 
     if options.emit_requests is not None:
-        emit_requests(planner, options.emit_requests)
+        emit_requests(planner, options.emit_requests, moves)
         return 0
 
     # Discarded: the first call pays for whatever the solver loaded lazily, and

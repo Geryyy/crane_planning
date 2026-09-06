@@ -126,6 +126,7 @@ def bounds(planner: Planner, speed_scale: float) -> dict:
     return {
         "dq_a": config.kappa * speed_scale * limits.dq_max,
         "ddq_a": config.kappa * speed_scale**2 * config.ddq_a_max,
+        "dddq_a": config.kappa * speed_scale**3 * config.dddq_a_max,
         "flow": config.kappa * speed_scale * limits.flow_max / config.pump_flow_max,
     }
 

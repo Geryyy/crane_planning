@@ -90,8 +90,10 @@ NX, NU = 9, 1
 #: Row order of `h`, which the caller reads back and must not re-derive. The
 #: rate and input blocks were boxes on `x` and `u` when `q_a` was planned; they
 #: are nonlinear rows now because what they bound is an expression in `sigma`.
-H_SWAY, H_FLOW, H_RATE, H_INPUT = 0, 2, 3, 3 + cs.K_PLANNED_DOF
-NH = 3 + 2 * cs.K_PLANNED_DOF
+H_SWAY, H_FLOW, H_RATE = 0, 2, 3
+H_ACCEL = 3 + cs.K_PLANNED_DOF
+H_JERK = 3 + 2 * cs.K_PLANNED_DOF
+NH = 3 + 3 * cs.K_PLANNED_DOF
 #: Row order of `h_e`: the settled box the caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
@@ -118,10 +120,9 @@ PATH_DERIVATIVES = 5
 #: the solve's own demand is ~132 and 2000 is ~15x headroom, which is what a
 #: guard should be.
 #:
-#: **Nothing else bounds the jerk or the snap.** Until issue 113 puts a physical
-#: row on them, this constant is the only thing between the solver and an
-#: arbitrarily sharp reference, and the numbers above say it is not doing that
-#: job -- it is simply out of the way.
+#: The **jerk** now carries a physical row (`dddq_a_max`), so this bounds only
+#: the snap, and deliberately loosely: with `dddq_a` bounded, `q_a''''` is
+#: finite whatever this is, and finite is what the command PT1 inversion needs.
 SIGMA_INPUT_MAX = 2000.0
 
 #: What the compiled solver's structure depends on. `weights` is deliberately
@@ -137,6 +138,7 @@ BAKED = (
     "q_sway_max",
     "dq_sway_max",
     "ddq_a_max",
+    "dddq_a_max",
     "path_segments",
 )
 
@@ -165,6 +167,17 @@ def description_limits(model) -> tuple:
         np.array([float(inner.velocityLimit[row]) for row in rows]),
         np.array([float(inner.effortLimit[row]) for row in rows]),
     )
+
+
+def baked_parameters(config) -> dict:
+    """
+    Read the `BAKED` names off a config. One place, because three callers agree.
+
+    Building this dict by hand is how a new `BAKED` entry goes missing: the tuple
+    is what `cache_tree` iterates, so a name added there and not here is a
+    `KeyError` at best and a wrong hash at worst.
+    """
+    return {name: getattr(config, name) for name in BAKED}
 
 
 def cache_tree(parameters: dict, hydraulics: dict) -> Path:
@@ -288,6 +301,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     q_sway_max = np.asarray(parameters["q_sway_max"], dtype=float)
     dq_sway_max = np.asarray(parameters["dq_sway_max"], dtype=float)
     ddq_a_max = np.asarray(parameters["ddq_a_max"], dtype=float)
+    dddq_a_max = np.asarray(parameters["dddq_a_max"], dtype=float)
     nominal = float(parameters["ocp_horizon"])
     segments = int(parameters["path_segments"])
     integrator = str(parameters["ocp_integrator"]).upper()
@@ -316,14 +330,20 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     #: numbers change between requests and the solver is generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
 
-    centre, tangent, curvature = path_expression(sigma, coefficients, segments)[:3]
+    centre, tangent, curvature, third = path_expression(sigma, coefficients, segments)[
+        :4
+    ]
     q_a = centre
-    # No `theta` here: `f_expl_expr` carries `nominal * theta`, so `v` is
-    # d sigma/dt in physical seconds already and these are the physical
-    # derivatives the limits are written against. The two levels above `ddq_a`
-    # exist in the chain but have no row yet -- issue 113 bounds them.
+    # Faa di Bruno on `q_a(t) = c(sigma(t))`. No `theta` here: `f_expl_expr`
+    # carries `nominal * theta`, so `v` is d sigma/dt in physical seconds
+    # already and these are the physical derivatives the limits are written
+    # against. The snap level is deliberately not built: bounding the jerk plus
+    # the input box already leaves `q_a''''` finite, which is all the command
+    # PT1 inversion needs, and a fourth row costs solve time on a problem that
+    # is already the expensive half of the plan.
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration
+    dddq_a = third * speed**3 + 3.0 * curvature * speed * acceleration + tangent * jerk
     sway = q_u - equilibrium(q_a)
 
     # Everything about the machine is `crane_model`'s, reached by substituting the
@@ -380,6 +400,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
         dq_u / dq_sway_max,
         (tau_a - tau_static) / tau_max,
         ddq_a / ddq_a_max,
+        dddq_a / dddq_a_max,
     )
     terminal_residual = ca.vertcat(
         dq_a / dq_max, sway / q_sway_max, dq_u / dq_sway_max, theta
@@ -413,10 +434,14 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # -- `q_a` is on the certified curve for every `sigma` in [0, 1], and `fit`
     # already refuses a curve that leaves joint range.
     pump_max = float(hydraulics["pump_flow_max"])
-    scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max])
+    scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max, dddq_a_max])
     scale_e = np.concatenate([q_sway_max, dq_sway_max])
     acados_model.con_h_expr_0 = ca.vertcat(
-        sway / q_sway_max, flow / pump_max, dq_a / dq_max, ddq_a / ddq_a_max
+        sway / q_sway_max,
+        flow / pump_max,
+        dq_a / dq_max,
+        ddq_a / ddq_a_max,
+        dddq_a / dddq_a_max,
     )
     acados_model.con_h_expr = acados_model.con_h_expr_0
     acados_model.con_h_expr_e = ca.vertcat(sway, dq_u) / scale_e
@@ -494,6 +519,7 @@ class Trajectory:
     q_a: np.ndarray  # (N+1, 5)
     dq_a: np.ndarray
     ddq_a: np.ndarray  # what the acceleration rows bound
+    dddq_a: np.ndarray  # what the jerk rows bound, and what the C3 inversion pays for
     #: The path state itself, and the coefficients it indexes. `q_a` is a
     #: function of these and not an independent answer, so a consumer that has to
     #: resample must resample `sigma` and evaluate the curve -- interpolating
@@ -548,18 +574,7 @@ class TrajectoryOcp:
     def __init__(self, description_xml: str, limits, config, weights: dict):
         self.limits, self.config = limits, config
         self.segments = int(config.path_segments)
-        baked = {
-            "ocp_intervals": config.ocp_intervals,
-            "ocp_horizon": config.ocp_horizon,
-            "ocp_integrator": config.ocp_integrator,
-            "ocp_max_iterations": config.ocp_max_iterations,
-            "ocp_tolerance": config.ocp_tolerance,
-            "levenberg_marquardt": config.levenberg_marquardt,
-            "q_sway_max": config.q_sway_max,
-            "dq_sway_max": config.dq_sway_max,
-            "ddq_a_max": config.ddq_a_max,
-            "path_segments": config.path_segments,
-        }
+        baked = baked_parameters(config)
         hydraulics = {"pump_flow_max": config.pump_flow_max}
         ocp, self.scale, model = build_ocp(
             description_xml, {**baked, "weights": weights}, hydraulics
@@ -632,7 +647,10 @@ class TrajectoryOcp:
         cfg, lim, N = self.config, self.limits, self.N
         solver, big = self.solver, 1.0e6
         rate_hi = cfg.kappa * speed_scale
-        input_hi = cfg.kappa * speed_scale**2
+        accel_hi = cfg.kappa * speed_scale**2
+        # A k-th derivative scales as `speed_scale**k` under a uniform time
+        # scaling, so the rate, acceleration and jerk ceilings are one rule.
+        jerk_hi = cfg.kappa * speed_scale**3
         flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
         theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
 
@@ -662,7 +680,8 @@ class TrajectoryOcp:
                 -np.ones(2),
                 [0.0],
                 np.full(planned, -rate_hi),
-                np.full(planned, -input_hi),
+                np.full(planned, -accel_hi),
+                np.full(planned, -jerk_hi),
             ]
         )
         uh = np.concatenate(
@@ -670,7 +689,8 @@ class TrajectoryOcp:
                 np.ones(2),
                 [flow_hi],
                 np.full(planned, rate_hi),
-                np.full(planned, input_hi),
+                np.full(planned, accel_hi),
+                np.full(planned, jerk_hi),
             ]
         )
         settled = np.concatenate(
@@ -755,8 +775,15 @@ class TrajectoryOcp:
         q_a = evaluate(coefficients, sigma)
         tangent = evaluate(coefficients, sigma, order=1)
         curvature = evaluate(coefficients, sigma, order=2)
+        third = evaluate(coefficients, sigma, order=3)
         dq_a = tangent * speed[:, None]
         ddq_a = curvature * speed[:, None] ** 2 + tangent * accel[:, None]
+        jerk = state[:, X_JERK]
+        dddq_a = (
+            third * speed[:, None] ** 3
+            + 3.0 * curvature * speed[:, None] * accel[:, None]
+            + tangent * jerk[:, None]
+        )
         q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
         dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
         slack = max(
@@ -799,10 +826,11 @@ class TrajectoryOcp:
             q_a=q_a,
             dq_a=dq_a,
             ddq_a=ddq_a,
+            dddq_a=dddq_a,
             sigma=sigma,
             speed=speed,
             acceleration=accel,
-            jerk=state[:, X_JERK],
+            jerk=jerk,
             snap=control[:, 0],
             coefficients=coefficients,
             q_u=q_u,

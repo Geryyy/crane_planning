@@ -214,6 +214,9 @@ class PlannerConfig:
     ddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.7, 0.5, 1.0, 6.0])
     )
+    dddq_a_max: np.ndarray = field(
+        default_factory=lambda: np.array([21.2, 2.72, 12.5, 236.0, 44.4])
+    )
     visualization_samples: int = 25
 
     # The pump, which the description does not carry.
