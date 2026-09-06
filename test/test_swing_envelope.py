@@ -205,3 +205,62 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
     assert required == pytest.approx(scene.required)
     assert clearance < required
     assert not scene.is_valid(np.zeros(PLANNED_DOF))
+
+
+class _Line:
+    """A path in the planned coordinates, straight, for the certificate alone."""
+
+    def __init__(self, start, goal):
+        self.start, self.goal = np.asarray(start, float), np.asarray(goal, float)
+
+    def position(self, sigma):
+        return self.start + sigma * (self.goal - self.start)
+
+
+def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
+    """
+    A body measured at `d` cannot come nearer than `d - motion` over a step, so
+    two far bodies are queried together once, at the start, and then one at a
+    time as their bounds are spent. The second half shows the bound *is* spent:
+    a body the path walks into is re-measured and refuses the path, not
+    skipped past.
+    """
+    scene = geometry(None)
+    tcp = _tcp(scene)
+    far = CollisionPrimitive(
+        id="far",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), tcp + np.array([0.0, 4.0, 0.0])),
+        dimensions_m=np.array([10.0, 0.1, 3.0]),
+    )
+    # and one body that stays close: a wall 0.6 m behind the base, so the far
+    # one is skipped on the bound while something is still queried each step
+    near = CollisionPrimitive(
+        id="near",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), np.array([-3.0, 0.0, 0.0])),
+        dimensions_m=np.array([0.1, 3.0, 3.0]),
+    )
+    scene.scene = [near, far]
+    queried = []
+    real = scene.model.collision_queries
+
+    def counting(q, bodies, swinging=None):
+        queried.append([body.id for body in bodies])
+        return real(q, bodies, swinging)
+
+    monkeypatch.setattr(scene.model, "collision_queries", counting)
+
+    # slew away from the wall: 0.3 rad on the slewing axis
+    scene.check_path(_Line(np.zeros(PLANNED_DOF), [-0.3, 0.0, 0.0, 0.0, 0.0]))
+    assert queried[0] == ["near", "far"]
+    # one body per step from then on: the self row needs a query anyway and
+    # carries the body with the smallest bound, the other rides its bound
+    assert all(len(bodies) == 1 for bodies in queried[1:])
+    assert len(queried) > 5
+
+    # slew towards it: the wall is 4 m out, the tool arcs to within the margin
+    queried.clear()
+    with pytest.raises(Exception, match="blocked at sigma"):
+        scene.check_path(_Line(np.zeros(PLANNED_DOF), [1.3, 0.0, 0.0, 0.0, 0.0]))
+    assert any("far" in bodies for bodies in queried[1:])

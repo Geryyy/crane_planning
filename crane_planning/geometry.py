@@ -199,10 +199,11 @@ class Geometry:
         self.required = self.required_rigid + self.envelope
         self.radii = self._radii()
 
-    def bodies(self, q: np.ndarray) -> list:
+    def bodies(self, q: np.ndarray, scene=None) -> list:
         """Return the scene at `q`, with what the tool carries placed on it."""
+        scene = self.scene if scene is None else list(scene)
         carried = payload_primitive(self.model, q, self.payload_shape)
-        return self.scene if carried is None else self.scene + [carried]
+        return scene if carried is None else scene + [carried]
 
     def _carried_reach(self) -> float:
         """How far past the tool centre point the carried body reaches, in metres."""
@@ -308,20 +309,35 @@ class Geometry:
         q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
         return q
 
-    def _scene_distance(self, q: np.ndarray, swinging=None) -> float:
+    def _distances(self, q: np.ndarray, swinging=None, scene=None) -> dict | None:
+        """
+        Return the distance per scene id at `q`.
+
+        Over `scene` (default: all of it) plus what the tool carries. `None`
+        when the query cannot be evaluated or the machine touches itself.
+        """
         try:
-            bodies = self.bodies(q)
+            bodies = self.bodies(q, scene)
             results = self.model.collision_queries(q, bodies, swinging)
         except (CraneModelError, PlanningError):
-            return -np.inf
+            return None
         # queries(): one row per scene primitive in scene order, then -- if the
         # description has self-pairs and the machine is not split -- one for the
         # machine against itself.
         scene_rows = results[: len(bodies)]
         self_rows = results[len(bodies) :]
         if any(row.minimum_distance_m <= 0.0 for row in self_rows):
+            return None
+        return {
+            body.id: row.minimum_distance_m
+            for body, row in zip(bodies, scene_rows, strict=True)
+        }
+
+    def _scene_distance(self, q: np.ndarray, swinging=None, scene=None) -> float:
+        distances = self._distances(q, swinging, scene)
+        if distances is None:
             return -np.inf
-        return min((row.minimum_distance_m for row in scene_rows), default=np.inf)
+        return min(distances.values(), default=np.inf)
 
     def clearance(self, q_a: np.ndarray) -> float:
         """
@@ -332,7 +348,7 @@ class Geometry:
         """
         return self._scene_distance(self.configuration(q_a))
 
-    def margin(self, q_a: np.ndarray) -> tuple[float, float]:
+    def margin(self, q_a: np.ndarray, scene=None) -> tuple[float, float]:
         """
         Return `(clearance, required)` as the pair that decides `q_a`.
 
@@ -343,8 +359,17 @@ class Geometry:
         machine is split at the upper hinge, the swinging half owes the
         envelope, the rigid half only the two margins, and the binding of the
         two is what is reported.
+
+        `scene` restricts the query to a subset of the scene; `check_path` passes
+        the bodies its bounds cannot already vouch for.
         """
-        hanging = self.clearance(q_a)
+        q = self.configuration(q_a)
+        return self._decide(q, self._distances(q, scene=scene), scene)
+
+    def _decide(self, q: np.ndarray, distances: dict | None, scene) -> tuple:
+        if distances is None:
+            return -np.inf, self.required
+        hanging = min(distances.values(), default=np.inf)
         if hanging > self.required:
             return hanging, self.required
         if hanging <= self.required_rigid:
@@ -353,7 +378,7 @@ class Geometry:
         # One more query, not two: `hanging` is the smaller of the two halves,
         # so a swinging half clear of `required` leaves the rigid half at
         # `hanging`, which is inside the band and therefore clear of its own.
-        swinging = self._scene_distance(self.configuration(q_a), swinging=True)
+        swinging = self._scene_distance(q, swinging=True, scene=scene)
         if swinging > self.required:
             return hanging, self.required_rigid
         return swinging, self.required
@@ -383,15 +408,27 @@ class Geometry:
         every sample, step bound between consecutive ones. Walked with the same
         adaptive step, because a sample count read off the tool's travel says
         nothing about how far the arm moved.
+
+        The step bound is also a broad phase. A body measured at distance `d`
+        cannot come nearer than `d - motion` over a step that moves the machine
+        by at most `motion`, so a body whose bound still exceeds `required` is
+        not queried again; its bound is just decremented. Bodies are re-measured
+        only once the bound has been spent, which for the truck under the crane
+        is every step and for a container across the yard is never. The carried
+        body rides the tool and is always queried.
         """
         previous = path.position(0.0)
-        if not self.is_valid(previous):
+        q = self.configuration(previous)
+        bounds = self._distances(q)
+        clearance, required = self._decide(q, bounds, None)
+        if not clearance > required:
             raise PlanningError("the fitted path is blocked at its start")
         sigma, step, count = 0.0, INITIAL_LIFT_STEP, 1
         while sigma < 1.0:
             step = min(step, 1.0 - sigma)
             candidate = path.position(sigma + step)
-            if self.step_bound(previous, candidate) > self.config.margin_interp:
+            motion = self.step_bound(previous, candidate)
+            if motion > self.config.margin_interp:
                 step *= 0.5
                 if step < MIN_LIFT_STEP:
                     raise PlanningError(
@@ -400,10 +437,20 @@ class Geometry:
                         f"resolves near sigma = {sigma:.3f}, so it is not certified"
                     )
                 continue
-            if not self.is_valid(candidate):
+            for body in bounds:
+                bounds[body] -= motion
+            near = [body for body in self.scene if bounds[body.id] <= self.required]
+            if not near and self.scene:
+                # the self row needs a query anyway; carry the nearest body
+                near = [min(self.scene, key=lambda body: bounds[body.id])]
+            q = self.configuration(candidate)
+            distances = self._distances(q, scene=near)
+            clearance, required = self._decide(q, distances, near)
+            if not clearance > required:
                 raise PlanningError(
                     f"the fitted path is blocked at sigma = {sigma + step:.3f}"
                 )
+            bounds.update(distances)
             previous, sigma = candidate, sigma + step
             count += 1
             if count > int(self.config.max_lift_samples):
