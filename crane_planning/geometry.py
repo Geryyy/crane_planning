@@ -350,12 +350,13 @@ class Geometry:
         if hanging <= self.required_rigid:
             # inside the two margins with something: no split can pass it
             return hanging, self.required_rigid
-        q = self.configuration(q_a)
-        swinging = self._scene_distance(q, swinging=True)
-        rigid = self._scene_distance(q, swinging=False)
-        if swinging - self.required <= rigid - self.required_rigid:
-            return swinging, self.required
-        return rigid, self.required_rigid
+        # One more query, not two: `hanging` is the smaller of the two halves,
+        # so a swinging half clear of `required` leaves the rigid half at
+        # `hanging`, which is inside the band and therefore clear of its own.
+        swinging = self._scene_distance(self.configuration(q_a), swinging=True)
+        if swinging > self.required:
+            return hanging, self.required_rigid
+        return swinging, self.required
 
     def is_valid(self, q_a: np.ndarray) -> bool:
         """Clear of the scene by the whole margin, and not folded into itself."""
