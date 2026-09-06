@@ -46,7 +46,10 @@ crane_planner:
     #
     # Each part spent once. `margin_safety` is the clearance the answer carries.
     # The envelope is `l_pendulum * sin(q_sway_max)`, computed rather than
-    # configured, which is why the sway box is no longer gridded pose by pose.
+    # configured. It is owed by the links hanging on the hinges only: a
+    # configuration inside it at the hanging pose is split at the upper hinge,
+    # and the rigid half needs just the two margins (README, "The collision
+    # certificate").
     #
     # Halving `margin_interp` roughly doubles the lifted configurations and so
     # the stage's cost. Raising it spends clearance on resolution.

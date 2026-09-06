@@ -73,6 +73,13 @@ from .ocp import Trajectory, TrajectoryOcp, evaluate, power_coefficients
 # ------------------------------------------------------------------ the planner
 
 
+#: rad/s (m/s on the telescope). Below this a measured start velocity is rest.
+#: An assumption about the encoder noise floor, not a measurement -- Gazebo
+#: reports 1e-6-scale rates at standstill; read the real one off a
+#: control_recordings/ bag before trusting it on hardware.
+REST_VELOCITY = 1e-3
+
+
 @dataclass
 class Start:
     """The measured state a plan leaves from."""
@@ -236,12 +243,21 @@ class Planner:
             start.q_a,
             restarts=int(self.config.ik_restarts),
         )
-        if not geometry.is_valid(start.q_a):
+        clearance, required = geometry.margin(start.q_a)
+        if not clearance > required:
             raise PlanningError(
                 f"the measured start configuration clears the scene by only "
-                f"{geometry.clearance(start.q_a):.3f} m against the "
-                f"{geometry.required:.3f} m this plan requires"
+                f"{clearance:.3f} m against the {required:.3f} m this plan requires"
             )
+
+        # A measured velocity is never exactly zero. Below the noise floor it is
+        # rest: fitting a tangent to it pins `c'(0)` at noise magnitude, which
+        # the OCP then has to grow to the move's own scale inside one knot span,
+        # and that acceleration exceeds the bound at a node where nothing can
+        # help. Refused on every start with a live encoder before this.
+        dq_a_start = np.asarray(start.dq_a, dtype=float)
+        if np.max(np.abs(dq_a_start)) < REST_VELOCITY:
+            dq_a_start = np.zeros_like(dq_a_start)
 
         path, lifted, candidate_name = plan_fitted_path(
             geometry,
@@ -250,7 +266,7 @@ class Planner:
             start.q_a,
             np.asarray(goal_position_m, dtype=float),
             float(goal_yaw),
-            start.dq_a,
+            dq_a_start,
         )
 
         equilibrium_start = passive_equilibrium(path.position(0.0))
@@ -276,7 +292,7 @@ class Planner:
         timing = self.ocp.solve(
             coefficients=power_coefficients(path, self.ocp.segments),
             q_u_start=q_u_start,
-            dq_a_start=np.asarray(start.dq_a, dtype=float),
+            dq_a_start=dq_a_start,
             dq_u_start=dq_u_start,
             payload=payload_vector,
             q_tool=start.q_tool,

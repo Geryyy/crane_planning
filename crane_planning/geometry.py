@@ -168,6 +168,11 @@ class Geometry:
 
         required = margin_safety + margin_interp + envelope   (each spent once)
 
+    The envelope is owed by what hangs on the hinges and by nothing else. One
+    hanging-pose query settles a configuration that clears by `required` with
+    the whole machine; one inside it is split at the upper hinge, and only the
+    swinging half has to clear by the envelope -- `margin`.
+
     Self-collision tests at zero, not against `required`: the links are near each
     other by design.
     """
@@ -190,9 +195,8 @@ class Geometry:
         self.payload = payload
         self.payload_shape = payload_shape
         self.envelope = self._envelope()
-        self.required = (
-            float(config.margin_safety) + float(config.margin_interp) + self.envelope
-        )
+        self.required_rigid = float(config.margin_safety) + float(config.margin_interp)
+        self.required = self.required_rigid + self.envelope
         self.radii = self._radii()
 
     def bodies(self, q: np.ndarray) -> list:
@@ -304,6 +308,21 @@ class Geometry:
         q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
         return q
 
+    def _scene_distance(self, q: np.ndarray, swinging=None) -> float:
+        try:
+            bodies = self.bodies(q)
+            results = self.model.collision_queries(q, bodies, swinging)
+        except (CraneModelError, PlanningError):
+            return -np.inf
+        # queries(): one row per scene primitive in scene order, then -- if the
+        # description has self-pairs and the machine is not split -- one for the
+        # machine against itself.
+        scene_rows = results[: len(bodies)]
+        self_rows = results[len(bodies) :]
+        if any(row.minimum_distance_m <= 0.0 for row in self_rows):
+            return -np.inf
+        return min((row.minimum_distance_m for row in scene_rows), default=np.inf)
+
     def clearance(self, q_a: np.ndarray) -> float:
         """
         Scene clearance at `q_a` in metres, `-inf` where it cannot be evaluated.
@@ -311,23 +330,37 @@ class Geometry:
         Self-collision is split out and tested at zero; what is returned is the
         distance to the scene, which is what the margin is against.
         """
-        try:
-            q = self.configuration(q_a)
-            bodies = self.bodies(q)
-            results = self.model.collision_queries(q, bodies)
-        except (CraneModelError, PlanningError):
-            return -np.inf
-        # queries(): one row per scene primitive in scene order, then -- if the
-        # description has self-pairs -- one for the machine against itself.
-        scene_rows = results[: len(bodies)]
-        self_rows = results[len(bodies) :]
-        if any(row.minimum_distance_m <= 0.0 for row in self_rows):
-            return -np.inf
-        return min((row.minimum_distance_m for row in scene_rows), default=np.inf)
+        return self._scene_distance(self.configuration(q_a))
+
+    def margin(self, q_a: np.ndarray) -> tuple[float, float]:
+        """
+        Return `(clearance, required)` as the pair that decides `q_a`.
+
+        The whole machine clearing by `required` at the hanging pose is
+        sufficient: no sway state can then reach anything. It is not necessary.
+        The column, the boom and the arm do not swing, and a configuration
+        inside `required` because of one of them is not refused on it: the
+        machine is split at the upper hinge, the swinging half owes the
+        envelope, the rigid half only the two margins, and the binding of the
+        two is what is reported.
+        """
+        hanging = self.clearance(q_a)
+        if hanging > self.required:
+            return hanging, self.required
+        if hanging <= self.required_rigid:
+            # inside the two margins with something: no split can pass it
+            return hanging, self.required_rigid
+        q = self.configuration(q_a)
+        swinging = self._scene_distance(q, swinging=True)
+        rigid = self._scene_distance(q, swinging=False)
+        if swinging - self.required <= rigid - self.required_rigid:
+            return swinging, self.required
+        return rigid, self.required_rigid
 
     def is_valid(self, q_a: np.ndarray) -> bool:
         """Clear of the scene by the whole margin, and not folded into itself."""
-        return self.clearance(q_a) > self.required
+        clearance, required = self.margin(q_a)
+        return clearance > required
 
     def tcp_pose(self, q_a: np.ndarray) -> tuple[np.ndarray, float]:
         """Return the tool centre point's position and yaw at `q_a`, hanging."""

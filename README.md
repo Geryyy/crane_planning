@@ -67,9 +67,22 @@ tunnels.
 | `envelope` | `l_tool*sin(q_sway_max)` -- how far the tool swings inside the admissible box |
 
 The envelope is **computed, not configured** -- pendulum length read from the
-description. That retired the nine-corner gridding of the
-sway box: one distance test answers the whole box, because the box is inside the
-margin.
+description. One distance test at the hanging pose answers the whole box for
+any configuration that clears by more than `required`: no sway state can then
+reach anything.
+
+That test is sufficient, not necessary, and the envelope is owed by what hangs
+on the hinges and by nothing else. The column, boom and arm do not swing, so a
+configuration inside `required` at the hanging pose is not refused on it. The
+machine is split at the upper passive hinge (`collision_queries(..., swinging=)`
+in `crane_model`) and each half is held to what it owes:
+
+    swinging half:  clearance > margin_safety + margin_interp + envelope
+    rigid half:     clearance > margin_safety + margin_interp
+
+Two more queries, only where the first could not decide (`Geometry.margin`).
+Self-collision is a property of the whole machine and is tested on the first
+query only.
 
 `radii` is over-estimated on purpose. Measured at full telescope extension where
 every radius is largest; outermost point taken as TCP + `tool_radius` + the

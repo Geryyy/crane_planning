@@ -6,7 +6,14 @@ import numpy as np
 import pinocchio as pin
 import pytest
 import yaml
-from crane_model import GENERALIZED_DOF, PASSIVE_INDICES, CraneModel, Frame, Tool
+from crane_model import (
+    GENERALIZED_DOF,
+    PASSIVE_INDICES,
+    CollisionPrimitive,
+    CraneModel,
+    Frame,
+    Tool,
+)
 from crane_planning.config import (
     PLANNED_DOF,
     TOOL_INDEX,
@@ -143,3 +150,58 @@ def test_required_spends_the_envelope_once():
     assert scene.required == pytest.approx(
         scene.config.margin_safety + scene.config.margin_interp + scene.envelope
     )
+
+
+def _shifted(
+    scene: Geometry, body: CollisionPrimitive, along: np.ndarray, target: float
+):
+    """Move `body` along `along` so the hanging pose clears it by `target`."""
+    scene.scene = [body]
+    clearance = scene.clearance(np.zeros(PLANNED_DOF))
+    assert np.isfinite(clearance)
+    body.pose_in_mounting_base.translation += along * (clearance - target)
+    assert scene.clearance(np.zeros(PLANNED_DOF)) == pytest.approx(target, abs=1e-3)
+    return scene
+
+
+def _tcp(scene: Geometry) -> np.ndarray:
+    return scene.model.forward_kinematics(
+        scene.configuration(np.zeros(PLANNED_DOF)), Frame.MOUNTING_BASE, Frame.TCP
+    ).position_m
+
+
+def test_inside_the_envelope_only_the_swinging_half_owes_it():
+    """
+    The envelope is owed by what hangs on the hinges. A wall the same distance
+    from the machine, inside `required` and outside the two margins, is
+    accepted when the base is what stands near it and refused when the tool is.
+    """
+    scene = geometry(None)
+    target = 0.5 * (scene.required + scene.required_rigid)
+    tcp = _tcp(scene)
+
+    # beside the base: the outriggers reach 2.62 m in y, the tool is 2.9 m out
+    # in x and 0.9 m wide, so a wall over the base is the base's alone
+    near_base = CollisionPrimitive(
+        id="near_base",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), np.array([0.0, 5.0, 0.0])),
+        dimensions_m=np.array([1.0, 0.1, 3.0]),
+    )
+    _shifted(scene, near_base, np.array([0.0, -1.0, 0.0]), target)
+    clearance, required = scene.margin(np.zeros(PLANNED_DOF))
+    assert required == pytest.approx(scene.required_rigid)
+    assert clearance > required
+    assert scene.is_valid(np.zeros(PLANNED_DOF))
+
+    near_tool = CollisionPrimitive(
+        id="near_tool",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), tcp + np.array([0.0, 1.5, 0.0])),
+        dimensions_m=np.array([3.0, 0.1, 3.0]),
+    )
+    _shifted(scene, near_tool, np.array([0.0, -1.0, 0.0]), target)
+    clearance, required = scene.margin(np.zeros(PLANNED_DOF))
+    assert required == pytest.approx(scene.required)
+    assert clearance < required
+    assert not scene.is_valid(np.zeros(PLANNED_DOF))
