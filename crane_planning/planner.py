@@ -230,11 +230,12 @@ class Planner:
         )
 
         # Reachable at all? Cold solve, restarts spread over the telescope range
-        # -- the coordinate the residual is flat in. Its configuration is
-        # deliberately discarded: which member of the redundant family the arm
-        # ends at is decided by marching there, and pinning an independently
-        # chosen one is a discontinuity no refinement closes.
-        solve_ik(
+        # -- the coordinate the residual is flat in. The Cartesian corridors
+        # discard its configuration: which member of the redundant family the
+        # arm ends at is decided by marching there, and pinning an independently
+        # chosen one is a discontinuity no refinement closes. The joint-space
+        # line is the one candidate that goes to it directly.
+        goal_q_a = solve_ik(
             geometry,
             self.limits,
             self.config,
@@ -267,6 +268,7 @@ class Planner:
             np.asarray(goal_position_m, dtype=float),
             float(goal_yaw),
             dq_a_start,
+            goal_q_a,
         )
 
         equilibrium_start = passive_equilibrium(path.position(0.0))

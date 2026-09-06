@@ -599,6 +599,14 @@ class CartesianCandidate:
     positions_m: tuple[np.ndarray, ...]
 
 
+@dataclass
+class JointCandidate:
+    """A straight line in the planned coordinates to the cold goal solve."""
+
+    name: str
+    goal_q_a: np.ndarray
+
+
 def _primitive_top(primitive) -> float:
     """Highest mounting-base z point of an oriented primitive's bounding box."""
     pose = primitive.pose_in_mounting_base
@@ -741,6 +749,28 @@ def lift_candidate(
                 )
             step *= 1.25
     return np.array(waypoints)
+
+
+def lift_joint_line(
+    geometry: Geometry,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_q_a: np.ndarray,
+) -> np.ndarray:
+    """
+    Waypoints on the straight joint-space line, spaced inside the step bound.
+
+    The line the reference iLQR planner effectively moves along. No IK: the goal
+    configuration is the cold solve's, and a straight line to it is continuous
+    by construction, so the branch-jump concern that discards that solve for the
+    Cartesian corridors does not apply. Cheap, and the one candidate that does
+    not sweep the tool through a chord the arm has to fold in to follow.
+    """
+    start = np.asarray(start_q_a, dtype=float)
+    goal = np.asarray(goal_q_a, dtype=float)
+    count = int(np.ceil(geometry.step_bound(start, goal) / config.margin_interp)) + 1
+    count = min(max(count, 2), int(config.max_lift_samples))
+    return np.linspace(start, goal, count)
 
 
 # ---------------------------------------------------------------------- the fit
@@ -895,18 +925,57 @@ def plan_fitted_path(
     goal_position_m: np.ndarray,
     goal_yaw: float,
     dq_start: np.ndarray,
+    goal_q_a: np.ndarray | None = None,
 ) -> tuple[Path, int, str]:
-    """Lift, fit and certify candidates until the executable curve is clear."""
-    start_position, _ = geometry.tcp_pose(start_q_a)
+    """
+    Lift, fit and certify candidates until the executable curve is clear.
+
+    Direct tool line, then the joint-space line when a goal configuration is
+    given, then the transfer corridors. A corridor corner the tool cannot be
+    placed at refuses every corridor through it before any of them is lifted:
+    the transfer height is set by the tallest scene body, which need not be
+    anywhere near the move, and lifting towards an unreachable corner costs
+    hundreds of IK solves per corridor before it fails.
+    """
+    start_position, start_yaw = geometry.tcp_pose(start_q_a)
     candidates = cartesian_candidates(
         geometry, config, start_position, np.asarray(goal_position_m, dtype=float)
     )
+    if goal_q_a is not None:
+        candidates.insert(1, JointCandidate("joint line", np.asarray(goal_q_a)))
     failures = []
+    unreachable: dict[tuple, str] = {}
+
+    def corner_refusal(candidate: CartesianCandidate) -> str | None:
+        corners = candidate.positions_m[1:-1]
+        for index, corner in enumerate(corners):
+            key = tuple(np.round(np.asarray(corner, dtype=float), 6))
+            if key not in unreachable:
+                yaw = start_yaw if index < len(corners) / 2 else float(goal_yaw)
+                try:
+                    solve_ik(
+                        geometry, limits, config, corner, yaw, start_q_a, restarts=1
+                    )
+                    unreachable[key] = ""
+                except PlanningError as failure:
+                    unreachable[key] = str(failure)
+            if unreachable[key]:
+                return unreachable[key]
+        return None
+
     for candidate in candidates:
         try:
-            waypoints = lift_candidate(
-                geometry, limits, config, start_q_a, goal_yaw, candidate
-            )
+            if isinstance(candidate, JointCandidate):
+                waypoints = lift_joint_line(
+                    geometry, config, start_q_a, candidate.goal_q_a
+                )
+            else:
+                refusal = corner_refusal(candidate)
+                if refusal is not None:
+                    raise PlanningError(refusal)
+                waypoints = lift_candidate(
+                    geometry, limits, config, start_q_a, goal_yaw, candidate
+                )
             path = fit(limits, config, waypoints, dq_start)
             # The spline is a different curve from its lifted polyline. Only a
             # successful certificate on it makes it executable.

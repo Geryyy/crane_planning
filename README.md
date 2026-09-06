@@ -22,12 +22,16 @@ Each candidate is a TCP polyline in `K0_mounting_base`; yaw follows the shortest
 arc over its Cartesian length. q8 is not planned -- the low-level controller
 holds it at its start value.
 
-Direct line first. Then transfer planes, starting above the highest scene
+Direct line first. Then the **joint-space line** to the cold goal solve -- no
+IK along it, and the line the reference iLQR planner effectively moves on; a
+close-in goal the tool chord cannot reach without folding the arm through a
+limit is answered here. Then transfer planes, starting above the highest scene
 primitive plus the full clearance requirement and rising by
 `corridor_height_step`; each plane gets a straight traverse plus configured
-left/right offsets. First candidate that survives lifting, fitting and the
-certificate wins. A fit failure advances to the next candidate rather than
-ending the call.
+left/right offsets. A plane corner the tool cannot be placed at refuses every
+corridor through it before lifting (one IK per corner, not hundreds per
+corridor). First candidate that survives lifting, fitting and the certificate
+wins. A fit failure advances to the next candidate rather than ending the call.
 
 **IK is the lift, not the check.** Each polyline sample is lifted into the five
 planned coordinates by continuation IK seeded from its predecessor; the passive

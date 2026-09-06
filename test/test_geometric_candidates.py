@@ -78,10 +78,64 @@ def config() -> planning.PlannerConfig:
 
 
 def certify(geometry, start, goal):
+    goal_q_a = np.array([goal[0], goal[1], goal[2], 0.0, 0.0])
     path, _lifted, name = planning.plan_fitted_path(
-        geometry, limits(), config(), start, goal, 0.0, np.zeros(5)
+        geometry, limits(), config(), start, goal, 0.0, np.zeros(5), goal_q_a
     )
     return path, name
+
+
+def test_joint_line_answers_when_the_tool_chord_does_not(identity_ik):
+    """A blocked tool chord with a clear joint line is answered without a corridor."""
+    geometry = FakeGeometry()
+    # the identity arm's joint line is the tool chord, so give the goal a
+    # configuration whose line passes above the block
+    start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
+    goal_q_a = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
+    geometry.is_valid = lambda q_a: (
+        not (abs(float(q_a[0])) < 0.2 and float(q_a[4]) < 0.1)
+    )
+    goal_q_a[4] = 1.0
+    path, _lifted, name = planning.plan_fitted_path(
+        geometry, limits(), config(), start, [1.0, 0.0, 0.0], 0.0, np.zeros(5), goal_q_a
+    )
+    assert name == "joint line"
+    assert np.allclose(path.position(1.0), goal_q_a)
+
+
+def test_unreachable_corner_refuses_its_corridors_without_lifting(monkeypatch):
+    """One IK per corner, not a lift per corridor, when the transfer plane is out of reach."""
+    lifts, solves = [], []
+
+    def solve(_geometry, _limits, _config, position, yaw, _seed, restarts=1):
+        solves.append(np.asarray(position, dtype=float))
+        if position[2] > 0.3:
+            raise planning.PlanningError("the tool cannot be placed there")
+        return np.array([position[0], position[1], position[2], yaw, 0.0])
+
+    real_lift = geometry_stage.lift_candidate
+
+    def lift(*args):
+        lifts.append(args[-1].name)
+        return real_lift(*args)
+
+    monkeypatch.setattr(geometry_stage, "solve_ik", solve)
+    monkeypatch.setattr(geometry_stage, "lift_candidate", lift)
+    start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
+    with pytest.raises(planning.PlanningError, match="cannot be placed"):
+        planning.plan_fitted_path(
+            geometry_stage and FakeGeometry(),
+            limits(),
+            config(),
+            start,
+            [1.0, 0.0, 0.0],
+            0.0,
+            np.zeros(5),
+        )
+    assert lifts == ["direct tool line"]
+    # two planes, two corners each; the second corner of a plane is never asked
+    # for once the first refused
+    assert sum(point[2] > 0.3 for point in solves) == 2
 
 
 def test_clear_direct_line_is_selected_first(identity_ik):
@@ -101,7 +155,7 @@ def test_blocked_direct_line_uses_overhead_corridor(identity_ik):
     assert np.allclose(path.position(1.0)[:3], [1.0, 0.0, 0.0])
 
 
-def test_smoothing_failure_advances_to_the_next_candidate(monkeypatch):
+def test_smoothing_failure_advances_to_the_next_candidate(monkeypatch, identity_ik):
     geometry = FakeGeometry(blocked=False)
     start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
     checks = 0
@@ -121,10 +175,10 @@ def test_smoothing_failure_advances_to_the_next_candidate(monkeypatch):
 
     geometry.check_path = check_path
     _path, _lifted, name = planning.plan_fitted_path(
-        geometry, limits(), config(), start, [1.0, 0.0, 0.0], 0.0, np.zeros(5)
+        geometry, limits(), config(), start, [1.0, 0.0, 0.0], 0.0, np.zeros(5), start
     )
     assert checks == 2
-    assert name.startswith("lift/traverse/descend")
+    assert name == "joint line"
 
 
 def test_out_of_range_tool_start_is_not_projected():
