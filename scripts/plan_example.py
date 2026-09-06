@@ -119,14 +119,15 @@ def bounds(planner: Planner, speed_scale: float) -> dict:
     Every bound `TrajectoryOcp.solve` writes onto the solver, in one place.
 
     Limit lines and normalisation both read it, so no plot can claim a bound
-    the solve did not use. speed_scale enters rate limits once, the
-    acceleration limit twice -- reparametrised duration, second derivative.
+    the solve did not use. `speed_scale` enters every row once: it is the
+    reference server's `slow_down` divider, which divides rate, acceleration and
+    jerk alike, and not a time reparametrisation -- see `TrajectoryOcp.solve`.
     """
     limits, config = planner.limits, planner.config
     return {
         "dq_a": config.kappa * speed_scale * limits.dq_max,
-        "ddq_a": config.kappa * speed_scale**2 * config.ddq_a_max,
-        "dddq_a": config.kappa * speed_scale**3 * config.dddq_a_max,
+        "ddq_a": config.kappa * speed_scale * config.ddq_a_max,
+        "dddq_a": config.kappa * speed_scale * config.dddq_a_max,
         "flow": config.kappa * speed_scale * limits.flow_max / config.pump_flow_max,
     }
 

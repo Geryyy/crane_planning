@@ -149,9 +149,23 @@ BAKED = (
 #: sits at w*dt = 1.8, where RK4's per-step amplification is 0.854 -- 500x of
 #: fabricated damping over 40 intervals, pricing the sway rows as if the swing
 #: settled on its own. Gauss-Legendre is symplectic, |R(iy)| = 1 at any step, so
-#: it cannot invent that. At the ~7 s answer ERK4 is within 1.6% over the whole
-#: horizon, which is why this is a knob and not a correction.
+#: it cannot invent that. `SIM_SUBSTEPS` is what keeps ERK honest instead --
+#: see there; the choice stays a knob.
 INTEGRATORS = {"ERK": 4, "IRK": 2}
+
+#: Substeps per shooting interval. Not a knob: answers land at 16 s, not at the
+#: ~7 s the stability argument above was first written for, and one RK4 step per
+#: interval at w*dt = 1.43 amplifies by 0.955 -- 0.16 over 40 intervals, so the
+#: solver believes 84 % of a swing excited early has vanished by the goal. The
+#: sway rows, the settled box and the terminal pin would then be met by the
+#: integrator rather than by the timing. Three substeps put 16 s at 0.991 and
+#: 20 s at 0.965; the quartic reconstruction stays exact because each substep is
+#: still exact on the nilpotent chain.
+#:
+#: Measured over the 21 bench moves: no duration moves by more than 0.25 % and no
+#: refusal changes, so the fabricated damping was never what the answers rested
+#: on. This is a correctness fix, not a retiming, and it is free.
+SIM_SUBSTEPS = 3
 
 
 def equilibrium(q_a):
@@ -201,6 +215,14 @@ def cache_tree(parameters: dict, hydraulics: dict) -> Path:
     # Same reasoning for the state count: it is the solver's shape, not a
     # parameter, and a cached `.so` is loaded rather than compared.
     baked["nx"] = NX
+    # And for the substep count: it is compiled into the integrator, so a cache
+    # built at one value would keep answering with that integrator's damping.
+    baked["sim_substeps"] = SIM_SUBSTEPS
+    # `ocp_integrator` names the method, `INTEGRATORS` decides its order, and only
+    # the name is a config value -- editing the map alone would load the old order.
+    baked["sim_stages"] = INTEGRATORS[parameters["ocp_integrator"]]
+    # How many levels `path_expression` builds, i.e. how long the chain is.
+    baked["path_derivatives"] = PATH_DERIVATIVES
     digest = hashlib.sha1(json.dumps(baked, sort_keys=True).encode()).hexdigest()
     return CACHE / f"{SOLVER_NAME}_{digest[:10]}"
 
@@ -495,7 +517,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # ERK4 already does, which is the wrong direction for an anti-sway problem.
     ocp.solver_options.collocation_type = "GAUSS_LEGENDRE"
     ocp.solver_options.sim_method_num_stages = INTEGRATORS[integrator]
-    ocp.solver_options.sim_method_num_steps = 1
+    ocp.solver_options.sim_method_num_steps = SIM_SUBSTEPS
     ocp.solver_options.globalization = "MERIT_BACKTRACKING"
     ocp.solver_options.regularize_method = "NO_REGULARIZE"
     ocp.solver_options.levenberg_marquardt = float(parameters["levenberg_marquardt"])
@@ -646,11 +668,16 @@ class TrajectoryOcp:
         """Solve one request, or refuse with what the solver said."""
         cfg, lim, N = self.config, self.limits, self.N
         solver, big = self.solver, 1.0e6
-        rate_hi = cfg.kappa * speed_scale
-        accel_hi = cfg.kappa * speed_scale**2
-        # A k-th derivative scales as `speed_scale**k` under a uniform time
-        # scaling, so the rate, acceleration and jerk ceilings are one rule.
-        jerk_hi = cfg.kappa * speed_scale**3
+        # `CalcMovement.slow_down` is a "divider to reduce max speed/acceleration",
+        # and the reference server divides qDotMax, qDDotMax and qDDDotMax by it
+        # alike (`mp_crane_lib_helpers.hpp` `apply_slow_down`). Uniform time
+        # scaling would give s**k on the k-th derivative, but it is not a symmetry
+        # of this problem -- the pendulum period is fixed, so an s**2 acceleration
+        # ceiling takes away the authority a solve needs to cancel sway at the
+        # swing frequency and it refuses instead of slowing down. The jerk ceiling
+        # is a valve budget, not a comfort choice, and scaling it at all is
+        # unnecessary; it is scaled only to stay one rule with the other two.
+        rate_hi = accel_hi = jerk_hi = cfg.kappa * speed_scale
         flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
         theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
 

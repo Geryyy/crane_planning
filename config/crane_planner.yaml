@@ -168,10 +168,10 @@ crane_planner:
     ocp_horizon: 7.0
     # `ERK` (4-stage explicit RK) or `IRK` (2-stage Gauss-Legendre collocation).
     # Both order 4; IRK costs 2-4x per node and buys an integrator that cannot
-    # damp the pendulum. `theta` scales the step, so ERK4 is exact-enough at the
-    # durations answers land on (w*dt = 0.63 at 7 s, 1.6% of amplitude over the
-    # horizon) and fabricates 500x of damping at `ocp_duration_max`. Raise
-    # `ocp_duration_max`, or find the solve wandering long, and switch.
+    # damp the pendulum. `theta` scales the step, so one ERK4 step per interval
+    # fabricates damping as the horizon grows -- 84% of the swing gone at the
+    # 16 s answers actually land on. `ocp.py`'s `SIM_SUBSTEPS` is the fix and
+    # holds to 0.965 at `ocp_duration_max`; switch here only past that.
     ocp_integrator: ERK
     # --- the cost, as preference alone ---------------------------------------
     #
@@ -206,7 +206,10 @@ crane_planner:
     # nothing and cost plenty -- a horizon settling just the wrong side of 1e-6
     # spends every remaining iteration failing to halve it.
     ocp_tolerance: 1.0e-4
-    # Added identically every iteration; not adaptive.
+    # Added identically every iteration; not adaptive. Raising it to 1e-3 was
+    # tried against the `telescope` refusal review.md finding 4 reports: on this
+    # HEAD that move already answers in 10 iterations, and 1e-3 changes neither a
+    # duration nor an iteration count on any of the 21 bench moves. Left alone.
     levenberg_marquardt: 1.0e-6
 
     # --- freshness -----------------------------------------------------------
