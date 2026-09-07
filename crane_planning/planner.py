@@ -189,6 +189,7 @@ class Planner:
         robot_description_xml: str,
         config: PlannerConfig | None = None,
         weights: dict | None = None,
+        build_missing: bool = True,
     ):
         self.config = config or PlannerConfig()
         self.model = CraneModel(robot_description_xml, Tool.PZS100)
@@ -202,6 +203,7 @@ class Planner:
             self.limits,
             self.config,
             weights or crane_weights.DEFAULTS,
+            build_missing,
         )
 
     def plan(

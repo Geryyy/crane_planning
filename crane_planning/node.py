@@ -48,6 +48,7 @@ from .a2b import (
     translate_request,
     translate_start,
 )
+from .ocp import SolverNotExported
 from .planner import (
     PASSIVE_INDICES,
     PLANNED_INDICES,
@@ -269,7 +270,17 @@ class CranePlanner(Node):
 
     def _description(self, message: String) -> None:
         try:
-            self.planner = Planner(message.data, self._config(), self.weights)
+            self.planner = Planner(
+                message.data, self._config(), self.weights, build_missing=False
+            )
+        except SolverNotExported as missing:
+            # Quit, not degrade: the solver is exported by hand against the
+            # description a deployment publishes, so a miss means this node would
+            # plan for another machine. Dying says so while the launch that
+            # publishes the description is still up to dump from.
+            self.planner = None
+            self.get_logger().fatal(str(missing))
+            raise SystemExit(1) from missing
         except Exception as failure:  # a bad description is not a crash
             self.planner = None
             self.get_logger().error(f"the robot description was refused: {failure}")

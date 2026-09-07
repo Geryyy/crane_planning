@@ -7,8 +7,8 @@ Write what `/robot_description` carries, byte for byte, for the exporter to bake
 
 The bytes are the point. `crane_planning.ocp.cache_key` hashes the description
 string, the node hashes the one the topic handed it, and the two have to be the
-same string or the prebaked solver is missed and the node compiles for minutes
-inside its own callback. `ros2 topic echo --field data` cannot be used for this:
+same string or the prebaked solver is missed and the node quits rather than plan
+for another machine. `ros2 topic echo --field data` cannot be used for this:
 it appends its own `\\n---\\n` record separator to the payload.
 
 Which description a deployment publishes there is a launch decision -- in

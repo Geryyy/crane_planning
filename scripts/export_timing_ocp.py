@@ -12,8 +12,13 @@ a second copy. What is here is the command line and the tree it writes.
 
 The third is the prep step for a run: it compiles a solver for the machine the
 node will actually be handed on `/robot_description` and leaves `generated/`
-alone. Without it the node compiles inside its own description callback, and
-whichever solver it finds is the one baked for some *other* description.
+alone. Without it the node quits on the description it is handed, because the
+only solver it could load would be one baked for some *other* description.
+
+Dump the description off a running deployment, then compile against it:
+
+    ./scripts/dump_robot_description.py live.urdf
+    ./scripts/export_timing_ocp.py --description live.urdf --compile-only
 """
 
 from __future__ import annotations
@@ -120,10 +125,10 @@ def compile_solver(description: str, parameters: dict, hydraulics: dict) -> None
     """
     Compile the solver into the cache the planner loads from.
 
-    Exporting without this leaves the first request to pay for a code generation
-    and a C build -- thirteen seconds on a warm toolchain and minutes on a cold
-    one, inside whatever asked for the plan. Doing it here means a node is ready
-    when it starts.
+    Exporting without this leaves the node with nothing to load: it refuses the
+    description rather than pay for a code generation and a C build -- thirteen
+    seconds on a warm toolchain and minutes on a cold one -- inside whatever asked
+    for the plan. Doing it here means a node is ready when it starts.
 
     It is a second `build_ocp` and a second code generation on purpose: what
     `output` gets is the pruned, normalised tree `--check` reviews, and
