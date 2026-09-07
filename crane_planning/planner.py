@@ -150,6 +150,9 @@ class Plan:
     time: np.ndarray
     q: np.ndarray  # the canonical eight, resampled at Ts, one row per sample
     dq: np.ndarray
+    #: C3's inversion as the correction the JTC's effort field carries,
+    #: `u(t + dead time) - dq_d(t)`, zero on the passive pair and the tool.
+    effort: np.ndarray
     tcp: np.ndarray  # tool position in K0_mounting_base, one row per sample
     timing: Trajectory
     message: str
@@ -510,6 +513,24 @@ class Planner:
         # reconstruction lands on is `c(1 - gap)`, so take the certified end.
         q[-1, list(PLANNED_INDICES)] = evaluate(timing.coefficients, 1.0)[0]
 
+        # C3's feedforward, from the `u` the OCP already solved for and bounded
+        # rather than from a second derivation of it. What the effort field
+        # carries is the *correction* `u(t + n_d) - dq_d(t)`, so the plugin's
+        # `dq_d + effort` is the inversion advanced by the dead time and a
+        # controller reading a reference without one degrades to the static
+        # feedforward instead of to none -- jtc_fork.md delta 3. `np.interp`
+        # holds the terminal value past the end of the plan, which is zero:
+        # `u = dq_a + tau_dot_a / k` and the plan ends at rest.
+        effort = np.zeros_like(q)
+        preview = stamps + float(self.config.command_dead_time_s)
+        commanded = np.array(
+            [
+                np.interp(preview, timing.time, timing.command[:, i])
+                for i in range(timing.command.shape[1])
+            ]
+        ).T
+        effort[:, list(PLANNED_INDICES)] = commanded - dq[:, list(PLANNED_INDICES)]
+
         # The tool where the plan says it is, sway included -- not where it would
         # hang if the machine stopped at each sample. This is visualization, not
         # the control reference, so evaluate a bounded number of poses.
@@ -533,7 +554,15 @@ class Planner:
             + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest "
             + f"at {timing.terminal_sway_rate:.3f} rad/s"
         )
-        return Plan(time=stamps, q=q, dq=dq, tcp=tcp, timing=timing, message=message)
+        return Plan(
+            time=stamps,
+            q=q,
+            dq=dq,
+            effort=effort,
+            tcp=tcp,
+            timing=timing,
+            message=message,
+        )
 
 
 def payload_parameters(payload: Payload | None) -> np.ndarray:

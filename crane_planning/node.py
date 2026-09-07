@@ -183,6 +183,7 @@ class CranePlanner(Node):
             "ocp_tolerance",
             "ocp_slack_price",
             "levenberg_marquardt",
+            "command_dead_time_s",
             "pump_flow_max",
             "pump_flow_planning_factor",
             "Ts",
@@ -226,6 +227,10 @@ class CranePlanner(Node):
         self.declare_parameter("max_scene_age", 10.0)
         self.declare_parameter("pendulum_state_deadline", 0.15)
         self.declare_parameter("payload_estimate_deadline", 1.0)
+        # C3's inversion in the effort field. A controller that does not set
+        # `effort_field_is_feedforward` rejects a trajectory carrying the field
+        # outright, so a profile without jtc_fork.md delta 3 turns this off.
+        self.declare_parameter("c3_feedforward", True)
 
     def _weights(self) -> dict:
         """
@@ -561,10 +566,15 @@ class CranePlanner(Node):
         trajectory.header.stamp = stamp
         trajectory.joint_names = [self.joint_names[index] for index in indices]
         columns = list(indices)
-        for when, position, velocity in zip(plan.time, plan.q, plan.dq):
+        feedforward = self.get_parameter("c3_feedforward").value
+        for when, position, velocity, command in zip(
+            plan.time, plan.q, plan.dq, plan.effort
+        ):
             point = JointTrajectoryPoint()
             point.positions = [float(value) for value in position[columns]]
             point.velocities = [float(value) for value in velocity[columns]]
+            if feedforward:
+                point.effort = [float(value) for value in command[columns]]
             point.time_from_start.sec = int(when)
             point.time_from_start.nanosec = int((when - int(when)) * 1e9)
             trajectory.points.append(point)

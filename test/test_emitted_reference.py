@@ -1,4 +1,7 @@
-"""The emitted plan's last point must carry exactly zero velocity.
+"""What the emitted reference must satisfy: it stops where the plan stops, and
+its effort field carries the command the OCP solved for.
+
+The last point first.
 
 `joint_trajectory_controller` rejects a `FollowJointTrajectory` goal whose last
 point moves at all -- `fabs(v) > numeric_limits<float>::epsilon()`, 1.19e-7 --
@@ -44,6 +47,9 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
         jerk=np.full(nodes + 1, -12.0 / duration**3),
         snap=np.zeros(nodes + 1),
         coefficients=COEFFICIENTS,
+        # A ramp per axis, so a preview that is dropped or applied backwards
+        # cannot pass: `u` at `t` and at `t + dead time` differ by a known slope.
+        command=np.outer(time, [0.01, 0.02, 0.03, 0.04, 0.05]),
         q_u=np.zeros((nodes + 1, 2)),
         dq_u=np.zeros((nodes + 1, 2)),
         pump_flow=np.zeros(nodes + 1),
@@ -90,3 +96,33 @@ def test_the_reference_ends_where_the_plan_does(duration):
 def test_a_solve_that_did_not_stop_is_refused():
     with pytest.raises(PlanningError, match="did not arrive stopped"):
         resample(10.0 * TERMINAL_DRIFT_MAX, 4.0)
+
+
+def test_the_effort_field_carries_the_previewed_command():
+    """
+    `jtc_fork.md` delta 3: effort is the *correction*, so what the plugin adds up
+    is `dq_d + effort = u(t + n_d)`. The OCP already bounded that `u`; nothing
+    downstream may derive it a second time.
+    """
+    config = PlannerConfig()
+    plan = resample(1.0e-6, 4.03)
+    solved = timing(1.0e-6, 4.03)
+
+    planned = list(PLANNED_INDICES)
+    commanded = plan.effort[:, planned] + plan.dq[:, planned]
+    previewed = np.array(
+        [
+            np.interp(
+                plan.time + config.command_dead_time_s,
+                solved.time,
+                solved.command[:, axis],
+            )
+            for axis in range(solved.command.shape[1])
+        ]
+    ).T
+
+    assert commanded == pytest.approx(previewed)
+    # The pendulum and the tool are not commanded, and the field is width-checked
+    # against the joint names, so they carry a zero rather than nothing.
+    passive_and_tool = [i for i in range(plan.effort.shape[1]) if i not in planned]
+    assert np.all(plan.effort[:, passive_and_tool] == 0.0)

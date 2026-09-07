@@ -158,6 +158,13 @@ crane_planner:
     command_k: [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
     command_u_min: [-0.9635, -0.3134, -0.3342, -0.5551, -2.3969]
     command_u_max: [0.9357, 0.2977, 0.3059, 0.5849, 2.4636]
+    # s. The reference carries `u` in its effort field advanced by this much:
+    # the feedforward branch is open loop against a plant that answers late, and
+    # controller_design.md 4.3 measures inversion and preview at x25-x52 together
+    # against a fraction of that for either alone. Common to every axis, because
+    # the fit pinned the dead time common. Was `c3_feedforward.dead_time_s` in
+    # bt_server_override.yaml, when a BT node rebuilt the inversion downstream.
+    command_dead_time_s: 0.06
     # Visualization is not the control reference: bound the authoritative FK calls
     # while the full JointTrajectory stays at 25 Hz.
     visualization_samples: 25

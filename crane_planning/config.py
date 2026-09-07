@@ -238,6 +238,12 @@ class PlannerConfig:
     command_u_max: np.ndarray = field(
         default_factory=lambda: np.array([0.9357, 0.2977, 0.3059, 0.5849, 2.4636])
     )
+    #: s. The feedforward the reference carries is advanced by this much, because
+    #: the branch it feeds is open loop against a plant that answers late --
+    #: inversion and preview are worth x25-x52 together and a fraction of that
+    #: apart (controller_design.md 4.3). One number for every axis: the dead time
+    #: was pinned common by the fit.
+    command_dead_time_s: float = 0.06
     visualization_samples: int = 25
 
     # The pump, which the description does not carry.
