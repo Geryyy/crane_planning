@@ -17,7 +17,7 @@ from.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import pinocchio as pin
@@ -78,6 +78,20 @@ from .ocp import Trajectory, TrajectoryOcp, evaluate, power_coefficients
 #: reports 1e-6-scale rates at standstill; read the real one off a
 #: control_recordings/ bag before trusting it on hardware.
 REST_VELOCITY = 1e-3
+
+#: m, rad. How far outside its own limit a measured coordinate may be and still
+#: be planned from. A joint parked on its stop reads a hair past it -- Gazebo
+#: settles the retracted telescope at -8e-5 and the excursion *creeps* with every
+#: move, so without this the first plan that ends fully retracted is the last
+#: plan that succeeds. Same argument as `REST_VELOCITY`, one derivative down.
+#:
+#: Clamped into the box rather than merely tolerated, because everything
+#: downstream -- the IK, the fit's range check, the OCP's own state box -- needs
+#: a start that is inside it. Equal to `eps_pos`, the planner's own positional
+#: acceptance, so a projection this small cannot be told from an IK solution it
+#: would have accepted. Past it the refusal stands: a state grossly outside its
+#: range means the wrong description, and projecting that hides it.
+LIMIT_DEADBAND = 1e-3
 
 #: rad/s. What the last emitted sample may drift from the rest the OCP pinned
 #: before the plan is refused. Deliberately not `REST_VELOCITY`: that one is a
@@ -226,7 +240,7 @@ class Planner:
         """
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
-        self._validate_start(start)
+        start = self._validate_start(start)
         if avoid_collisions and scene is None:
             raise PlanningError(
                 "avoid_collisions was asked for with no collision scene: a plan "
@@ -330,8 +344,13 @@ class Planner:
             )
         return self._resample(geometry, path, timing, start, lifted, candidate_name)
 
-    def _validate_start(self, start: Start) -> None:
-        """Refuse a measured state that is not one state of this description."""
+    def _validate_start(self, start: Start) -> Start:
+        """
+        Refuse a measured state that is not one state of this description.
+
+        Returns the state to plan from, which is the measured one with any
+        coordinate resting inside `LIMIT_DEADBAND` of its stop clamped onto it.
+        """
         q = np.asarray(start.q, dtype=float).reshape(-1)
         dq_a = np.asarray(start.dq_a, dtype=float).reshape(-1)
         dq_u = np.asarray(start.dq_u, dtype=float).reshape(-1)
@@ -347,23 +366,42 @@ class Planner:
             raise PlanningError("the start must contain two finite passive sway rates")
         q_a = q[list(PLANNED_INDICES)]
         outside = self.limits.bounded & (
-            (q_a < self.limits.lower) | (q_a > self.limits.upper)
+            (q_a < self.limits.lower - LIMIT_DEADBAND)
+            | (q_a > self.limits.upper + LIMIT_DEADBAND)
         )
         if np.any(outside):
             axis = int(np.flatnonzero(outside)[0])
             raise PlanningError(
                 f"planned coordinate {axis} is measured at {q_a[axis]:.6f}, outside "
-                f"[{self.limits.lower[axis]:.6f}, {self.limits.upper[axis]:.6f}]; "
-                "planning from a projected state would not match the machine"
+                f"[{self.limits.lower[axis]:.6f}, {self.limits.upper[axis]:.6f}] by "
+                f"more than {LIMIT_DEADBAND:.0e}; planning from a projected state "
+                "would not match the machine"
             )
         if self.limits.tool_bounded and not (
-            self.limits.tool_lower <= start.q_tool <= self.limits.tool_upper
+            self.limits.tool_lower - LIMIT_DEADBAND
+            <= start.q_tool
+            <= self.limits.tool_upper + LIMIT_DEADBAND
         ):
             raise PlanningError(
                 f"the tool coordinate is measured at {start.q_tool:.6f}, outside "
-                f"[{self.limits.tool_lower:.6f}, {self.limits.tool_upper:.6f}]; "
-                "fix the simulated state or the description instead of projecting it"
+                f"[{self.limits.tool_lower:.6f}, {self.limits.tool_upper:.6f}] by "
+                f"more than {LIMIT_DEADBAND:.0e}; fix the simulated state or the "
+                "description instead of projecting it"
             )
+
+        projected = q.copy()
+        projected[list(PLANNED_INDICES)] = np.where(
+            self.limits.bounded,
+            np.clip(q_a, self.limits.lower, self.limits.upper),
+            q_a,
+        )
+        if self.limits.tool_bounded:
+            projected[TOOL_INDEX] = np.clip(
+                start.q_tool, self.limits.tool_lower, self.limits.tool_upper
+            )
+        if np.array_equal(projected, q):
+            return start
+        return replace(start, q=projected)
 
     def prepare_scene(self, scene, avoid_collisions: bool) -> list:
         """

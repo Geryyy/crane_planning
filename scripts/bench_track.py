@@ -21,7 +21,7 @@ Everything measured comes off `/trajectory_controllers/controller_state`, which
 the JTC already publishes at the controller rate carrying `reference`,
 `feedback`, `error` and `output` per joint. Nothing new is instrumented.
 
-    ./scripts/bench_plan.py --emit-requests /tmp/a2b_goals.json --move-set all
+    ./scripts/bench_plan.py --emit-requests /tmp/a2b_goals.json --set all
     ./scripts/bench_track.py --requests /tmp/a2b_goals.json \\
         --only ax_slew,ax_arm,sh_multi,across --repeats 3 --out /tmp/ablation
 
@@ -58,6 +58,8 @@ import rclpy
 from control_msgs.action import FollowJointTrajectory
 from control_msgs.msg import JointTrajectoryControllerState
 from controller_manager_msgs.srv import SwitchController
+from crane_model import PASSIVE_INDICES
+from crane_planning.config import PLANNED_INDICES
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
@@ -85,8 +87,29 @@ ARMS = {
 GRID_S = 0.01
 
 #: rad, m on the telescope. A run that did not start where the plan says it
-#: started is not a run of that plan, so it is dropped rather than averaged in.
-START_TOLERANCE = 0.02
+#: started is not a run of that plan. Measured over the **five planned axes**
+#: only: the passive pair is not commanded by anyone, and the tool is owned by
+#: its own controller, carries no feedforward and has no fitted lag, so neither
+#: is evidence about a start this ablation cares about. The offset that was
+#: actually achieved goes into every metrics row rather than being hidden behind
+#: the gate.
+START_TOLERANCE = 0.05
+
+#: How long to wait for the park to settle after its goal returns. Slew's loop
+#: is a trim integrator with a 28 s dominant time constant (jtc_pid yaml), so
+#: "the goal succeeded" and "the axis has stopped moving" are not the same
+#: event and the second one is the one that matters here.
+PARK_SETTLE_S = 40.0
+
+#: rad, and rad/s. **The pendulum is the reason this exists.** `q0` puts the
+#: passive pair at `passive_equilibrium` with `dq_u = 0` -- hanging straight and
+#: still -- so a run started while the tool is still swinging is a run the OCP
+#: did not plan. Measured: parking left tilt 0.224 rad off vertical, past the
+#: planner's own `q_sway_max` of 0.2, and every axis then tracked a plan whose
+#: start never happened. Nothing commands the pair, so waiting is the only
+#: instrument there is.
+PASSIVE_TOLERANCE = 0.03
+REST_RATE = 0.05
 
 
 def parked(names: list, q0, seconds: float) -> JointTrajectory:
@@ -249,11 +272,50 @@ class Bench(Node):
         return (result.result.error_code if result is not None else None), self.samples
 
     def offset_from(self, q0, order: list) -> float:
-        """Largest deviation from `q0` right now, by name, not by index."""
+        """Largest deviation from `q0` over the planned axes, by name."""
         if self.latest is None:
             return float("inf")
         feedback = np.array(self.latest.feedback.positions)[order]
-        return float(np.max(np.abs(feedback - np.asarray(q0, dtype=float))))
+        axes = list(PLANNED_INDICES)
+        return float(np.max(np.abs(feedback[axes] - np.asarray(q0, dtype=float)[axes])))
+
+    def at_rest(self, q0, order: list) -> tuple:
+        """`(planned offset, passive offset, largest rate)` right now."""
+        if self.latest is None:
+            return float("inf"), float("inf"), float("inf")
+        position = np.array(self.latest.feedback.positions)[order]
+        rate = np.array(self.latest.feedback.velocities)
+        target = np.asarray(q0, dtype=float)
+        axes = list(PLANNED_INDICES)
+        passive = list(PASSIVE_INDICES)
+        return (
+            float(np.max(np.abs(position[axes] - target[axes]))),
+            float(np.max(np.abs(position[passive] - target[passive]))),
+            float(np.max(np.abs(rate[order]))) if rate.size else float("inf"),
+        )
+
+    def park(self, names: list, q0, order: list, rate: float) -> tuple:
+        """
+        Drive to `q0`, then wait for the machine to stop.
+
+        Both halves are needed and neither implies the other: the goal reports
+        success on the commanded axes' tolerances, which the pendulum is not in.
+        """
+        travel = self.offset_from(q0, order)
+        status, _ = self.execute(
+            parked(names, q0, max(6.0, travel / rate)), record=False, timeout=240.0
+        )
+        end = time.perf_counter() + PARK_SETTLE_S
+        while True:
+            offset, sway, speed = self.at_rest(q0, order)
+            settled = (
+                offset <= START_TOLERANCE
+                and sway <= PASSIVE_TOLERANCE
+                and speed <= REST_RATE
+            )
+            if settled or time.perf_counter() > end:
+                return status, offset, sway, speed
+            self.spin(0.25)
 
 
 # ---------------------------------------------------------------- the numbers
@@ -360,8 +422,11 @@ def main() -> int:
     parser.add_argument("--service", default="/a2b_movement")
     parser.add_argument("--controller", default="trajectory_controller_a2b")
     parser.add_argument("--plan-timeout", type=float, default=120.0)
-    parser.add_argument("--park-rate", type=float, default=0.15, help="rad/s, slow")
+    parser.add_argument("--park-rate", type=float, default=0.08, help="rad/s, slow")
     parser.add_argument("--settle", type=float, default=2.0)
+    parser.add_argument(
+        "--deactivate", action="store_true", help="release the controller on exit"
+    )
     options = parser.parse_args()
 
     moves = json.loads(options.requests.read_text())["moves"]
@@ -434,18 +499,20 @@ def main() -> int:
             for repeat in range(options.repeats):
                 # Park first, and check it landed: a run that started somewhere
                 # else is not a run of this plan.
-                travel = node.offset_from(move["q0"], order)
-                node.execute(
-                    parked(names, move["q0"], max(4.0, travel / options.park_rate)),
-                    record=False,
-                    timeout=180.0,
+                park_status, offset, sway, speed = node.park(
+                    names, move["q0"], order, options.park_rate
                 )
                 node.spin(options.settle)
-                offset = node.offset_from(move["q0"], order)
-                if offset > START_TOLERANCE:
+                if (
+                    offset > START_TOLERANCE
+                    or sway > PASSIVE_TOLERANCE
+                    or speed > REST_RATE
+                ):
                     node.get_logger().warn(
-                        f"{move['name']}/{arm}/{repeat}: parked {offset:.3f} off q0, "
-                        "dropped"
+                        f"{move['name']}/{arm}/{repeat}: dropped -- parked "
+                        f"{offset:.3f} off q0, tool {sway:.3f} off hanging, "
+                        f"moving at {speed:.3f} rad/s "
+                        f"(park error_code {park_status})"
                     )
                     dropped += 1
                     continue
@@ -458,7 +525,15 @@ def main() -> int:
                     )
                 for row in metrics(samples, duration, names, order):
                     rows.append(
-                        {"move": move["name"], "arm": arm, "repeat": repeat, **row}
+                        {
+                            "move": move["name"],
+                            "arm": arm,
+                            "repeat": repeat,
+                            "start_offset": offset,
+                            "start_sway": sway,
+                            "start_rate": speed,
+                            **row,
+                        }
                     )
                 if repeat == 0 and samples:
                     per_arm[arm] = {
@@ -471,7 +546,10 @@ def main() -> int:
             write_move_csv(path, per_arm, names, order)
             print(f"  -> {path}")
 
-    node.switch_controller(False)
+    # Left active on purpose. Deactivating it stops `controller_state`, and a
+    # campaign that cannot be probed after it finishes cannot be debugged.
+    if options.deactivate:
+        node.switch_controller(False)
 
     if rows:
         keys = list(rows[0])
