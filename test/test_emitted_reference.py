@@ -127,7 +127,12 @@ def test_the_effort_field_carries_the_previewed_command():
         ]
     ).T
 
-    assert commanded == pytest.approx(previewed)
+    # Every sample **but the last**: that one is pinned to zero, because the JTC
+    # holds it after the plan ends and a held feedforward is a permanent command
+    # bias rather than a transient. `test_the_held_last_point_carries_no_command`
+    # is the other half of this contract.
+    assert commanded[:-1] == pytest.approx(previewed[:-1])
+    assert np.all(plan.effort[-1] == 0.0)
     # The pendulum and the tool are not commanded, and the field is width-checked
     # against the joint names, so they carry a zero rather than nothing.
     passive_and_tool = [i for i in range(plan.effort.shape[1]) if i not in planned]
@@ -148,10 +153,43 @@ def test_the_pt1_arm_adds_tau_v_du_dt_and_leaves_a_zero_lag_axis_alone():
     without = resample(1.0e-6, 4.03).effort[:, planned]
     with_lag = resample(1.0e-6, 4.03, lag=lag).effort[:, planned]
 
-    assert with_lag == pytest.approx(without + lag * slope)
+    # The law is exact away from the end. The spline that reconstructs `du/dt`
+    # is clamped to zero slope at `T` -- the emitted feedforward has to land at
+    # zero because the JTC holds the last point -- so the final OCP interval
+    # carries the taper rather than the constant, and this ramp fixture cannot
+    # satisfy both. Assert the constant where the taper does not reach, and the
+    # landing separately; `test_the_held_last_point_carries_no_command` covers
+    # the pin itself.
+    solved = timing(1.0e-6, 4.03)
+    interior = resample(1.0e-6, 4.03).time + PlannerConfig().command_dead_time_s
+    interior = interior < solved.time[-2]
+    assert with_lag[interior] == pytest.approx(without[interior] + lag * slope)
+    assert with_lag[-1] == pytest.approx(np.zeros(len(lag)))
     # `ka`'s fitted lag is zero, so the two arms are bit-identical on the arm
     # axis. That is the control `bench_track.py` reads off `ax_arm`.
     assert np.all(with_lag[:, 2] == without[:, 2])
+
+
+def test_the_held_last_point_carries_no_command():
+    """
+    A held feedforward is a standing command bias, not a transient.
+
+    The JTC keeps sampling the final trajectory point once the plan ends, and
+    `PidTrajectoryPlugin` keeps adding its effort to the command. Slewing is
+    where that is fatal rather than untidy: `p: 0.07` with `i: 0` is a trim
+    integrator with a 28 s dominant time constant, so the loop settles where
+    `p e_pos` cancels the held term. Measured on the sim run of 2026-09-07,
+    before this pin: a held -0.0276 rad/s left the axis 0.355 rad off its goal
+    and still creeping toward the 0.394 rad that ratio predicts.
+
+    The plan ends at rest, so zero is the honest value and not merely the safe
+    one -- and the lag arm is asserted too, because `tau_v u'(T)` is what put a
+    non-zero number there in the first place.
+    """
+    lag = np.array([0.100, 0.025, 0.000, 0.075, 0.125])
+
+    assert np.all(resample(1.0e-6, 4.03).effort[-1] == 0.0)
+    assert np.all(resample(1.0e-6, 4.03, lag=lag).effort[-1] == 0.0)
 
 
 def test_the_reference_carries_accelerations():

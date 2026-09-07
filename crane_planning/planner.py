@@ -32,6 +32,7 @@ from crane_model import (
     Tool,
 )
 from crane_model import symbolic as symbolic_model
+from scipy.interpolate import CubicSpline
 
 from . import weights as crane_weights
 
@@ -592,11 +593,29 @@ class Planner:
         # Block 2, the command PT1, when an arm asks for it. `u_f` chases `u`
         # through `tau_v`, so commanding `u + tau_v du/dt` is what lands `u_f` on
         # the inversion; `command_lag_s` at zero leaves `commanded` untouched and
-        # this is the shipped law. Differentiated on the OCP grid and then
-        # interpolated, not the other way round: `np.interp` is piecewise linear
-        # and differentiating its output gives a staircase. The extra derivative
-        # is `q_a''''`, which is why the path is C4 -- and with `path_segments`
-        # breakpoints the snap is piecewise constant, so `rate` steps at each.
+        # this is the shipped law. The extra derivative is `q_a''''`, which is
+        # why the path is C4.
+        #
+        # **A cubic through the OCP nodes, differentiated analytically -- not a
+        # central difference on that grid.** `np.interp` is piecewise linear and
+        # differentiating its output gives a staircase, which is why the old
+        # code differentiated first; but `np.gradient` on the OCP grid is no
+        # better. That grid runs at ~183 ms on a nominal move while the emitted
+        # samples are 40 ms apart, and `u` carries curvature between nodes --
+        # with `path_segments` breakpoints the snap is piecewise constant. A
+        # central difference there flattens the peaks of `u'` and smears them
+        # onto their neighbours: measured against this spline on the `stow`
+        # bench move it lost 83% of the slewing peak and 93% of the rotator's.
+        # The lead term *is* `tau_v u'`, so an attenuated and displaced `u'` is
+        # a feedforward that pushes where it should not and barely pushes where
+        # it should -- worse than no feedforward, which is what the machine
+        # showed.
+        #
+        # The preview is clamped into the plan rather than extrapolated, which
+        # is what `np.interp` did for `commanded` and did here before: past `T`
+        # the command is held, so the slope is held with it. Clamping is not
+        # cosmetic -- the preview reaches `command_dead_time_s` past the last
+        # stamp on every plan, and a cubic evaluated out there runs away.
         #
         # Clipped to the identified domain, because the feedforward branch is
         # bounded at its source (jtc_pid yaml, "TWO KNOWN DEVIATIONS") and this
@@ -605,22 +624,59 @@ class Planner:
         lag = np.asarray(self.config.command_lag_s, dtype=float)
         lag_saturation = 0.0
         if np.any(lag != 0.0):
-            rate = np.array(
-                [
-                    np.interp(
-                        preview,
-                        timing.time,
-                        np.gradient(timing.command[:, i], timing.time),
-                    )
-                    for i in range(timing.command.shape[1])
-                ]
-            ).T
+            slope = CubicSpline(
+                timing.time,
+                timing.command,
+                axis=0,
+                # Natural, not scipy's not-a-knot default, and not a clamped
+                # end either. Not-a-knot *extrapolates* curvature through the
+                # last interval and ran `u'` to the largest value of the whole
+                # plan in the final three samples. Clamping `u'(T)` to zero
+                # fixes the tail but a cubic spline is **not local** -- the end
+                # condition perturbs every interval, so a ramp stops being a
+                # ramp long before the boundary and the block-2 law is no longer
+                # `tau_v u'` anywhere. Natural claims no curvature at the two
+                # ends, reproduces a ramp exactly, and the tail is handled
+                # locally by the fade below instead.
+                bc_type="natural",
+            ).derivative()
+            rate = slope(np.clip(preview, timing.time[0], timing.time[-1]))
+            # Faded to zero across the final OCP interval, smoothstep so the
+            # lead stays C1. The feedforward has to *land* at zero -- the JTC
+            # holds the last point and `effort[-1]` is pinned below -- and the
+            # only question is whether it arrives there smoothly or steps. It
+            # stepped: measured on the `stow` bench move the slewing lead climbed
+            # to 0.0312 rad/s at `T` and was then cut to zero in one 40 ms
+            # sample, a 0.03 rad/s impulse into the axis at the instant it
+            # arrives. That is the end-of-move ringing the lag arm showed and
+            # the static arm did not. The fade is local, so `tau_v u'` is
+            # untouched everywhere the last interval does not reach -- which is
+            # also why the ramp fixture can still assert the law exactly.
+            #
+            # This interval is the right width and not a tuned one: it is where
+            # `u` is least trustworthy anyway. The solve pins `v = a = j = 0` at
+            # the terminal node, and the node before it carries a one-node kink
+            # (u: -0.0102, -0.0363, -0.00003 on slewing) that no derivative of
+            # `u` can tell from signal.
+            span = timing.time[-1] - timing.time[-2]
+            x = np.clip((timing.time[-1] - preview) / span, 0.0, 1.0)
+            rate = rate * (x * x * (3.0 - 2.0 * x))[:, None]
             raw = commanded + lag * rate
             commanded = np.clip(
                 raw, self.config.command_u_min, self.config.command_u_max
             )
             lag_saturation = float(np.mean(raw != commanded))
         effort[:, list(PLANNED_INDICES)] = commanded - dq[:, list(PLANNED_INDICES)]
+        # The last point is **held**, so its feedforward is not a transient: the
+        # JTC keeps sampling it after the plan ends and the PID plugin keeps
+        # adding it, forever. On slewing that is fatal rather than untidy --
+        # `p: 0.07` with `i: 0` means the loop settles where `p e_pos` cancels
+        # it, so a held -0.0276 rad/s buys a standing 0.39 rad of position
+        # error that the 28 s trim loop crawls toward and never removes.
+        # Measured: exactly that, 0.355 rad and still moving, on the run of
+        # 2026-09-07. The plan ends at rest, so the answer is zero, and it is
+        # pinned for the same reason `dq[-1]` and `ddq[-1]` above are.
+        effort[-1] = 0.0
 
         # The tool where the plan says it is, sway included -- not where it would
         # hang if the machine stopped at each sample. This is visualization, not
