@@ -16,6 +16,7 @@ tool of a different crane.
 
 from __future__ import annotations
 
+import hashlib
 from collections import deque
 
 import numpy as np
@@ -269,7 +270,15 @@ class CranePlanner(Node):
             self.get_logger().error(f"the robot description was refused: {failure}")
             return
         self.joint_names = list(canonical_joints())
-        self.get_logger().info(f"planning for {Tool.PZS100.value}")
+        # Which machine, not just which tool: a deployment publishes several
+        # descriptions and remaps this node onto one of them, and the sha1 is
+        # what names the solver that was compiled for it. Without it, "which URDF
+        # is this planning for" is answerable only by reading the launch file.
+        digest = hashlib.sha1(message.data.encode()).hexdigest()
+        self.get_logger().info(
+            f"planning for {Tool.PZS100.value} on the description at sha1 "
+            f"{digest[:10]}, solver {self.planner.ocp.tree.name}"
+        )
 
     def _joint_states(self, message: JointState) -> None:
         """

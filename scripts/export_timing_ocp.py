@@ -8,6 +8,12 @@ a second copy. What is here is the command line and the tree it writes.
 
     ./scripts/export_timing_ocp.py            # rewrite `generated/`
     ./scripts/export_timing_ocp.py --check    # regenerate into a scratch tree and diff
+    ./scripts/export_timing_ocp.py --description live.urdf --compile-only
+
+The third is the prep step for a run: it compiles a solver for the machine the
+node will actually be handed on `/robot_description` and leaves `generated/`
+alone. Without it the node compiles inside its own description callback, and
+whichever solver it finds is the one baked for some *other* description.
 """
 
 from __future__ import annotations
@@ -39,7 +45,9 @@ from crane_planning.ocp import (  # noqa: E402
     NH_E,
     X_HORIZON,
     build_ocp,
-    cache_tree,
+    cache_key,
+    tree_of,
+    write_manifest,
 )
 
 # ------------------------------------------------------------------ generation
@@ -97,20 +105,18 @@ def write_header(output: Path, parameters: dict, scale: np.ndarray) -> Path:
 
 
 def generate(
-    output: Path, descriptions: Path, parameters: dict, hydraulics: dict
+    output: Path, description: str, parameters: dict, hydraulics: dict
 ) -> None:
     """Write the whole tree, from an empty directory."""
     output.mkdir(parents=True, exist_ok=True)
-    ocp, scale, model = build_ocp(
-        (descriptions / DESCRIPTION).read_text(), parameters, hydraulics
-    )
+    ocp, scale, model = build_ocp(description, parameters, hydraulics)
     tree = ox.generate_solver(ocp, output)
     ox.write_output_map(model, ocp.model.name, tree)
     write_header(output, parameters, scale)
     ox.finalise(output, README)
 
 
-def compile_solver(descriptions: Path, parameters: dict, hydraulics: dict) -> None:
+def compile_solver(description: str, parameters: dict, hydraulics: dict) -> None:
     """
     Compile the solver into the cache the planner loads from.
 
@@ -124,17 +130,20 @@ def compile_solver(descriptions: Path, parameters: dict, hydraulics: dict) -> No
     `crane_ocp`'s `finalise` reads every file it ships as text, so a compiled
     `.so` cannot live there. Same problem, two artifacts.
     """
-    ocp, _, _ = build_ocp(
-        (descriptions / DESCRIPTION).read_text(), parameters, hydraulics
-    )
+    ocp, _, _ = build_ocp(description, parameters, hydraulics)
     CACHE.mkdir(parents=True, exist_ok=True)
     # Named by what is baked, not by the tool alone: a cached `.so` is loaded and
-    # not compared, so a changed `path_segments` or integrator has to land in a
-    # different directory or the node answers with the previous build.
-    tree = cache_tree(parameters, hydraulics)
+    # not compared, so a changed `path_segments`, integrator or *description* has
+    # to land in a different directory or the node answers with the previous
+    # build. The node hashes the description it was handed on `/robot_description`
+    # and says which of these it missed on, so compiling for the wrong machine is
+    # a warning at run time rather than a silent wrong answer.
+    key = cache_key(parameters, hydraulics, description)
+    tree = tree_of(key)
     ocp.code_export_directory = str(tree)
     AcadosOcpSolver(ocp, json_file=str(tree.with_suffix(".json")), verbose=False)
-    print(f"compiled {tree}")
+    write_manifest(tree, key)
+    print(f"compiled {tree} (description sha1 {key['description'][:10]})")
 
 
 def main() -> int:
@@ -145,21 +154,49 @@ def main() -> int:
         action="store_true",
         help="write the tree but do not compile the solver into the cache",
     )
+    parser.add_argument(
+        "--description",
+        type=Path,
+        help=(
+            "the machine to bake, instead of the test fixture. What the node "
+            "plans for is whatever `/robot_description` carries, which in sim is "
+            "a different xacro than the fixture; dump it byte for byte with "
+            "`scripts/dump_robot_description.py`. Needs --compile-only"
+        ),
+    )
+    parser.add_argument(
+        "--compile-only",
+        action="store_true",
+        help=(
+            "compile into the cache and leave `generated/` alone -- the prep "
+            "step for a live description, which must not rewrite the shipped tree"
+        ),
+    )
     arguments = parser.parse_args()
 
     parameters = ox.read_ros_parameters(
         PACKAGE / "config" / "crane_planner.yaml", "crane_planner"
     )
+    source = arguments.description or arguments.descriptions / DESCRIPTION
+    description = source.read_text()
+    # `generated/` is the shipped tree `--check` and CI diff against, and they
+    # regenerate it from the fixture. Writing another machine into it would make
+    # every later `--check` report a diff nobody asked for.
+    if arguments.description and not arguments.compile_only:
+        parser.error("--description writes only into the cache: add --compile-only")
+    if arguments.compile_only:
+        compile_solver(description, parameters, parameters)
+        return 0
     status = ox.run(
         arguments.output,
         arguments.check,
-        lambda output: generate(output, arguments.descriptions, parameters, parameters),
+        lambda output: generate(output, description, parameters, parameters),
         "export_timing_ocp.py",
     )
     # `--check` compares two trees and must not touch the cache; a real export
     # leaves a compiled solver behind so the node does not build one on demand.
     if status == 0 and not arguments.check and not arguments.no_compile:
-        compile_solver(arguments.descriptions, parameters, parameters)
+        compile_solver(description, parameters, parameters)
     return status
 
 

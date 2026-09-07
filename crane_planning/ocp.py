@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
@@ -75,6 +76,11 @@ TOOL = "pzs100"
 DESCRIPTION = "pzs100.urdf"
 SOLVER_NAME = f"crane_planning_ocp_{TOOL}"
 GENERATED_HEADER = "crane_planning_ocp_generated.h"
+
+#: Written beside each built solver: the `cache_key` it was built from. The tree
+#: name is a digest and says nothing about what it holds; this is what lets a
+#: missed prebake name the value that diverged instead of just recompiling.
+MANIFEST = "cache_key.json"
 
 #: The two hinges the hanging pose is a closed form in. `crane_model.symbolic`
 #: numbers the planned axes but does not name them; `planner.py` carries the same.
@@ -197,20 +203,27 @@ def baked_parameters(config) -> dict:
     Read the `BAKED` names off a config. One place, because three callers agree.
 
     Building this dict by hand is how a new `BAKED` entry goes missing: the tuple
-    is what `cache_tree` iterates, so a name added there and not here is a
+    is what `cache_key` iterates, so a name added there and not here is a
     `KeyError` at best and a wrong hash at worst.
     """
     return {name: getattr(config, name) for name in BAKED}
 
 
-def cache_tree(parameters: dict, hydraulics: dict) -> Path:
+def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     """
-    Where this configuration's solver is built, named so a stale one cannot load.
+    Everything a built solver is only valid for. The tree is named after it.
 
     A cached `.so` is loaded, not compared. Every value that enters the
     *expressions* or the dimensions therefore has to move the directory, or a
     changed `ocp_integrator` -- or a changed `path_segments`, which changes the
     parameter vector itself -- silently answers with the previous build.
+
+    The **description** is one of those values and the least visible: the
+    dynamics are built from it, the node builds its planner from whatever
+    `/robot_description` carries, and the exporter bakes from a file on disk.
+    Those two are not the same machine unless someone checked -- the sim's
+    `/robot_description` is a different xacro at `sim_hydraulics:=false` -- so it
+    is hashed here and reported by `divergence` when a prebaked tree is missed.
     """
     baked = {}
     for key in BAKED:
@@ -232,8 +245,48 @@ def cache_tree(parameters: dict, hydraulics: dict) -> Path:
     baked["sim_stages"] = INTEGRATORS[parameters["ocp_integrator"]]
     # How many levels `path_expression` builds, i.e. how long the chain is.
     baked["path_derivatives"] = PATH_DERIVATIVES
-    digest = hashlib.sha1(json.dumps(baked, sort_keys=True).encode()).hexdigest()
+    # The machine itself: masses, inertias, limits and the linkage the dynamics
+    # are generated from. Hashed, not stored -- a URDF is megabytes.
+    baked["description"] = hashlib.sha1(description.encode()).hexdigest()
+    return baked
+
+
+def tree_of(key: dict) -> Path:
+    """Where the solver for `key` is built, named so a stale one cannot load."""
+    digest = hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest()
     return CACHE / f"{SOLVER_NAME}_{digest[:10]}"
+
+
+def cache_tree(parameters: dict, hydraulics: dict, description: str) -> Path:
+    """`tree_of` for callers that hold the inputs rather than the key."""
+    return tree_of(cache_key(parameters, hydraulics, description))
+
+
+def write_manifest(tree: Path, key: dict) -> None:
+    """Record what a freshly built tree was built from, for `divergence` to read."""
+    (tree / MANIFEST).write_text(json.dumps(key, sort_keys=True, indent=1))
+
+
+def divergence(key: dict) -> list:
+    """
+    Say which baked names separate `key` from each solver already in the cache.
+
+    The hash decides *that* a prebaked tree was missed; this says *what* missed
+    it, which is the whole difference between "recompiling, three minutes" and
+    "you are about to plan for a machine nobody exported for". `description`
+    appearing here means the model diverged, not a setting.
+    """
+    lines = []
+    for manifest in sorted(CACHE.glob(f"{SOLVER_NAME}_*/{MANIFEST}")):
+        try:
+            other = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            continue
+        differ = sorted(
+            name for name in set(key) | set(other) if key.get(name) != other.get(name)
+        )
+        lines.append(f"  {manifest.parent.name}: differs in {', '.join(differ)}")
+    return lines
 
 
 # -------------------------------------------------------------------- the path
@@ -661,10 +714,31 @@ class TrajectoryOcp:
         # tree; builds one on first construction, costing minutes. Regenerating
         # unconditionally would overwrite the exporter's output and make `--check`
         # meaningless.
-        tree = cache_tree(baked, hydraulics)
+        key = cache_key(baked, hydraulics, description_xml)
+        #: Which built solver answered. Reported by the node, so a run says on
+        #: disk what it planned with.
+        self.tree = tree = tree_of(key)
         library = tree / f"libacados_ocp_solver_{SOLVER_NAME}.so"
         fresh = not library.is_file()
         CACHE.mkdir(parents=True, exist_ok=True)
+        if fresh:
+            # Loud, because the honest cause is usually not "nothing is exported"
+            # but "what is exported is for another machine or another setting",
+            # and the recompile hides that behind three quiet minutes.
+            print(
+                "\n".join(
+                    [
+                        f"no exported solver for this configuration ({tree.name});"
+                        " compiling, which takes minutes.",
+                        f"  description sha1 {key['description'][:10]}",
+                        *(divergence(key) or ["  the cache holds no other solver"]),
+                        "  export one with scripts/export_timing_ocp.py"
+                        " --description <urdf> --compile-only",
+                    ]
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         ocp.code_export_directory = str(tree)
         self.solver = AcadosOcpSolver(
             ocp,
@@ -673,6 +747,8 @@ class TrajectoryOcp:
             build=fresh,
             verbose=False,
         )
+        if fresh:
+            write_manifest(tree, key)
         # `W` reaches the generated code only at export time, and a cached `.so`
         # is *loaded*, not regenerated -- so without this the weights a caller
         # passes are inert on every run but the one that built the tree, and
