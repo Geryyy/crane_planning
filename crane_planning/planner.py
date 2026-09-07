@@ -110,7 +110,7 @@ class Start:
 
 def actuated_samples(timing, stamps: np.ndarray) -> tuple:
     """
-    `q_a` and `dq_a` at `stamps`, on the curve rather than on the chord.
+    `q_a`, `dq_a` and `ddq_a` at `stamps`, on the curve rather than on the chord.
 
     `q_a = c(sigma)` is an identity the solve never leaves, so `q_a` is not a row
     to interpolate: between two nodes the straight line joining them is off the
@@ -137,9 +137,13 @@ def actuated_samples(timing, stamps: np.ndarray) -> tuple:
         + s * dt**4 / 24.0
     )
     speed = v + a * dt + j * dt**2 / 2.0 + s * dt**3 / 6.0
+    accel = a + j * dt + s * dt**2 / 2.0
+    tangent = evaluate(timing.coefficients, sigma, order=1)
+    curvature = evaluate(timing.coefficients, sigma, order=2)
     return (
         evaluate(timing.coefficients, sigma),
-        evaluate(timing.coefficients, sigma, order=1) * speed[:, None],
+        tangent * speed[:, None],
+        curvature * speed[:, None] ** 2 + tangent * accel[:, None],
     )
 
 
@@ -150,6 +154,7 @@ class Plan:
     time: np.ndarray
     q: np.ndarray  # the canonical eight, resampled at Ts, one row per sample
     dq: np.ndarray
+    ddq: np.ndarray  # the actuated five only, so the JTC interpolates quintic
     #: C3's inversion as the correction the JTC's effort field carries,
     #: `u(t + dead time) - dq_d(t)`, zero on the passive pair and the tool.
     effort: np.ndarray
@@ -484,12 +489,19 @@ class Planner:
                 ]
             ).T
 
-        q_a, dq_a = actuated_samples(timing, stamps)
+        q_a, dq_a, ddq_a = actuated_samples(timing, stamps)
 
         q = np.zeros((len(stamps), GENERALIZED_DOF))
         dq = np.zeros_like(q)
+        # The JTC interpolates cubic between knots without accelerations and
+        # quintic with them (`trajectory.cpp`). The feedforward comes off a C4
+        # curve, so a cubic reconstruction of the tracked reference would have
+        # the two branches follow different curves. The passive pair keeps none:
+        # nothing commands it, and it is not a function of `sigma`.
+        ddq = np.zeros_like(q)
         q[:, list(PLANNED_INDICES)] = q_a
         dq[:, list(PLANNED_INDICES)] = dq_a
+        ddq[:, list(PLANNED_INDICES)] = ddq_a
         # No closed form for the passive pair: it is an integrated state, not a
         # function of `sigma`, so interpolating it is the only option here.
         q[:, list(PASSIVE_INDICES)] = sample(timing.q_u)
@@ -509,6 +521,7 @@ class Planner:
                 "arrive stopped"
             )
         dq[-1] = 0.0
+        ddq[-1] = 0.0
         # `c(1)` *is* the lifted goal, `geometry.fit` writes it there. What the
         # reconstruction lands on is `c(1 - gap)`, so take the certified end.
         q[-1, list(PLANNED_INDICES)] = evaluate(timing.coefficients, 1.0)[0]
@@ -558,6 +571,7 @@ class Planner:
             time=stamps,
             q=q,
             dq=dq,
+            ddq=ddq,
             effort=effort,
             tcp=tcp,
             timing=timing,

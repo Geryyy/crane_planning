@@ -115,7 +115,7 @@ def test_the_resampler_reproduces_the_chain_at_the_next_node():
     """
     plan = chain(np.array([3.0, -2.0, 1.5, -4.0, 0.5]))
     edges = plan.time[1:] - 1.0e-12  # inside interval k, at its right edge
-    q_a, dq_a = actuated_samples(plan, edges)
+    q_a, dq_a, _ = actuated_samples(plan, edges)
 
     expected_q = evaluate(COEFFICIENTS, plan.sigma[1:])
     expected_dq = evaluate(COEFFICIENTS, plan.sigma[1:], order=1) * plan.speed[1:, None]

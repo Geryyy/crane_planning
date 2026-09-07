@@ -126,3 +126,20 @@ def test_the_effort_field_carries_the_previewed_command():
     # against the joint names, so they carry a zero rather than nothing.
     passive_and_tool = [i for i in range(plan.effort.shape[1]) if i not in planned]
     assert np.all(plan.effort[:, passive_and_tool] == 0.0)
+
+
+def test_the_reference_carries_accelerations():
+    """
+    Without them the JTC interpolates the tracked reference cubic while the
+    feedforward comes off the C4 curve, so the two branches follow different
+    curves between knots.
+    """
+    plan = resample(1.0e-6, 4.03)
+
+    planned = list(PLANNED_INDICES)
+    interior = slice(1, -1)
+    difference = np.gradient(plan.dq[:, planned], plan.time, axis=0)[interior]
+    assert difference == pytest.approx(plan.ddq[interior][:, planned], abs=1e-3)
+
+    not_commanded = [i for i in range(plan.ddq.shape[1]) if i not in planned]
+    assert np.all(plan.ddq[:, not_commanded] == 0.0)

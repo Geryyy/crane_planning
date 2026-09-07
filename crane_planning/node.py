@@ -567,12 +567,13 @@ class CranePlanner(Node):
         trajectory.joint_names = [self.joint_names[index] for index in indices]
         columns = list(indices)
         feedforward = self.get_parameter("c3_feedforward").value
-        for when, position, velocity, command in zip(
-            plan.time, plan.q, plan.dq, plan.effort
+        for when, position, velocity, acceleration, command in zip(
+            plan.time, plan.q, plan.dq, plan.ddq, plan.effort
         ):
             point = JointTrajectoryPoint()
             point.positions = [float(value) for value in position[columns]]
             point.velocities = [float(value) for value in velocity[columns]]
+            point.accelerations = [float(value) for value in acceleration[columns]]
             if feedforward:
                 point.effort = [float(value) for value in command[columns]]
             point.time_from_start.sec = int(when)

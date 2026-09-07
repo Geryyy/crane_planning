@@ -54,7 +54,7 @@ def recovered_sigma(row: np.ndarray) -> float:
 def test_every_emitted_configuration_lies_on_the_curve():
     plan = timing()
     stamps = np.linspace(0.0, plan.time[-1], 37)  # deliberately off the node grid
-    q_a, _ = actuated_samples(plan, stamps)
+    q_a, _, _ = actuated_samples(plan, stamps)
 
     for row in q_a:
         on_curve = evaluate(COEFFICIENTS, recovered_sigma(row))[0]
@@ -80,7 +80,7 @@ def test_the_chord_would_fail_this():
 def test_velocities_are_the_derivative_of_the_positions_emitted():
     plan = timing()
     stamps = np.linspace(0.0, plan.time[-1], 2001)
-    q_a, dq_a = actuated_samples(plan, stamps)
+    q_a, dq_a, _ = actuated_samples(plan, stamps)
 
     interior = slice(1, -1)
     difference = np.gradient(q_a, stamps, axis=0)[interior]
