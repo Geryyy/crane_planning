@@ -29,6 +29,7 @@ from crane_model import (
     canonical_joints,
 )
 from crane_msgs.msg import CollisionScene, PayloadEstimate
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from rclpy.node import Node
@@ -82,6 +83,12 @@ JOINT_STATES_TOPIC = "/joint_states"
 COLLISION_SCENE_TOPIC = "/crane/collision_scene"
 PAYLOAD_ESTIMATE_TOPIC = "/crane/payload_estimate"
 ROBOT_DESCRIPTION_TOPIC = "/robot_description"
+#: What the OCP did on the last request, converged or not. **Private**, for
+#: `crane_mpc`'s `~/shadow_comparison` reason: it is a diagnostics stream and
+#: nothing decides anything on it, so it must not be one remap away from reading
+#: like a contract. Latched, because the question it answers -- "why did that
+#: request come back empty?" -- is asked after the fact.
+SOLVER_STATS_TOPIC = "~/solver_stats"
 
 #: The frame planning geometry is in. The assembly planner converts `world` to
 #: this before it calls; nothing downstream converts, so a goal that arrives in
@@ -216,6 +223,9 @@ class CranePlanner(Node):
         # Transient-local, because an RViz started after the plan should still
         # see it -- a plan is a standing decision, not a stream.
         self.markers = self.create_publisher(MarkerArray, MARKERS_TOPIC, latched())
+        self.solver_stats = self.create_publisher(
+            DiagnosticArray, SOLVER_STATS_TOPIC, latched()
+        )
         # The retained timber contract, on the same node and over the same
         # planner: one adapter, no second set of limits.
         self.create_service(CalcMovement, A2B_MOVEMENT_SERVICE, self._a2b)
@@ -498,10 +508,9 @@ class CranePlanner(Node):
         response.trajectory = JointTrajectory()
         response.tcp_path = []
         if self.planner is None:
-            self.get_logger().warn(
-                f"a2b_movement refused: no robot description has arrived on "
-                f"{ROBOT_DESCRIPTION_TOPIC}"
-            )
+            refusal = f"no robot description has arrived on {ROBOT_DESCRIPTION_TOPIC}"
+            self.get_logger().warn(f"a2b_movement refused: {refusal}")
+            self._report(DiagnosticStatus.ERROR, refusal, {})
             return response
 
         try:
@@ -530,6 +539,9 @@ class CranePlanner(Node):
             )
         except PlanningError as refusal:
             self.get_logger().warn(f"a2b_movement refused: {refusal}")
+            # Every refusal, not only the solver's: a stream that is silent on
+            # the refusals it has no numbers for reads as "the solve was fine".
+            self._report(DiagnosticStatus.ERROR, str(refusal), refusal.stats)
             return response
 
         # The canonical eight, because that is what the trajectory controller
@@ -595,7 +607,33 @@ class CranePlanner(Node):
         self.reference.publish(trajectory)
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
+        self._report(DiagnosticStatus.OK, plan.message, plan.timing.stats)
         return plan, trajectory, path
+
+    def _report(self, level: bytes, message: str, stats: dict) -> None:
+        """
+        Publish what the solver did, converged or not, on one topic in one shape.
+
+        The non-convergence is the case this exists for and it is also the case
+        that returns nothing at all: `CalcMovement.Response` has no message
+        field, so before this the only trace of a failed solve was a line in
+        this node's log. `level` is a `DiagnosticStatus` constant and those are
+        `bytes`, not ints -- an int fails the field's type check.
+        """
+        report = DiagnosticArray()
+        report.header.stamp = self.get_clock().now().to_msg()
+        report.status = [
+            DiagnosticStatus(
+                level=level,
+                name=f"{self.get_name()}: trajectory OCP",
+                message=message,
+                values=[
+                    KeyValue(key=key, value=f"{value:.6g}")
+                    for key, value in stats.items()
+                ],
+            )
+        ]
+        self.solver_stats.publish(report)
 
     def _trajectory(self, plan, stamp, indices) -> JointTrajectory:
         """

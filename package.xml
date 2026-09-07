@@ -19,6 +19,8 @@
   <depend>crane_msgs</depend>
   <!-- CasADi vectorizes the passive-dynamics rollout and actuator checks. -->
   <depend>casadi</depend>
+  <!-- `~/solver_stats`: what the OCP did, converged or not. -->
+  <depend>diagnostic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>rclpy</depend>

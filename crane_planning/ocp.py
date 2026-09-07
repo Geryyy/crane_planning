@@ -271,6 +271,45 @@ class SolverNotExported(RuntimeError):
     """No compiled solver for the description and settings the node was handed."""
 
 
+#: The four KKT residuals acados stops on, in the order it returns them.
+RESIDUALS = ("stationarity", "equality", "inequality", "complementarity")
+
+
+def solver_stats(solver, status: int, elapsed: float) -> dict:
+    """
+    One solve as flat named numbers -- what `~/solver_stats` carries.
+
+    Built off the solver and **once**, before the outcome is branched on, so the
+    keys do not depend on whether it converged: a diagnostics stream that
+    reports fewer numbers exactly when it failed is the wrong way round. Read a
+    regression off the iteration counts and the residuals against
+    `ocp_tolerance`, never off a time -- all three are load-bound.
+
+    `qp_iter` and `qp_stat` are **vectors**, one entry per SQP iteration, so the
+    total and the worst are what a scalar row can honestly carry. The QP status
+    is worth its own key rather than being folded into `acados_status`: acados
+    reports a QP that merely hit HPIPM's iteration limit as a success.
+    """
+    qp_iterations = np.asarray(solver.get_stats("qp_iter"), dtype=float)
+    qp_status = np.asarray(solver.get_stats("qp_stat"), dtype=float)
+    stats = {
+        "acados_status": float(status),
+        "sqp_iterations": float(solver.get_stats("sqp_iter")),
+        "qp_iterations": float(qp_iterations.sum()),
+        "qp_status_worst": float(qp_status.max()) if qp_status.size else 0.0,
+        "solve_time_s": float(elapsed),
+        "acados_time_s": float(solver.get_stats("time_tot")),
+        "qp_time_s": float(solver.get_stats("time_qp")),
+    }
+    stats.update(
+        {
+            f"residual_{name}": float(value)
+            for name, value in zip(RESIDUALS, solver.get_stats("residuals"))
+        }
+    )
+    return stats
+
+
 def divergence(key: dict) -> list:
     """
     Say which baked names separate `key` from each solver already in the cache.
@@ -672,6 +711,10 @@ class Trajectory:
     #: against `ocp_tolerance`, never off the time.
     acados_time_s: float
     residuals: np.ndarray  # (4,) stationarity, equality, inequality, complementarity
+    #: The same solve as flat named numbers, for `~/solver_stats`. Carried
+    #: rather than derived, because the refusals raised *after* this object is
+    #: built report the identical shape and must not rebuild it differently.
+    stats: dict
 
     @property
     def duration(self) -> float:
@@ -1012,24 +1055,33 @@ class TrajectoryOcp:
                 for node in range(N + 1)
             ]
         )
-        if guard > 0.99:
-            raise PlanningError(
-                f"the snap guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
-                "duration this answer carries is partly that constant's and not the "
-                "machine's"
-            )
+        stats = solver_stats(solver, status, elapsed)
+        # **The status is read before the guard**, and the order is the whole
+        # point: `guard` is computed off the returned iterate, and a diverged
+        # iterate is more likely to saturate the snap chain than a converged
+        # one, so checking the guard first reports a constant's name for what is
+        # actually a non-convergence.
         if status != 0:
             # The residuals are the whole diagnosis of a non-convergence -- which
             # of the four stalled says whether it is the dynamics, the goal box or
             # a soft row -- and this is the one path where no `Trajectory` is
-            # built to carry them, so they go in the message instead.
+            # built to carry them, so they ride the refusal itself: into the
+            # message for the log, and as `stats` for `~/solver_stats`.
             stat, eq, ineq, comp = np.asarray(
                 solver.get_stats("residuals"), dtype=float
             )
             raise PlanningError(
                 f"the trajectory OCP did not converge: acados status {status} after "
-                f"{solver.get_stats('sqp_iter')} iterations, {elapsed:.2f} s, on "
-                f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}"
+                f"{int(stats['sqp_iterations'])} iterations, {elapsed:.2f} s, on "
+                f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}",
+                stats=stats,
+            )
+        if guard > 0.99:
+            raise PlanningError(
+                f"the snap guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
+                "duration this answer carries is partly that constant's and not the "
+                "machine's",
+                stats=stats,
             )
         return Trajectory(
             time=np.linspace(0.0, duration, N + 1),
@@ -1053,4 +1105,5 @@ class TrajectoryOcp:
             solve_time_s=elapsed,
             acados_time_s=float(solver.get_stats("time_tot")),
             residuals=np.asarray(solver.get_stats("residuals"), dtype=float),
+            stats=stats,
         )

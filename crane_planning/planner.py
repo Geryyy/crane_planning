@@ -335,12 +335,18 @@ class Planner:
         if np.any(terminal_offset > self.config.terminal_q_sway_max) or np.any(
             terminal_rate > self.config.terminal_dq_sway_max
         ):
+            # `timing.stats` and not nothing: this refusal is the one that most
+            # needs its numbers on the wire. A clean iteration count with every
+            # residual under `ocp_tolerance` beside a sway the solve did not
+            # close says the solver is fine and the model it was given is not --
+            # which is the opposite conclusion from an empty report.
             raise PlanningError(
                 "the timing solve converged but did not arrive settled: terminal sway "
                 f"offset {terminal_offset.tolist()} rad against "
                 f"{self.config.terminal_q_sway_max.tolist()}, rate "
                 f"{terminal_rate.tolist()} rad/s against "
-                f"{self.config.terminal_dq_sway_max.tolist()}"
+                f"{self.config.terminal_dq_sway_max.tolist()}",
+                stats=timing.stats,
             )
         return self._resample(geometry, path, timing, start, lifted, candidate_name)
 
@@ -558,7 +564,8 @@ class Planner:
             raise PlanningError(
                 f"the plan ends at {drift:.3e} rad/s, above the "
                 f"{TERMINAL_DRIFT_MAX:.0e} terminal floor: the solve did not "
-                "arrive stopped"
+                "arrive stopped",
+                stats=timing.stats,
             )
         dq[-1] = 0.0
         ddq[-1] = 0.0

@@ -55,6 +55,9 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
         pump_flow=np.zeros(nodes + 1),
         iterations=3,
         solve_time_s=0.1,
+        # `_resample`'s drift refusal carries the solve's own numbers on
+        # `~/solver_stats`; the stand-in only has to have them.
+        stats={},
         slack=0.0,
         terminal_sway=0.0,
         terminal_sway_rate=0.0,

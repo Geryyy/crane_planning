@@ -50,6 +50,14 @@ ARM_AXIS = 2
 class PlanningError(RuntimeError):
     """A refusal. The message is what the service answer carries."""
 
+    def __init__(self, message: str, stats: dict | None = None):
+        super().__init__(message)
+        #: The solver's own numbers where the refusal came out of a solve, so a
+        #: non-convergence -- the one outcome that builds no `Trajectory` to
+        #: carry them -- can still be reported as numbers and not only as prose.
+        #: Empty on every refusal raised before the solve.
+        self.stats = dict(stats or {})
+
 
 # --------------------------------------------------------------------- limits
 
