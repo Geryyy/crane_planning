@@ -125,25 +125,39 @@ crane_planner:
     # joint accelerations are a comfort limit the description does not carry.
     dq_sway_max: [1.0, 0.5]
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
-    # rad/s^3 (m/s^3 on the telescope), and the one limit here that is not a
-    # comfort choice: it is what the C3 feedforward can pay for. The inversion is
-    # u = v + (2 zeta / w_n) v' + v'' / w_n^2, so a third derivative the command
-    # cannot afford saturates the valve and the feedforward stops being one --
-    # controller_design.md 4.4, "nothing on this page is shippable without it".
-    # Budget the command: dddq_a_max = w_n^2 (u_max - kappa dq_max - 2 zeta / w_n
-    # ddq_a_max), with w_n and zeta from c3_full_model.json and u_max the
-    # identified command domain of compensator_map.md section 3.
-    #   slew      w_n 8.66  zeta 0.102  u_max 0.936  ->  21.2
-    #   boom      w_n 8.05  zeta 0.364  u_max 0.526  ->   2.72
-    #   arm       w_n 9.71  zeta 0.395  u_max 0.866  ->  12.5
-    #   telescope w_n 82.2  zeta 0.662  u_max 0.555  -> 236.0
-    #   rotator   w_n 12.1  zeta 0.402  u_max 2.397  ->  44.4
-    # Boom and arm are the weak entries: compensator_map identifies a domain for
-    # slewing, the rotator and the telescope only ("still open on the boom -- the
-    # arity differs"), so `u_max` falls back to the description velocity limit
-    # for those two and their budget is an assumption, not a measurement. The
-    # boom is also the axis that comes closest to its bound in practice.
+    # rad/s^3 (m/s^3 on the telescope). **Not a limit.** It is the scale the
+    # jerk row of the *cost* is measured in, so 1.0 there means "as much third
+    # derivative as the fitted pose could pay for" and the weight stays a
+    # preference. What the machine can actually afford is the command row below,
+    # which bounds the command itself rather than a proxy for it.
+    #
+    # It was a limit until issue 113's notes: derived as
+    # `dddq_a_max = w_n^2 (u_max - kappa dq_max - 2 zeta / w_n ddq_a_max)` at the
+    # `m_ii_median` of `c3_full_model.json`. Two things were wrong with that. The
+    # inertia is not a constant -- slewing runs 2.4x to 8.8x that median over the
+    # 21 bench moves -- and reserving the rate and the acceleration separately
+    # prices a sum of worst cases, when the valve pays the sum at each instant:
+    # measured, it refuses `across`, whose real command is 0.46 of the domain.
     dddq_a_max: [21.2, 2.72, 12.5, 236.0, 44.4]
+    # --- what the C3 feedforward will command --------------------------------
+    #
+    # `u_d = qdot_d + tau_dot_d / k_i`, the inversion `AddC3Feedforward` writes
+    # into the trajectory's effort field, bounded by the domain the compensator
+    # was identified over. Same three lists as `bt_server_override.yaml`'s
+    # `c3_feedforward.{k,u_min,u_max}`, and they must stay the same lists: the
+    # planner exists to refuse what the feedforward cannot deliver, so a second
+    # derivation of these numbers is a second answer to one question.
+    #
+    # `k` is N m/rad, N/m on the telescope, from
+    # `wiki/diagrams/hydraulic_calibration/c3_full_model.json`. The telescope's is
+    # a geometry prior rather than a fit (controller_design.md 3.4) and the
+    # rotator's rests on four bags (hydraulics 6.1) -- indicative, not measured.
+    # `u_min`/`u_max` are Psi's identified domain, min_x/max_x of
+    # `velocity_characteristic.yaml`; outside it the compensator extrapolates a
+    # monotone spline past its data.
+    command_k: [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
+    command_u_min: [-0.9635, -0.3134, -0.3342, -0.5551, -2.3969]
+    command_u_max: [0.9357, 0.2977, 0.3059, 0.5849, 2.4636]
     # Visualization is not the control reference: bound the authoritative FK calls
     # while the full JointTrajectory stays at 25 Hz.
     visualization_samples: 25
@@ -194,7 +208,12 @@ crane_planner:
       dddq_a: 1.0
       terminal_scale: 1.0
       time: 0.3
-    ocp_max_iterations: 60
+    # The command row is a stiffer direction than the `dddq_a` row it replaced:
+    # `ax_slew` needs 70 iterations against 48 before, and 60 refuses it. Not
+    # higher, because a refusal spends the whole budget before saying so:
+    # `sh_boom` takes 29.9 s to refuse at 200, against the tree's 30 s call
+    # timeout. `ax_rot` does not converge at any budget tried; see 113's notes.
+    ocp_max_iterations: 100
     # The duration box `theta` is limited by, in seconds.
     ocp_duration_min: 2.0
     ocp_duration_max: 20.0

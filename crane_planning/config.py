@@ -193,7 +193,11 @@ class PlannerConfig:
     ocp_integrator: str = "ERK"
     ocp_duration_min: float = 2.0
     ocp_duration_max: float = 20.0
-    ocp_max_iterations: int = 60
+    #: The command row is a stiffer direction than the `dddq_a` row it replaced:
+    #: `ax_slew` needs 70 iterations against 48 before, and 60 refuses it. Not
+    #: higher: a refusal costs the whole budget, and `sh_boom` spends 29.9 s
+    #: failing at 200 against a 30 s call timeout in the tree.
+    ocp_max_iterations: int = 100
     #: acados defaults to 1e-6 on all four residuals, a control-loop number. This
     #: answer is resampled onto a 25 Hz reference and tracked by a controller that
     #: closes the loop on it, so the last two decades buy nothing and cost every
@@ -214,8 +218,25 @@ class PlannerConfig:
     ddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.7, 0.5, 1.0, 6.0])
     )
+    #: No longer a limit -- the scale the jerk *preference* in the cost is
+    #: measured in. `H_COMMAND` bounds what the command actually is.
     dddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([21.2, 2.72, 12.5, 236.0, 44.4])
+    )
+    #: C3's actuator stiffness per axis and the domain the compensator was
+    #: identified over. The same three lists `AddC3Feedforward` reads from
+    #: `bt_server_override.yaml`; planner and feedforward must not carry two
+    #: derivations of one number.
+    command_k: np.ndarray = field(
+        default_factory=lambda: np.array(
+            [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
+        )
+    )
+    command_u_min: np.ndarray = field(
+        default_factory=lambda: np.array([-0.9635, -0.3134, -0.3342, -0.5551, -2.3969])
+    )
+    command_u_max: np.ndarray = field(
+        default_factory=lambda: np.array([0.9357, 0.2977, 0.3059, 0.5849, 2.4636])
     )
     visualization_samples: int = 25
 

@@ -1,11 +1,15 @@
-"""The jerk the C3 feedforward can pay for is a row in the OCP, and a hard one.
+"""The command the C3 feedforward will issue is a row in the OCP, and a hard one.
 
-`wiki/controller_design.md` section 4.4: the inversion is
-`u = v + (2 zeta / w_n) v' + v'' / w_n^2`, so its excursion grows as the cube of the
-inverse rise time, and a reference whose third derivative the command cannot afford
-saturates the valve -- at which point the feedforward is no longer one. That page
-ends "nothing on this page is shippable without it", and says the bound belongs to
-the planner rather than to a post-hoc check.
+`wiki/controller_design.md` section 4.4: a reference the command cannot afford
+saturates the valve, at which point the feedforward is no longer one. That page ends
+"nothing on this page is shippable without it", and says the bound belongs to the
+planner rather than to a post-hoc check.
+
+The row is the command itself -- `u_d = dq_a + tau_dot_a / k`, what
+`AddC3Feedforward` computes -- and not the `dddq_a` proxy issue 113 first shipped.
+The proxy priced a sum of worst cases (reserve the rate, reserve the acceleration,
+give the jerk what is left) where the valve pays the sum at each instant, and it
+froze `M_ii` at the fitted pose; see the issue's notes.
 
 Two properties, and they fail differently. If the row is missing the solve answers
 with a reference the machine cannot track. If the row is made *soft* the solve
@@ -26,7 +30,7 @@ from crane_planning.config import (
     PlannerConfig,
 )
 from crane_planning.geometry import yaw_of
-from crane_planning.ocp import H_JERK, NH, baked_parameters, build_ocp
+from crane_planning.ocp import H_COMMAND, NH, baked_parameters, build_ocp
 from crane_planning.planner import Planner, Start
 
 #: `stow`, the `bench_plan.py` move that comes closest to the bound -- 0.75 of it
@@ -50,7 +54,7 @@ def description() -> str:
     return path.read_text()
 
 
-def test_the_jerk_rows_are_present_and_hard():
+def test_the_command_rows_are_present_and_hard():
     config = PlannerConfig()
     baked = {**baked_parameters(config), "weights": crane_weights.DEFAULTS}
     ocp, _scale, _model = build_ocp(
@@ -58,13 +62,14 @@ def test_the_jerk_rows_are_present_and_hard():
     )
 
     assert ocp.model.con_h_expr.shape[0] == NH
-    jerk_rows = set(range(H_JERK, NH))
-    # Soft rows are the ones a caller would rather have late than refused. A jerk
-    # the command cannot pay for is not a slower plan, it is an untrackable one.
-    assert jerk_rows.isdisjoint(set(np.atleast_1d(ocp.constraints.idxsh).tolist()))
+    command_rows = set(range(H_COMMAND, NH))
+    # Soft rows are the ones a caller would rather have late than refused. A
+    # command the valve cannot deliver is not a slower plan, it is an untrackable
+    # one.
+    assert command_rows.isdisjoint(set(np.atleast_1d(ocp.constraints.idxsh).tolist()))
 
 
-def test_a_solved_trajectory_respects_the_jerk_bound():
+def test_a_solved_trajectory_respects_the_command_bound():
     config = PlannerConfig()
     planner = Planner(description(), config, dict(crane_weights.DEFAULTS))
 
@@ -90,7 +95,12 @@ def test_a_solved_trajectory_respects_the_jerk_bound():
         avoid_collisions=True,
     )
 
-    peak = np.max(np.abs(plan.timing.dddq_a), axis=0)
-    assert np.all(peak <= config.dddq_a_max + 1.0e-6), (
-        f"peak jerk {peak.tolist()} against {config.dddq_a_max.tolist()}"
+    reservation = config.kappa
+    assert np.all(plan.timing.command <= reservation * config.command_u_max + 1e-6), (
+        f"command {plan.timing.command.max(axis=0).tolist()} over "
+        f"{(reservation * config.command_u_max).tolist()}"
+    )
+    assert np.all(plan.timing.command >= reservation * config.command_u_min - 1e-6), (
+        f"command {plan.timing.command.min(axis=0).tolist()} under "
+        f"{(reservation * config.command_u_min).tolist()}"
     )

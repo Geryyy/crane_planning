@@ -122,12 +122,20 @@ def bounds(planner: Planner, speed_scale: float) -> dict:
     the solve did not use. `speed_scale` enters every row once: it is the
     reference server's `slow_down` divider, which divides rate, acceleration and
     jerk alike, and not a time reparametrisation -- see `TrajectoryOcp.solve`.
+    The command row is the exception and carries `kappa` alone: `slow_down` asks
+    for a gentler move, it does not shrink the valve's domain.
+
+    No `dddq_a` entry: nothing bounds the third derivative on its own any more.
+    What it is spent on is the command, which is a row of its own.
     """
     limits, config = planner.limits, planner.config
     return {
         "dq_a": config.kappa * speed_scale * limits.dq_max,
         "ddq_a": config.kappa * speed_scale * config.ddq_a_max,
-        "dddq_a": config.kappa * speed_scale * config.dddq_a_max,
+        "command": (
+            config.kappa * config.command_u_min,
+            config.kappa * config.command_u_max,
+        ),
         "flow": config.kappa * speed_scale * limits.flow_max / config.pump_flow_max,
     }
 
@@ -161,6 +169,15 @@ def usage(planner: Planner, plan, speed_scale: float) -> dict:
         "sway": np.max(np.abs((timing.q_u - timing.q_u_eq) / sway_bound), axis=1),
         "dq_u": np.max(np.abs(timing.dq_u / rate_bound), axis=1),
         "pump": timing.pump_flow / limit["flow"],
+        "C3 command": np.max(
+            np.abs(
+                timing.command
+                / np.where(
+                    timing.command < 0, -limit["command"][0], limit["command"][1]
+                )
+            ),
+            axis=1,
+        ),
     }
 
 

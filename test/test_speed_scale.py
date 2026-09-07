@@ -58,17 +58,18 @@ def test_slow_down_divides_every_ceiling_once():
     )
 
     reservation = config.kappa * SPEED_SCALE
+    peak_rate = np.max(np.abs(plan.timing.dq_a), axis=0)
     peak_accel = np.max(np.abs(plan.timing.ddq_a), axis=0)
-    peak_jerk = np.max(np.abs(plan.timing.dddq_a), axis=0)
+    assert np.all(peak_rate <= reservation * planner.limits.dq_max + 1.0e-6), (
+        f"peak rate {peak_rate.tolist()} over {reservation} of "
+        f"{planner.limits.dq_max.tolist()}"
+    )
     assert np.all(peak_accel <= reservation * config.ddq_a_max + 1.0e-6), (
         f"peak acceleration {peak_accel.tolist()} over {reservation} of "
         f"{config.ddq_a_max.tolist()}"
     )
-    assert np.all(peak_jerk <= reservation * config.dddq_a_max + 1.0e-6), (
-        f"peak jerk {peak_jerk.tolist()} over {reservation} of "
-        f"{config.dddq_a_max.tolist()}"
-    )
 
-    # The discriminating half: under `s**k` this answer was not available.
+    # The discriminating half: under `s**k` this answer was not available -- the
+    # acceleration alone reaches 1.03 and 1.48 of what `s**2` would have allowed.
+    # No jerk assertion: `dddq_a_max` is a cost scale now and bounds nothing.
     assert np.any(peak_accel > config.kappa * SPEED_SCALE**2 * config.ddq_a_max)
-    assert np.any(peak_jerk > config.kappa * SPEED_SCALE**3 * config.dddq_a_max)

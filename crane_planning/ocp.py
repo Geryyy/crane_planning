@@ -92,7 +92,12 @@ NX, NU = 9, 1
 #: are nonlinear rows now because what they bound is an expression in `sigma`.
 H_SWAY, H_FLOW, H_RATE = 0, 2, 3
 H_ACCEL = 3 + cs.K_PLANNED_DOF
-H_JERK = 3 + 2 * cs.K_PLANNED_DOF
+#: The C3 command itself, `u = dq_a + tau_dot_a / k`, against the domain the
+#: compensator was identified over. It replaced a `dddq_a` row: bounding the
+#: third derivative was only ever a proxy for this, and a decomposed proxy --
+#: reserve the rate, reserve the acceleration, give jerk the remainder -- prices
+#: a sum of worst cases where the machine pays the sum at each instant.
+H_COMMAND = 3 + 2 * cs.K_PLANNED_DOF
 NH = 3 + 3 * cs.K_PLANNED_DOF
 #: Row order of `h_e`: the settled box the caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
@@ -120,9 +125,10 @@ PATH_DERIVATIVES = 5
 #: the solve's own demand is ~132 and 2000 is ~15x headroom, which is what a
 #: guard should be.
 #:
-#: The **jerk** now carries a physical row (`dddq_a_max`), so this bounds only
-#: the snap, and deliberately loosely: with `dddq_a` bounded, `q_a''''` is
-#: finite whatever this is, and finite is what the command PT1 inversion needs.
+#: The **command** carries the physical row now (`H_COMMAND`), and it contains
+#: `dddq_a` through `M_ii/k`, so this bounds only the snap and deliberately
+#: loosely: with the command bounded, `q_a''''` is finite whatever this is, and
+#: finite is what a PT1 inversion would need if one were ever done.
 SIGMA_INPUT_MAX = 2000.0
 
 #: What the compiled solver's structure depends on. `weights` is deliberately
@@ -139,6 +145,9 @@ BAKED = (
     "dq_sway_max",
     "ddq_a_max",
     "dddq_a_max",
+    "command_k",
+    "command_u_min",
+    "command_u_max",
     "path_segments",
 )
 
@@ -324,6 +333,11 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     dq_sway_max = np.asarray(parameters["dq_sway_max"], dtype=float)
     ddq_a_max = np.asarray(parameters["ddq_a_max"], dtype=float)
     dddq_a_max = np.asarray(parameters["dddq_a_max"], dtype=float)
+    command_k = np.asarray(parameters["command_k"], dtype=float)
+    command_u_min = np.asarray(parameters["command_u_min"], dtype=float)
+    command_u_max = np.asarray(parameters["command_u_max"], dtype=float)
+    # One scale for the row, so 1.0 is the wider side of an asymmetric domain.
+    command_ref = np.maximum(np.abs(command_u_min), command_u_max)
     nominal = float(parameters["ocp_horizon"])
     segments = int(parameters["path_segments"])
     integrator = str(parameters["ocp_integrator"]).upper()
@@ -397,6 +411,36 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     acados_model.xdot = ca.SX.sym("xdot", NX)
     acados_model.f_impl_expr = acados_model.xdot - acados_model.f_expl_expr
 
+    # What `AddC3Feedforward` will actually command for this plan, in its own
+    # arithmetic: `u_d = qdot_d + tau_dot_d / k_i` (`c3_feedforward_math.hpp`),
+    # with `tau` the same RNEA over all eight coordinates the node evaluates.
+    # `jtimes` against the state derivative is the exact total derivative --
+    # d tau/dq qdot + d tau/dqdot qddot + M qdddot, passive coupling included --
+    # and it is the expression issue 114 needs, so it is built once, here.
+    #
+    # Convention: `tau_a` is `crane_model`'s, which carries the mimic coupling and
+    # the transmission projection, while `command_k` was identified against a
+    # plain CRBA -- the two differ by 1.09x to 3.40x and the factor is
+    # pose-dependent, so it cannot be absorbed into a constant. The node divides
+    # exactly this `tau` by exactly this `k`, so the planner refuses what the
+    # machine will actually be asked for; correcting the convention corrects both
+    # at once. See `issues/open/113`'s notes.
+    #
+    # `f_expl_expr` is `dx/dtau` on acados' own `[0, 1]` grid -- it carries the
+    # `nominal * theta` scaling -- so `jtimes` against it gives `d tau_a/dtau`,
+    # which is `T` times the physical derivative. Dividing it back out is what
+    # makes this row a command and not a command times the answer's own duration:
+    # left in, the row's acceleration coefficient was `T D_ii/k` against a
+    # physical `d_i/k`, so it tightened as the answer lengthened and the horizon
+    # state appeared in `con_h` where no other row uses it.
+    tau_dot_a = ca.jtimes(tau_a, acados_model.x, acados_model.f_expl_expr) / (
+        nominal * theta
+    )
+    command = dq_a + tau_dot_a / command_k
+    model.command_function = ca.Function(
+        "command", [acados_model.x, acados_model.p], [command]
+    )
+
     # ----------------------------------------------------------------- the cost
 
     # `tau_a` minus its value at rest on the same configuration. 91% of the raw
@@ -456,14 +500,14 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # -- `q_a` is on the certified curve for every `sigma` in [0, 1], and `fit`
     # already refuses a curve that leaves joint range.
     pump_max = float(hydraulics["pump_flow_max"])
-    scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max, dddq_a_max])
+    scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max, command_ref])
     scale_e = np.concatenate([q_sway_max, dq_sway_max])
     acados_model.con_h_expr_0 = ca.vertcat(
         sway / q_sway_max,
         flow / pump_max,
         dq_a / dq_max,
         ddq_a / ddq_a_max,
-        dddq_a / dddq_a_max,
+        command / command_ref,
     )
     acados_model.con_h_expr = acados_model.con_h_expr_0
     acados_model.con_h_expr_e = ca.vertcat(sway, dq_u) / scale_e
@@ -541,7 +585,10 @@ class Trajectory:
     q_a: np.ndarray  # (N+1, 5)
     dq_a: np.ndarray
     ddq_a: np.ndarray  # what the acceleration rows bound
-    dddq_a: np.ndarray  # what the jerk rows bound, and what the C3 inversion pays for
+    dddq_a: np.ndarray  # what the C3 inversion pays for, third term
+    #: `u_d = dq_a + tau_dot_a / k` per axis, what `AddC3Feedforward` will
+    #: command. This is the row `H_COMMAND` bounds.
+    command: np.ndarray
     #: The path state itself, and the coefficients it indexes. `q_a` is a
     #: function of these and not an independent answer, so a consumer that has to
     #: resample must resample `sigma` and evaluate the curve -- interpolating
@@ -607,6 +654,7 @@ class TrajectoryOcp:
             model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
         )
         self._flow = ca.Function("flow", [model.x, model.u, model.p], [flow])
+        self._command = model.command_function
         self.N = ocp.solver_options.N_horizon
         self.nominal = float(config.ocp_horizon)
         # **Generated by `scripts/export_timing_ocp.py`, not here.** Loads a built
@@ -677,7 +725,13 @@ class TrajectoryOcp:
         # swing frequency and it refuses instead of slowing down. The jerk ceiling
         # is a valve budget, not a comfort choice, and scaling it at all is
         # unnecessary; it is scaled only to stay one rule with the other two.
-        rate_hi = accel_hi = jerk_hi = cfg.kappa * speed_scale
+        rate_hi = accel_hi = cfg.kappa * speed_scale
+        # The command row is not scaled by `speed_scale`: `slow_down` is a request
+        # to move more gently, not a claim that the valve's domain shrank. `kappa`
+        # still applies -- it is the deployment reservation on every limit.
+        reference = np.maximum(np.abs(cfg.command_u_min), cfg.command_u_max)
+        command_lo = cfg.kappa * cfg.command_u_min / reference
+        command_hi = cfg.kappa * cfg.command_u_max / reference
         flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
         theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
 
@@ -708,7 +762,7 @@ class TrajectoryOcp:
                 [0.0],
                 np.full(planned, -rate_hi),
                 np.full(planned, -accel_hi),
-                np.full(planned, -jerk_hi),
+                command_lo,
             ]
         )
         uh = np.concatenate(
@@ -717,7 +771,7 @@ class TrajectoryOcp:
                 [flow_hi],
                 np.full(planned, rate_hi),
                 np.full(planned, accel_hi),
-                np.full(planned, jerk_hi),
+                command_hi,
             ]
         )
         settled = np.concatenate(
@@ -733,7 +787,26 @@ class TrajectoryOcp:
         soft = H_RATE
 
         # Uniform progress with the pendulum hanging: no rollout and nothing that
-        # knows the answer, which is all this problem has needed.
+        # knows the answer.
+        #
+        # `1 / nominal` is a guess about `ocp_horizon`, not about the request, and
+        # when the answer is far from nominal the first QP fails outright --
+        # `across` needs 16 s against a nominal of 7 and dies at SQP iteration 1
+        # with a stationarity residual of 1e3, as does `pair_tuck`. Seeding from a
+        # rate- and acceleration-limited duration estimate does not fix it: both
+        # estimates come out under 7 s on every bench move including `across`,
+        # because what sets that 16 s is the sway rows and not a kinematic ceiling.
+        # A guess that helps has to know the pendulum, and that is not this change.
+        #
+        # What *is* known is `speed_scale`: a request to move at half speed is a
+        # request for an answer about twice as long, so the guess carries it. Left
+        # alone the `stow` move at `speed_scale` 0.5 answers at 11.5 s against a
+        # guess of 7 and fails the same way.
+        duration_guess = float(
+            np.clip(
+                self.nominal / speed_scale, cfg.ocp_duration_min, cfg.ocp_duration_max
+            )
+        )
         solver.reset()
         for node in range(N + 1):
             sigma = node / N
@@ -744,10 +817,10 @@ class TrajectoryOcp:
                 "x",
                 np.concatenate(
                     [
-                        [sigma, 1.0 / self.nominal, 0.0, 0.0],
+                        [sigma, 1.0 / duration_guess, 0.0, 0.0],
                         passive_equilibrium(guess),
                         np.zeros(cs.K_PASSIVE_DOF),
-                        [1.0],
+                        [duration_guess / self.nominal],
                     ]
                 ),
             )
@@ -829,6 +902,12 @@ class TrajectoryOcp:
                 for node in range(N + 1)
             ]
         )
+        command = np.array(
+            [
+                np.asarray(self._command(state[node], parameters)).ravel()
+                for node in range(N + 1)
+            ]
+        )
         if guard > 0.99:
             raise PlanningError(
                 f"the snap guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
@@ -854,6 +933,7 @@ class TrajectoryOcp:
             dq_a=dq_a,
             ddq_a=ddq_a,
             dddq_a=dddq_a,
+            command=command,
             sigma=sigma,
             speed=speed,
             acceleration=accel,
