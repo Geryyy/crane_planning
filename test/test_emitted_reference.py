@@ -56,8 +56,8 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
         iterations=3,
         solve_time_s=0.1,
         # `_resample`'s drift refusal carries the solve's own numbers on
-        # `~/solver_stats`; the stand-in only has to have them.
-        stats={},
+        # `~/solver_stats`; the stand-in only has to answer for them.
+        report=dict,
         slack=0.0,
         terminal_sway=0.0,
         terminal_sway_rate=0.0,

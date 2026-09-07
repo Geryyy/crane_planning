@@ -49,7 +49,7 @@ from .a2b import (
     translate_request,
     translate_start,
 )
-from .ocp import SolverNotExported
+from .ocp import SLACK_SPENT, SolverNotExported
 from .planner import (
     PASSIVE_INDICES,
     PLANNED_INDICES,
@@ -607,7 +607,17 @@ class CranePlanner(Node):
         self.reference.publish(trajectory)
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
-        self._report(DiagnosticStatus.OK, plan.message, plan.timing.stats)
+        # `WARN` and not `OK` where the solve bought the answer with slack: a
+        # priced violation of the sway box, the settled box or the pump's
+        # planning share is a plan the machine still executes, and the residuals
+        # say nothing about it. The threshold is `plan.message`'s own, so the
+        # log line and the topic cannot disagree about whether slack was spent.
+        level = (
+            DiagnosticStatus.WARN
+            if plan.timing.slack > SLACK_SPENT
+            else DiagnosticStatus.OK
+        )
+        self._report(level, plan.message, plan.timing.report())
         return plan, trajectory, path
 
     def _report(self, level: bytes, message: str, stats: dict) -> None:

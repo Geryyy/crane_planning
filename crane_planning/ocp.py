@@ -274,6 +274,30 @@ class SolverNotExported(RuntimeError):
 #: The four KKT residuals acados stops on, in the order it returns them.
 RESIDUALS = ("stationarity", "equality", "inequality", "complementarity")
 
+#: Above this the solve paid the L1 price rather than met the soft bound. One
+#: constant, because the log line and `~/solver_stats` disagreeing about whether
+#: slack was spent is the kind of contradiction nobody reconciles at 2 a.m.
+#:
+#: **1e-6 and not the 1e-9 the log clause used to carry.** Two converged bench
+#: solves off `test_jerk_bound`'s description report 1.3e-9 and 1.6e-8 of slack
+#: with every soft bound met -- that is the QP's own floor, three to five orders
+#: under `ocp_tolerance`, and 1e-9 sits below it, so the clause printed "on
+#: 0.000 of slack" on every plan. A severity that fires on every plan is not
+#: one. Two solves is a floor observation, not a fitted number; raise it if a
+#: real violation ever lands under it.
+SLACK_SPENT = 1e-6
+
+#: What the answer costs, as against how hard it was to find. Present on every
+#: report and `nan` wherever no `Trajectory` was built, so a consumer reads one
+#: set of keys and never has to branch on the outcome to know what arrived.
+PLAN_ROWS = (
+    "slack",
+    "pump_flow_peak",
+    "terminal_sway",
+    "terminal_sway_rate",
+    "duration_s",
+)
+
 
 def solver_stats(solver, status: int, elapsed: float) -> dict:
     """
@@ -307,6 +331,7 @@ def solver_stats(solver, status: int, elapsed: float) -> dict:
             for name, value in zip(RESIDUALS, solver.get_stats("residuals"))
         }
     )
+    stats.update({name: float("nan") for name in PLAN_ROWS})
     return stats
 
 
@@ -715,6 +740,25 @@ class Trajectory:
     #: rather than derived, because the refusals raised *after* this object is
     #: built report the identical shape and must not rebuild it differently.
     stats: dict
+
+    def report(self) -> dict:
+        """
+        `stats` with `PLAN_ROWS` filled in: the whole report for a built plan.
+
+        The solver half says how hard the answer was to find, this half says
+        what it costs. They are separable and the second is the one that matters
+        once a solve converges: a plan bought with `slack` violated a soft bound
+        -- the sway box, the settled box or the planning share of the pump --
+        and still drives the machine, which a clean residual vector says nothing
+        about. `pump_flow_peak` is already a fraction of the physical pump.
+        """
+        return self.stats | {
+            "slack": float(self.slack),
+            "pump_flow_peak": float(np.max(self.pump_flow)),
+            "terminal_sway": self.terminal_sway,
+            "terminal_sway_rate": self.terminal_sway_rate,
+            "duration_s": self.duration,
+        }
 
     @property
     def duration(self) -> float:

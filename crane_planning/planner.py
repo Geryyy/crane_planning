@@ -68,7 +68,7 @@ from .geometry import (
     wrap,
     yaw_of,
 )
-from .ocp import Trajectory, TrajectoryOcp, evaluate, power_coefficients
+from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coefficients
 
 # ------------------------------------------------------------------ the planner
 
@@ -346,7 +346,7 @@ class Planner:
                 f"{self.config.terminal_q_sway_max.tolist()}, rate "
                 f"{terminal_rate.tolist()} rad/s against "
                 f"{self.config.terminal_dq_sway_max.tolist()}",
-                stats=timing.stats,
+                stats=timing.report(),
             )
         return self._resample(geometry, path, timing, start, lifted, candidate_name)
 
@@ -565,7 +565,7 @@ class Planner:
                 f"the plan ends at {drift:.3e} rad/s, above the "
                 f"{TERMINAL_DRIFT_MAX:.0e} terminal floor: the solve did not "
                 "arrive stopped",
-                stats=timing.stats,
+                stats=timing.report(),
             )
         dq[-1] = 0.0
         ddq[-1] = 0.0
@@ -641,7 +641,11 @@ class Planner:
             f"{timing.iterations} SQP iterations in {timing.solve_time_s:.2f} s; "
             f"peak pump draw {np.max(timing.pump_flow):.2f} of the physical limit "
             f"at kappa = {self.config.kappa}"
-            + (f", on {timing.slack:.3f} of slack" if timing.slack > 1e-9 else "")
+            + (
+                f", on {timing.slack:.3g} of slack"
+                if timing.slack > SLACK_SPENT
+                else ""
+            )
             + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest "
             + f"at {timing.terminal_sway_rate:.3f} rad/s"
             + (

@@ -18,7 +18,7 @@ import numpy as np
 from builtin_interfaces.msg import Time
 from crane_planning.config import PlanningError
 from crane_planning.node import CranePlanner
-from crane_planning.ocp import RESIDUALS, solver_stats
+from crane_planning.ocp import PLAN_ROWS, RESIDUALS, solver_stats
 from diagnostic_msgs.msg import DiagnosticStatus
 
 
@@ -76,6 +76,31 @@ def test_a_non_convergence_reports_its_residuals():
     assert values["qp_iterations"] == "33"
     assert values["qp_status_worst"] == "3"
     assert {f"residual_{name}" for name in RESIDUALS} <= set(values)
+
+
+def test_the_plan_rows_are_there_either_way():
+    """A consumer reads one set of keys; `nan` is how "no plan was built" reads.
+
+    The alternative -- omitting them where there is no trajectory -- makes the
+    key set depend on the outcome, so every reader has to branch before it can
+    plot, and a missing key and a zero become the same thing on a plot.
+    """
+    solver = _Solver(
+        sqp_iter=9,
+        qp_iter=np.array([0.0, 16.0]),
+        qp_stat=np.zeros(2),
+        time_tot=1.0,
+        time_qp=0.2,
+        residuals=np.zeros(4),
+    )
+    stats = solver_stats(solver, 0, 1.0)
+    assert set(PLAN_ROWS) <= set(stats)
+    assert all(np.isnan(stats[name]) for name in PLAN_ROWS)
+    values = {
+        entry.key: entry.value
+        for entry in report(DiagnosticStatus.ERROR, "no plan", stats).values
+    }
+    assert values["slack"] == "nan"
 
 
 def test_a_refusal_from_before_the_solve_still_reports():
