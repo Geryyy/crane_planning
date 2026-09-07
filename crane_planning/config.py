@@ -244,6 +244,14 @@ class PlannerConfig:
     #: apart (controller_design.md 4.3). One number for every axis: the dead time
     #: was pinned common by the fit.
     command_dead_time_s: float = 0.06
+    #: s, per axis. Block 2 of C3, the command PT1. **Zero is the shipped law**:
+    #: the emitted feedforward then inverts blocks 3 and the rigid body (RNEA,
+    #: hydraulic_actuator_model.md 5.3) and block 1 by preview, and block 2 not
+    #: at all. Non-zero adds `tau_v du/dt` on top -- the block 2 inversion
+    #: controller_design.md 2.4 names, which is why the path is C4. Set it to the
+    #: fitted split (sw .100, ha .025, ka 0, sa .075, ro .125) to run that arm;
+    #: the Gazebo URDF carries the same numbers as `tau_v`.
+    command_lag_s: np.ndarray = field(default_factory=lambda: np.zeros(5))
     visualization_samples: int = 25
 
     # The pump, which the description does not carry.

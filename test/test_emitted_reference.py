@@ -61,13 +61,16 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
     )
 
 
-def resample(gap: float, duration: float = 4.0):
+def resample(gap: float, duration: float = 4.0, lag=None):
     """`_resample` alone: it reads `self.config` and the geometry's FK, nothing else."""
     pose = SimpleNamespace(position_m=np.zeros(3))
     geometry = SimpleNamespace(
         model=SimpleNamespace(forward_kinematics=lambda *_: pose)
     )
-    planner = SimpleNamespace(config=PlannerConfig())
+    config = PlannerConfig()
+    if lag is not None:
+        config.command_lag_s = np.asarray(lag, dtype=float)
+    planner = SimpleNamespace(config=config)
     return Planner._resample(
         planner,
         geometry,
@@ -126,6 +129,26 @@ def test_the_effort_field_carries_the_previewed_command():
     # against the joint names, so they carry a zero rather than nothing.
     passive_and_tool = [i for i in range(plan.effort.shape[1]) if i not in planned]
     assert np.all(plan.effort[:, passive_and_tool] == 0.0)
+
+
+def test_the_pt1_arm_adds_tau_v_du_dt_and_leaves_a_zero_lag_axis_alone():
+    """
+    controller_design.md 2.4's block 2 inversion, `bench_track.py`'s third arm.
+
+    `timing`'s command is a ramp per axis, so `du/dt` is that axis's slope and
+    the whole term is a constant offset -- exact, not approximately.
+    """
+    lag = np.array([0.100, 0.025, 0.000, 0.075, 0.125])
+    slope = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
+
+    planned = list(PLANNED_INDICES)
+    without = resample(1.0e-6, 4.03).effort[:, planned]
+    with_lag = resample(1.0e-6, 4.03, lag=lag).effort[:, planned]
+
+    assert with_lag == pytest.approx(without + lag * slope)
+    # `ka`'s fitted lag is zero, so the two arms are bit-identical on the arm
+    # axis. That is the control `bench_track.py` reads off `ax_arm`.
+    assert np.all(with_lag[:, 2] == without[:, 2])
 
 
 def test_the_reference_carries_accelerations():

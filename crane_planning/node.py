@@ -111,6 +111,71 @@ def volatile(depth: int = 1) -> QoSProfile:
     )
 
 
+#: Every `PlannerConfig` field `config/crane_planner.yaml` may set, by type.
+#: `command_k`, `command_u_min` and `command_u_max` were missing from the array
+#: list until 2026-09-07: the yaml carried them, nothing declared them, so the
+#: dataclass defaults ran and editing the yaml changed nothing and said nothing.
+#: They matched, so no number moved.
+FLOAT_PARAMETERS = (
+    "kappa",
+    "eps_pos",
+    "eps_yaw",
+    "margin_safety",
+    "margin_interp",
+    "tool_radius",
+    "corridor_clearance",
+    "corridor_height_step",
+    "corridor_lateral_step",
+    "ocp_horizon",
+    "ocp_duration_min",
+    "ocp_duration_max",
+    "ocp_tolerance",
+    "ocp_slack_price",
+    "levenberg_marquardt",
+    "command_dead_time_s",
+    "pump_flow_max",
+    "pump_flow_planning_factor",
+    "Ts",
+    "truck_bed_thickness",
+    "truck_headboard_thickness",
+    "truck_headboard_height",
+)
+INT_PARAMETERS = (
+    "ik_restarts",
+    "max_lift_samples",
+    "corridor_height_samples",
+    "corridor_lateral_samples",
+    "path_segments",
+    "ocp_intervals",
+    "ocp_max_iterations",
+    "visualization_samples",
+)
+ARRAY_PARAMETERS = (
+    "q_sway_max",
+    "terminal_q_sway_max",
+    "terminal_dq_sway_max",
+    "dq_sway_max",
+    "ddq_a_max",
+    "dddq_a_max",
+    "command_k",
+    "command_u_min",
+    "command_u_max",
+    "command_lag_s",
+    "truck_runge_dimensions",
+    "truck_runge_stations",
+)
+
+#: Names declared outside the three loops, so the yaml check sees them too.
+OTHER_PARAMETERS = (
+    "ocp_integrator",
+    "max_input_age",
+    "max_scene_age",
+    "pendulum_state_deadline",
+    "payload_estimate_deadline",
+    "c3_feedforward",
+)
+
+
 class CranePlanner(Node):
     def __init__(self) -> None:
         super().__init__("crane_planner")
@@ -166,58 +231,22 @@ class CranePlanner(Node):
         deliberately absent, read from the description instead: a limit written
         beside a node drifts away from the description every controller in the
         same deployment was configured against.
+
+        The name lists are module constants and not literals here because an
+        override for a name nobody declared is dropped in silence: the yaml then
+        reads as authoritative and is not. `test_every_yaml_key_is_declared`
+        compares the two, which is the only thing that notices.
         """
         defaults = PlannerConfig()
-        for name in (
-            "kappa",
-            "eps_pos",
-            "eps_yaw",
-            "margin_safety",
-            "margin_interp",
-            "tool_radius",
-            "corridor_clearance",
-            "corridor_height_step",
-            "corridor_lateral_step",
-            "ocp_horizon",
-            "ocp_duration_min",
-            "ocp_duration_max",
-            "ocp_tolerance",
-            "ocp_slack_price",
-            "levenberg_marquardt",
-            "command_dead_time_s",
-            "pump_flow_max",
-            "pump_flow_planning_factor",
-            "Ts",
-            "truck_bed_thickness",
-            "truck_headboard_thickness",
-            "truck_headboard_height",
-        ):
+        for name in FLOAT_PARAMETERS:
             self.declare_parameter(name, float(getattr(defaults, name)))
-        for name in (
-            "ik_restarts",
-            "max_lift_samples",
-            "corridor_height_samples",
-            "corridor_lateral_samples",
-            "path_segments",
-            "ocp_intervals",
-            "ocp_max_iterations",
-            "visualization_samples",
-        ):
+        for name in INT_PARAMETERS:
             self.declare_parameter(name, int(getattr(defaults, name)))
-        self.declare_parameter("ocp_integrator", str(defaults.ocp_integrator))
-        for name in (
-            "q_sway_max",
-            "terminal_q_sway_max",
-            "terminal_dq_sway_max",
-            "dq_sway_max",
-            "ddq_a_max",
-            "dddq_a_max",
-            "truck_runge_dimensions",
-            "truck_runge_stations",
-        ):
+        for name in ARRAY_PARAMETERS:
             self.declare_parameter(
                 name, [float(value) for value in getattr(defaults, name)]
             )
+        self.declare_parameter("ocp_integrator", str(defaults.ocp_integrator))
         # The OCP's cost weights, nested under `weights` as the yaml writes them.
         # Every residual row is dimensionless, so these are preferences and a
         # scalar sets a whole block; `weights.time` prices the horizon row and is
@@ -522,6 +551,14 @@ class CranePlanner(Node):
         self, start, position_m, yaw, payload, shape, avoid_collisions, speed_scale
     ):
         """Plan, then publish the reference and the drawing."""
+        # Re-read live, like `c3_feedforward` below. Safe to change between
+        # requests where the rest of the config is not: the lag enters only the
+        # post-solve reconstruction of the effort field, never the exported
+        # solver, the geometry or a cached anything. It is what lets an ablation
+        # switch feedforward laws without a relaunch.
+        self.planner.config.command_lag_s = np.asarray(
+            self.get_parameter("command_lag_s").value, dtype=float
+        )
         primitives = self._primitives(avoid_collisions)
         # The goal and the geometry are drawn **before** the solve, so that a
         # refusal leaves them on screen. "It said no" and "it said no, and here

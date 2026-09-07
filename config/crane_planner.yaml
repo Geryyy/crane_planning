@@ -165,6 +165,21 @@ crane_planner:
     # the fit pinned the dead time common. Was `c3_feedforward.dead_time_s` in
     # bt_server_override.yaml, when a BT node rebuilt the inversion downstream.
     command_dead_time_s: 0.06
+    # s per axis, block 2 of C3 -- the fitted command PT1. **Zero is the shipped
+    # law.** The emitted feedforward then carries hydraulic_actuator_model.md
+    # 5.3 as written: blocks 3 and the rigid body by RNEA, block 1 by the preview
+    # above, block 2 not at all. controller_design.md 2.4 is where the third
+    # inversion is named, and it costs a C4 reference -- which the path already
+    # is, so the term is affordable; whether it is worth it is what an ablation
+    # measures.
+    #
+    # The arm that turns it on: [0.100, 0.025, 0.000, 0.075, 0.125] -- the fitted
+    # split of hydraulic_actuator_model.md 2 (sw, ha, ka, sa, ro), the same
+    # numbers the Gazebo URDF carries as `tau_v`. Only the lag/dead-time *sum* is
+    # identified, so these are a choice, not a measurement.
+    #
+    # Live: read per request, so an ablation flips arms without a relaunch.
+    command_lag_s: [0.0, 0.0, 0.0, 0.0, 0.0]
     # Visualization is not the control reference: bound the authoritative FK calls
     # while the full JointTrajectory stays at 25 Hz.
     visualization_samples: 25

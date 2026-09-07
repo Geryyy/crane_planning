@@ -544,6 +544,37 @@ class Planner:
                 for i in range(timing.command.shape[1])
             ]
         ).T
+        # Block 2, the command PT1, when an arm asks for it. `u_f` chases `u`
+        # through `tau_v`, so commanding `u + tau_v du/dt` is what lands `u_f` on
+        # the inversion; `command_lag_s` at zero leaves `commanded` untouched and
+        # this is the shipped law. Differentiated on the OCP grid and then
+        # interpolated, not the other way round: `np.interp` is piecewise linear
+        # and differentiating its output gives a staircase. The extra derivative
+        # is `q_a''''`, which is why the path is C4 -- and with `path_segments`
+        # breakpoints the snap is piecewise constant, so `rate` steps at each.
+        #
+        # Clipped to the identified domain, because the feedforward branch is
+        # bounded at its source (jtc_pid yaml, "TWO KNOWN DEVIATIONS") and this
+        # term is the one most likely to ask for command the machine does not
+        # have. How often it did is reported rather than swallowed.
+        lag = np.asarray(self.config.command_lag_s, dtype=float)
+        lag_saturation = 0.0
+        if np.any(lag != 0.0):
+            rate = np.array(
+                [
+                    np.interp(
+                        preview,
+                        timing.time,
+                        np.gradient(timing.command[:, i], timing.time),
+                    )
+                    for i in range(timing.command.shape[1])
+                ]
+            ).T
+            raw = commanded + lag * rate
+            commanded = np.clip(
+                raw, self.config.command_u_min, self.config.command_u_max
+            )
+            lag_saturation = float(np.mean(raw != commanded))
         effort[:, list(PLANNED_INDICES)] = commanded - dq[:, list(PLANNED_INDICES)]
 
         # The tool where the plan says it is, sway included -- not where it would
@@ -568,6 +599,11 @@ class Planner:
             + (f", on {timing.slack:.3f} of slack" if timing.slack > 1e-9 else "")
             + f"; the tool arrives {np.degrees(timing.terminal_sway):.2f} deg off rest "
             + f"at {timing.terminal_sway_rate:.3f} rad/s"
+            + (
+                f"; PT1 inversion on, clipped on {lag_saturation:.1%} of samples"
+                if np.any(lag != 0.0)
+                else ""
+            )
         )
         return Plan(
             time=stamps,
