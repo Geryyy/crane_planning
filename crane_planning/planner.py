@@ -482,6 +482,19 @@ class Planner:
         q[:, list(PASSIVE_INDICES)] = sample(timing.q_u)
         dq[:, list(PASSIVE_INDICES)] = sample(timing.dq_u)
         q[:, TOOL_INDEX] = start.q_tool
+        # The last stamp is the terminal node, where the OCP pins `v = a = j = 0`
+        # and `dq_u = 0`: the plan ends stopped. `actuated_samples` reconstructs
+        # that sample from the interval before it, so what it reports there is
+        # the multiple-shooting gap -- 1e-6 rad/s at `ocp_tolerance`. JTC rejects
+        # a goal whose last point moves at all (`float` epsilon, 1.19e-7), so
+        # write the row the solve pinned and refuse a solve that did not stop.
+        drift = float(np.max(np.abs(dq[-1])))
+        if drift > REST_VELOCITY:
+            raise PlanningError(
+                f"the plan ends at {drift:.3e} rad/s, above the {REST_VELOCITY:.0e} "
+                "rest floor: the solve did not arrive stopped"
+            )
+        dq[-1] = 0.0
 
         # The tool where the plan says it is, sway included -- not where it would
         # hang if the machine stopped at each sample. This is visualization, not
