@@ -79,6 +79,12 @@ from .ocp import Trajectory, TrajectoryOcp, evaluate, power_coefficients
 #: control_recordings/ bag before trusting it on hardware.
 REST_VELOCITY = 1e-3
 
+#: rad/s. What the last emitted sample may drift from the rest the OCP pinned
+#: before the plan is refused. Deliberately not `REST_VELOCITY`: that one is a
+#: claim about the encoder and is meant to be raised to a measured noise floor,
+#: which must not quietly loosen what "the solve stopped" means.
+TERMINAL_DRIFT_MAX = 1e-3
+
 
 @dataclass
 class Start:
@@ -455,13 +461,17 @@ class Planner:
         curve -- configurations the plan never contained, off the curve the
         certificate was run on. So `sigma` is reconstructed and the curve is
         evaluated at it. The reconstruction is exact rather than interpolated:
-        acados holds the input constant across an interval, and `sigma'' = a`
-        there, so `sigma` is quadratic and `v` linear on each interval.
+        acados holds the input constant across an interval, and `sigma'''' = s`
+        there, so `sigma` is quartic and `v` cubic on each interval.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
-        if stamps[-1] < timing.duration:
-            stamps = np.append(stamps, timing.duration)
+        # Rounding to nearest puts the last stamp up to `Ts / 2` *past* the solve's
+        # own end, and `actuated_samples` then evaluates the terminal interval
+        # outside it: a sample off the end of the certified curve, moving at
+        # `snap * overshoot^3 / 6` where the plan says it is stopped. 10 ms of it
+        # is what the JTC rejected. The reference ends when the plan does.
+        stamps[-1] = timing.duration
 
         def sample(rows):
             return np.array(
@@ -489,12 +499,16 @@ class Planner:
         # a goal whose last point moves at all (`float` epsilon, 1.19e-7), so
         # write the row the solve pinned and refuse a solve that did not stop.
         drift = float(np.max(np.abs(dq[-1])))
-        if drift > REST_VELOCITY:
+        if drift > TERMINAL_DRIFT_MAX:
             raise PlanningError(
-                f"the plan ends at {drift:.3e} rad/s, above the {REST_VELOCITY:.0e} "
-                "rest floor: the solve did not arrive stopped"
+                f"the plan ends at {drift:.3e} rad/s, above the "
+                f"{TERMINAL_DRIFT_MAX:.0e} terminal floor: the solve did not "
+                "arrive stopped"
             )
         dq[-1] = 0.0
+        # `c(1)` *is* the lifted goal, `geometry.fit` writes it there. What the
+        # reconstruction lands on is `c(1 - gap)`, so take the certified end.
+        q[-1, list(PLANNED_INDICES)] = evaluate(timing.coefficients, 1.0)[0]
 
         # The tool where the plan says it is, sway included -- not where it would
         # hang if the machine stopped at each sample. This is visualization, not

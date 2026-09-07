@@ -14,16 +14,21 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from crane_planning.config import PLANNED_DOF, PlannerConfig, PlanningError
-from crane_planning.ocp import ORDER
-from crane_planning.planner import REST_VELOCITY, Planner
+from crane_planning.config import (
+    PLANNED_DOF,
+    PLANNED_INDICES,
+    PlannerConfig,
+    PlanningError,
+)
+from crane_planning.ocp import ORDER, evaluate
+from crane_planning.planner import TERMINAL_DRIFT_MAX, Planner
 
 COEFFICIENTS = np.zeros((1, ORDER, PLANNED_DOF))
 COEFFICIENTS[0, 0] = [0.0, 0.10, -0.20, 0.30, 0.05]
 COEFFICIENTS[0, 1] = [1.20, -0.60, 0.90, 0.40, -0.30]
 
 
-def timing(gap: float, nodes: int = 8, duration: float = 4.0) -> SimpleNamespace:
+def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
     """A solve that stops at `T`, whose last interval misses it by `gap` rad/s."""
     time = np.linspace(0.0, duration, nodes + 1)
     # sigma(t) = 3 (t/T)^2 - 2 (t/T)^3: starts and ends at rest, ends at 1.
@@ -50,7 +55,7 @@ def timing(gap: float, nodes: int = 8, duration: float = 4.0) -> SimpleNamespace
     )
 
 
-def resample(gap: float):
+def resample(gap: float, duration: float = 4.0):
     """`_resample` alone: it reads `self.config` and the geometry's FK, nothing else."""
     pose = SimpleNamespace(position_m=np.zeros(3))
     geometry = SimpleNamespace(
@@ -61,18 +66,27 @@ def resample(gap: float):
         planner,
         geometry,
         None,
-        timing(gap),
+        timing(gap, duration),
         SimpleNamespace(q_tool=0.3),
         1,
         "test",
     )
 
 
-def test_the_last_point_does_not_move():
-    plan = resample(1.0e-6)  # the gap that failed in sim
+# `duration` is a solver output, so it lands anywhere against the 40 ms grid:
+# just short of a multiple (the stub), just past one (what rounding to nearest
+# extrapolated past the end of the plan), and exactly on one (measure-zero).
+@pytest.mark.parametrize("duration", [4.0, 4.001, 4.03])
+def test_the_reference_ends_where_the_plan_does(duration):
+    plan = resample(1.0e-6, duration)  # the gap that failed in sim
+
+    assert plan.time[-1] == pytest.approx(duration)
     assert np.all(plan.dq[-1] == 0.0)
+    assert plan.q[-1, list(PLANNED_INDICES)] == pytest.approx(
+        evaluate(COEFFICIENTS, 1.0)[0]
+    )
 
 
 def test_a_solve_that_did_not_stop_is_refused():
     with pytest.raises(PlanningError, match="did not arrive stopped"):
-        resample(10.0 * REST_VELOCITY)
+        resample(10.0 * TERMINAL_DRIFT_MAX, 4.0)
