@@ -155,32 +155,36 @@ def translate_payload(request):
             f"`carries_log` is true but `m_log` is {request.m_log} kg; an unknown payload is "
             "not a massless one, so send `carries_log` false instead"
         )
-    if not _finite_point(request.p_cyl_8):
-        raise PlanningError(
-            "`p_cyl_8` is not three finite numbers, and it is the centre this planner "
-            "carries; the collision body has to have somewhere to be"
-        )
-
-    # The two centres. Every caller fills all three components of `p_cyl_8`; the
-    # behaviour tree leaves `s_log_8.z` at NaN on purpose, which is that caller
-    # saying "not specified" rather than "at infinity". One centre carries both,
-    # so the unspecified components come from `p_cyl_8` and the specified ones
-    # have to agree with it -- a homogeneous log's mass centre *is* its
-    # geometric centre, and a request where the two disagree describes two
-    # bodies again.
-    centre = np.array([request.p_cyl_8.x, request.p_cyl_8.y, request.p_cyl_8.z])
+    # The two centres. `p_cyl_8` is an **x-only** field: every caller writes
+    # `p_cyl_8.x` and leaves y and z at the .srv zero default, because the legacy
+    # server read nothing else -- `a2b_server_base.cpp` takes `p_cyl_8.x` and the
+    # generated collision body carries the scalar `p_cyl_8_x`. `s_log_8` is the
+    # measured point: CBS fills its y from the offset the block ended up gripped
+    # at. So the centre is `s_log_8` where specified and `p_cyl_8` where NaN, and
+    # only x is cross-checked -- the one component both sides really write, where
+    # a disagreement does describe two bodies. Reading an unwritten y as a claim
+    # refuses every off-centre grasp.
     mass_centre = np.array([request.s_log_8.x, request.s_log_8.y, request.s_log_8.z])
-    for axis in range(3):
-        if (
-            np.isfinite(mass_centre[axis])
-            and abs(mass_centre[axis] - centre[axis]) > 1.0e-9
-        ):
-            raise PlanningError(
-                f"`s_log_8` and `p_cyl_8` are two different points on axis {axis} "
-                f"({mass_centre[axis]} m against {centre[axis]} m), and this planner carries "
-                "one centre for the mass and for the collision body alike. A homogeneous "
-                "log's centre of mass is its geometric centre; send one point"
-            )
+    collision_centre = np.array(
+        [request.p_cyl_8.x, request.p_cyl_8.y, request.p_cyl_8.z]
+    )
+    if np.isfinite(mass_centre[0]) and (
+        not np.isfinite(collision_centre[0])
+        or abs(mass_centre[0] - collision_centre[0]) > 1.0e-9
+    ):
+        raise PlanningError(
+            f"`s_log_8.x` and `p_cyl_8.x` are two different points along the body "
+            f"({mass_centre[0]} m against {collision_centre[0]} m), and this planner "
+            "carries one centre for the mass and for the collision body alike. A "
+            "homogeneous log's centre of mass is its geometric centre; send one point"
+        )
+    centre = np.where(np.isfinite(mass_centre), mass_centre, collision_centre)
+    if not np.all(np.isfinite(centre)):
+        raise PlanningError(
+            "neither `s_log_8` nor `p_cyl_8` gives a finite centre on every axis, and "
+            "it is the centre this planner carries; the collision body has to have "
+            "somewhere to be"
+        )
 
     payload = Payload(
         mass_kg=float(request.m_log),
