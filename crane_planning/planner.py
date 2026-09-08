@@ -75,10 +75,15 @@ from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coeffic
 
 
 #: rad/s (m/s on the telescope). Below this a measured start velocity is rest.
-#: An assumption about the encoder noise floor, not a measurement -- Gazebo
-#: reports 1e-6-scale rates at standstill; read the real one off a
-#: control_recordings/ bag before trusting it on hardware.
-REST_VELOCITY = 1e-3
+#: **Measured, on the standing machine** (2026-09-08, live `/joint_states`, 993
+#: samples over 10 s): per-axis rms 0.002-0.005, max 0.0098 on the actuated five
+#: and 0.0126 on the passive pair. The old 1e-3 was a Gazebo-scale guess, 3-10x
+#: *under* that floor, so the deadband never fired on hardware: the noise was
+#: taken for motion, `start_speed` pinned `v(0)` on it against a path clamped to
+#: leave at rest, and every plan died in the first QP -- acados status 4, one
+#: iteration, stationarity 1e3. 2e-2 is twice the measured max; it is 2-4% of
+#: `dq_max`, so a real creep this slow is rest as far as the reference goes.
+REST_VELOCITY = 2e-2
 
 #: m, rad. How far outside its own limit a measured coordinate may be and still
 #: be planned from. A joint parked on its stop reads a hair past it -- Gazebo
