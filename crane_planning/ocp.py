@@ -182,6 +182,16 @@ INTEGRATORS = {"ERK": 4, "IRK": 2}
 #: on. This is a correctness fix, not a retiming, and it is free.
 SIM_SUBSTEPS = 3
 
+#: How far under the path's own interior speed its start tangent may be fitted.
+#: The fit leaves along the measured start velocity, so a velocity at the encoder
+#: noise floor pins `c'(0)` at noise magnitude: `start_speed` divides by it, and
+#: the tangent then has to grow two orders inside one knot span. The first QP
+#: dies on that step -- acados status 4 at iteration 1, stationarity sitting at
+#: the slack price, on every goal. Measured live: 179x and 228x on the two noise
+#: starts that failed, 0.9x and 1.2x on the same two from rest. Two observations
+#: either side, so 10 is an order clear of both rather than a fitted number.
+TANGENT_STEP_MAX = 10.0
+
 
 def equilibrium(q_a):
     """Return where the tool hangs: a two-hinge pendulum hangs straight down."""
@@ -935,6 +945,30 @@ class TrajectoryOcp:
                 f"the measured start velocity is {unrepresentable:.3e} rad/s off "
                 "the path tangent, and a motion confined to the path cannot leave "
                 "in any other direction"
+            )
+        # Noise fitted as the direction of travel, caught here rather than left
+        # to acados: `TANGENT_STEP_MAX`. Only when the start moves at all -- at
+        # rest the fit leaves along the move and there is nothing to check --
+        # and `unrepresentable` above has already refused a zero tangent under a
+        # nonzero velocity, so the ratio below cannot divide by zero.
+        tangent_start = float(np.linalg.norm(evaluate(coefficients, 0.0, order=1)[0]))
+        interior = float(
+            np.median(
+                [
+                    np.linalg.norm(evaluate(coefficients, sigma, order=1)[0])
+                    for sigma in np.linspace(0.0, 1.0, 21)
+                ]
+            )
+        )
+        if np.any(dq_a_start) and tangent_start * TANGENT_STEP_MAX < interior:
+            raise PlanningError(
+                f"the fitted path leaves at {interior / tangent_start:.0f}x under "
+                f"its own interior speed: the measured start velocity peaks at "
+                f"{np.max(np.abs(dq_a_start)):.2e} rad/s, which this fit took for "
+                "the direction of travel and the timing solve cannot recover from. "
+                "That rate is the encoder noise floor, not motion -- raise "
+                "`REST_VELOCITY` (planner.py) above this machine's standing noise, "
+                "or plan from a machine that has settled"
             )
 
         # `sigma` in [0, 1] and `v >= 0`: the machine may not run backwards along
