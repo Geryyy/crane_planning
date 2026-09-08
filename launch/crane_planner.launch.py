@@ -12,6 +12,7 @@ def generate_launch_description() -> LaunchDescription:
     use_sim_time = LaunchConfiguration("use_sim_time")
     parameter_file = LaunchConfiguration("parameter_file")
     joint_states_topic = LaunchConfiguration("joint_states_topic")
+    allow_missing_scene = LaunchConfiguration("allow_missing_scene")
 
     default_parameter_file = (
         PathSubstitution(FindPackageShare("crane_planning"))
@@ -36,6 +37,14 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/joint_states",
                 description="Canonical joint-state input.",
             ),
+            DeclareLaunchArgument(
+                "allow_missing_scene",
+                default_value="true",
+                description=(
+                    "Test rig only: plan against an empty world when no "
+                    "collision scene is published, instead of refusing."
+                ),
+            ),
             Node(
                 package="crane_planning",
                 executable="crane_planner_node",
@@ -44,6 +53,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     parameter_file,
                     {"use_sim_time": use_sim_time},
+                    {"allow_missing_scene": allow_missing_scene},
                 ],
                 remappings=[("/joint_states", joint_states_topic)],
             ),

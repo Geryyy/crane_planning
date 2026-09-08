@@ -265,6 +265,10 @@ class CranePlanner(Node):
             self.declare_parameter(f"weights.{name}", float(value))
         self.declare_parameter("max_input_age", 0.5)
         self.declare_parameter("max_scene_age", 10.0)
+        # Test rig only: no perception running means no scene, and a request
+        # asking for collision checks is refused. Set true to plan against an
+        # empty world instead -- self-collision still checked, geometry not.
+        self.declare_parameter("allow_missing_scene", True)
         self.declare_parameter("pendulum_state_deadline", 0.15)
         self.declare_parameter("payload_estimate_deadline", 1.0)
         # C3's inversion in the effort field. A controller that does not set
@@ -418,6 +422,13 @@ class CranePlanner(Node):
 
     def _primitives(self, avoid_collisions: bool) -> list:
         if self.scene is None:
+            if avoid_collisions and self.get_parameter("allow_missing_scene").value:
+                self.get_logger().warn(
+                    "allow_missing_scene: planning against an empty world. The "
+                    "trajectory is certified clear of nothing but the machine "
+                    "itself -- do not run this on hardware."
+                )
+                return []
             return None if avoid_collisions else []
         age = self._age(self.scene.header)
         if age > self.get_parameter("max_scene_age").value:
