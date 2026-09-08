@@ -189,9 +189,10 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
         dimensions_m=np.array([1.0, 0.1, 3.0]),
     )
     _shifted(scene, near_base, np.array([0.0, -1.0, 0.0]), target)
-    clearance, required = scene.margin(np.zeros(PLANNED_DOF))
+    clearance, required, body = scene.margin(np.zeros(PLANNED_DOF))
     assert required == pytest.approx(scene.required_rigid)
     assert clearance > required
+    assert body == "near_base"
     assert scene.is_valid(np.zeros(PLANNED_DOF))
 
     near_tool = CollisionPrimitive(
@@ -201,9 +202,12 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
         dimensions_m=np.array([3.0, 0.1, 3.0]),
     )
     _shifted(scene, near_tool, np.array([0.0, -1.0, 0.0]), target)
-    clearance, required = scene.margin(np.zeros(PLANNED_DOF))
+    # The swinging half decides here, so the name has to come from that query
+    # too -- a name read off the unsplit one would be a different measurement.
+    clearance, required, body = scene.margin(np.zeros(PLANNED_DOF))
     assert required == pytest.approx(scene.required)
     assert clearance < required
+    assert body == "near_tool"
     assert not scene.is_valid(np.zeros(PLANNED_DOF))
 
 

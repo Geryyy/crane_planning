@@ -275,10 +275,17 @@ class Planner:
             start.q_a,
             restarts=int(self.config.ik_restarts),
         )
-        clearance, required = geometry.margin(start.q_a)
+        clearance, required, body = geometry.margin(start.q_a)
         if not clearance > required:
+            # Named, because "it said no" and "it said no, and the block it is
+            # holding is 0.6 m inside the tool" are answered by different people.
+            if body is None:
+                raise PlanningError(
+                    "the measured start configuration cannot be measured against "
+                    "the scene at all: the machine is folded into itself there"
+                )
             raise PlanningError(
-                f"the measured start configuration clears the scene by only "
+                f"the measured start configuration clears '{body}' by only "
                 f"{clearance:.3f} m against the {required:.3f} m this plan requires"
             )
 

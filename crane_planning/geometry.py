@@ -348,9 +348,13 @@ class Geometry:
         """
         return self._scene_distance(self.configuration(q_a))
 
-    def margin(self, q_a: np.ndarray, scene=None) -> tuple[float, float]:
+    def margin(self, q_a: np.ndarray, scene=None) -> tuple[float, float, str | None]:
         """
-        Return `(clearance, required)` as the pair that decides `q_a`.
+        Return `(clearance, required, body)` as what decides `q_a`.
+
+        `body` is the scene id the clearance was measured against -- what a
+        refusal has to name to be worth reading -- and `None` where no query
+        could be made.
 
         The whole machine clearing by `required` at the hanging pose is
         sufficient: no sway state can then reach anything. It is not necessary.
@@ -367,25 +371,43 @@ class Geometry:
         return self._decide(q, self._distances(q, scene=scene), scene)
 
     def _decide(self, q: np.ndarray, distances: dict | None, scene) -> tuple:
+        """
+        Return `(clearance, required, body)` for one set of measured distances.
+
+        The id comes from whichever query produced the number, so the name and
+        the number never say different things.
+        """
         if distances is None:
-            return -np.inf, self.required
-        hanging = min(distances.values(), default=np.inf)
+            return -np.inf, self.required, None
+        body, hanging = self._nearest(distances)
         if hanging > self.required:
-            return hanging, self.required
+            return hanging, self.required, body
         if hanging <= self.required_rigid:
             # inside the two margins with something: no split can pass it
-            return hanging, self.required_rigid
+            return hanging, self.required_rigid, body
         # One more query, not two: `hanging` is the smaller of the two halves,
         # so a swinging half clear of `required` leaves the rigid half at
         # `hanging`, which is inside the band and therefore clear of its own.
-        swinging = self._scene_distance(q, swinging=True, scene=scene)
+        swinging_body, swinging = self._nearest(
+            self._distances(q, swinging=True, scene=scene)
+        )
         if swinging > self.required:
-            return hanging, self.required_rigid
-        return swinging, self.required
+            return hanging, self.required_rigid, body
+        return swinging, self.required, swinging_body
+
+    @staticmethod
+    def _nearest(distances: dict | None) -> tuple[str | None, float]:
+        """Return the nearest body and its distance: `-inf` no query, `inf` no body."""
+        if distances is None:
+            return None, -np.inf
+        if not distances:
+            return None, np.inf
+        body = min(distances, key=distances.get)
+        return body, distances[body]
 
     def is_valid(self, q_a: np.ndarray) -> bool:
         """Clear of the scene by the whole margin, and not folded into itself."""
-        clearance, required = self.margin(q_a)
+        clearance, required, _body = self.margin(q_a)
         return clearance > required
 
     def tcp_pose(self, q_a: np.ndarray) -> tuple[np.ndarray, float]:
@@ -420,9 +442,9 @@ class Geometry:
         previous = path.position(0.0)
         q = self.configuration(previous)
         bounds = self._distances(q)
-        clearance, required = self._decide(q, bounds, None)
+        clearance, required, body = self._decide(q, bounds, None)
         if not clearance > required:
-            raise PlanningError("the fitted path is blocked at its start")
+            raise PlanningError(f"the fitted path is blocked at its start by '{body}'")
         sigma, step, count = 0.0, INITIAL_LIFT_STEP, 1
         while sigma < 1.0:
             step = min(step, 1.0 - sigma)
@@ -445,10 +467,11 @@ class Geometry:
                 near = [min(self.scene, key=lambda body: bounds[body.id])]
             q = self.configuration(candidate)
             distances = self._distances(q, scene=near)
-            clearance, required = self._decide(q, distances, near)
+            clearance, required, body = self._decide(q, distances, near)
             if not clearance > required:
                 raise PlanningError(
-                    f"the fitted path is blocked at sigma = {sigma + step:.3f}"
+                    f"the fitted path is blocked at sigma = {sigma + step:.3f} "
+                    f"by '{body}'"
                 )
             bounds.update(distances)
             previous, sigma = candidate, sigma + step
