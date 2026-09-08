@@ -465,8 +465,16 @@ class Geometry:
 
 
 def yaw_of(rotation: np.ndarray) -> float:
-    """Return the rotation about K0 z, which is the whole of what a goal fixes."""
-    return float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+    """
+    Return `phi_tool`: the world yaw of the TCP's local **y**, about K0 z.
+
+    Not the x axis. `phi_tool_n` is the heading of the jaw-opening direction,
+    which on the PZS100 is TCP y -- the rails stroke along -+y. The legacy
+    planner spelled the same angle in joint space as `theta1 - theta8`, and the
+    two agree exactly at every configuration. Reading the x axis instead is the
+    perpendicular, and puts the gripper 90 deg off the requested angle.
+    """
+    return float(np.arctan2(rotation[1, 1], rotation[0, 1]))
 
 
 def wrap(angle: float) -> float:
