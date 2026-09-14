@@ -1,16 +1,13 @@
-"""The certified path must be `C4` in sigma, and both readers must agree on it.
+"""Certified path must be `C4` in sigma, and both readers must agree on it.
 
-C3's flat inversion needs `qdddot_d` to exist and the command PT1 inversion needs
-one derivative beyond that, so the reference has to be `C4`. A cubic B-spline with
-simple interior knots is `C2` and no constraint can recover the missing levels; a
-quintic is `C4` by construction. `wiki/controller_design.md` section 2.4 is where
-the derivative count comes from.
+C3's flat inversion needs `qdddot_d`, command PT1 inversion one derivative beyond:
+reference must be `C4`. Cubic B-spline with simple interior knots is `C2` and no
+constraint recovers the missing levels; a quintic is `C4` by construction.
 
-The second test is the one that catches a half-done degree change. `evaluate` and
-`path_expression` are two implementations of the same power basis -- one numeric,
-one symbolic -- and `evaluate`'s docstring says why they are written twice: what
-is reported back has to be what was constrained. Nothing else checks that they
-still agree once a derivative level is added.
+Second test catches a half-done degree change. `evaluate` and `path_expression` are
+the same power basis twice, numeric and symbolic -- `evaluate`'s docstring says why:
+what is reported back must be what was constrained. Nothing else checks they still
+agree once a derivative level is added.
 """
 
 import casadi as ca
@@ -27,8 +24,8 @@ from crane_planning.ocp import (
     power_coefficients,
 )
 
-#: A polyline that curves in every coordinate, so a straight-line fit would not
-#: pass by accident.
+#: Polyline curving in every coordinate, so a straight-line fit would not pass
+#: by accident.
 WAYPOINTS = np.column_stack(
     [
         np.linspace(0.0, 0.9, 40) + 0.15 * np.sin(np.linspace(0.0, 3.0, 40)),
@@ -72,12 +69,11 @@ def test_the_fitted_path_is_c4_at_every_interior_breakpoint():
     """
     Read the two polynomials, not a finite difference across the join.
 
-    A one-sided difference at a breakpoint measures the next derivative times the
-    step as well as any genuine jump, so at the fourth level of a quintic it
-    cannot separate the two. The power basis the solver is handed carries each
-    segment's polynomial explicitly, so the limits are exact: evaluate segment
-    `k` at its right edge and segment `k+1` at its left, and they either agree or
-    the curve is not `C4`.
+    One-sided difference at a breakpoint measures the next derivative times the
+    step plus any genuine jump -- at the fourth level of a quintic it cannot
+    separate them. The power basis carries each segment's polynomial explicitly, so
+    limits are exact: segment `k` at its right edge, `k+1` at its left -- they
+    agree, or it is not `C4`.
     """
     coefficients = power_coefficients(fitted(), PlannerConfig().path_segments)
     segments = coefficients.shape[0]
@@ -107,8 +103,8 @@ def test_evaluate_and_path_expression_agree_at_every_level():
     )
 
     flat = coefficients.reshape(-1)
-    # Breakpoints included: they are where a segment lookup that disagreed would
-    # show, and the curve is C4 across them so both readers must answer alike.
+    # Breakpoints included: where a disagreeing segment lookup would show, and
+    # the curve is C4 across them so both readers must answer alike.
     query = np.unique(
         np.concatenate([np.linspace(0.0, 1.0, 97), np.linspace(0.0, 1.0, segments + 1)])
     )

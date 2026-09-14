@@ -1,17 +1,13 @@
 """
-The `crane_planner` node: `/a2b_movement`, and the reference it answered with.
+`crane_planner` node: `/a2b_movement` + the reference it answers with.
 
-**Not a second writer of the machine.** `crane_velocity_controller` is the sole
-claimant of the six velocity command interfaces, and which controller holds that
-claim is the supervisor's decision alone. So this node publishes a *reference*,
-holds no `controller_manager` client, and is composed beside the manager rather
-than loaded into it.
+**Not a second writer of the machine.** `crane_velocity_controller` is sole
+claimant of six velocity command interfaces; supervisor alone grants that claim.
+So: reference only, no `controller_manager` client, composed beside manager.
 
-Every name below is an absolute cross-node contract except `/robot_description`,
-which a deployment remaps -- the description composition publishes several and
-the profile picks one. A planner solving the kinematics of a different
-description from the one the controllers were configured against would place the
-tool of a different crane.
+Names below are absolute cross-node contracts except `/robot_description`,
+remapped per deployment (several published, profile picks one). Wrong
+description -> tool of a different crane.
 """
 
 from __future__ import annotations
@@ -64,42 +60,34 @@ from .planner import (
 
 REFERENCE_TOPIC = "/crane/reference"
 PLANNED_PATH_TOPIC = "/crane_planner/planned_path"
-#: The Cartesian path the legacy A2B server published beside its service
-#: answer, on the name it published it: relative, from a node in the root
-#: namespace, so that an operator's RViz shows the same thing it always did.
+#: Cartesian path legacy A2B server published beside its service answer. Kept
+#: on its old relative name so operator RViz is unchanged.
 #:
-#: The legacy server also latched the trajectory itself on `joint_trajectory`,
-#: and that one is **deliberately not carried over**. Nothing in the workspace
-#: subscribes to it -- the trajectory controller listens on its own
-#: `~/joint_trajectory` -- so it is a debug artefact, and publishing it would
-#: give this node a second `JointTrajectory` publisher. That count is what the
-#: launch contract reads as evidence that the planner cannot be a second
-#: command producer, and spending it on a topic nobody reads is a bad trade.
+#: Legacy also latched trajectory on `joint_trajectory` -- **not carried over**:
+#: nothing subscribes (trajectory controller uses its own `~/joint_trajectory`),
+#: and it would make this a second `JointTrajectory` publisher -- the count the
+#: launch contract reads as proof planner is no second command producer.
 LEGACY_TCP_PATH_TOPIC = "tcp_path"
-#: Everything a plan looks like, in one array: the path, the tool swept along
-#: it, the goal, and the bodies the plan was actually checked against.
+#: Whole plan in one array: path, swept tool, goal, bodies checked against.
 MARKERS_TOPIC = "/crane_planner/markers"
 JOINT_STATES_TOPIC = "/joint_states"
 COLLISION_SCENE_TOPIC = "/crane/collision_scene"
 PAYLOAD_ESTIMATE_TOPIC = "/crane/payload_estimate"
 ROBOT_DESCRIPTION_TOPIC = "/robot_description"
-#: What the OCP did on the last request, converged or not. **Private**, for
-#: `crane_mpc`'s `~/shadow_comparison` reason: it is a diagnostics stream and
-#: nothing decides anything on it, so it must not be one remap away from reading
-#: like a contract. Latched, because the question it answers -- "why did that
-#: request come back empty?" -- is asked after the fact.
+#: What OCP did last request, converged or not. **Private**, like `crane_mpc`'s
+#: `~/shadow_comparison`: diagnostics only, nothing decides on it, must not sit
+#: one remap from looking like a contract. Latched -- asked after the fact.
 SOLVER_STATS_TOPIC = "~/solver_stats"
 
-#: The frame planning geometry is in. The assembly planner converts `world` to
-#: this before it calls; nothing downstream converts, so a goal that arrives in
-#: any other frame is refused rather than assumed.
+#: Frame of planning geometry. Assembly planner converts `world` to this before
+#: calling; nothing downstream converts, so other frames refused, not assumed.
 PLANNING_FRAME = "K0_mounting_base"
 
 SHAPES = {1: "box", 2: "cylinder", 3: "sphere"}
 
 
 def latched(depth: int = 1) -> QoSProfile:
-    """Reliable, keep-last, transient-local: the reference and the scene rows."""
+    """Reliable, keep-last, transient-local: reference and scene rows."""
     return QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
@@ -109,7 +97,7 @@ def latched(depth: int = 1) -> QoSProfile:
 
 
 def volatile(depth: int = 1) -> QoSProfile:
-    """Reliable, keep-last, volatile: the measured state this plans from."""
+    """Reliable, keep-last, volatile: measured state this plans from."""
     return QoSProfile(
         reliability=ReliabilityPolicy.RELIABLE,
         history=HistoryPolicy.KEEP_LAST,
@@ -119,10 +107,9 @@ def volatile(depth: int = 1) -> QoSProfile:
 
 
 #: Every `PlannerConfig` field `config/crane_planner.yaml` may set, by type.
-#: `command_k`, `command_u_min` and `command_u_max` were missing from the array
-#: list until 2026-09-07: the yaml carried them, nothing declared them, so the
-#: dataclass defaults ran and editing the yaml changed nothing and said nothing.
-#: They matched, so no number moved.
+#: `command_k`, `command_u_min`, `command_u_max` were once absent here: yaml set
+#: them, nothing declared them, dataclass defaults ran silently. They matched,
+#: no number moved.
 FLOAT_PARAMETERS = (
     "kappa",
     "eps_pos",
@@ -172,7 +159,7 @@ ARRAY_PARAMETERS = (
     "truck_runge_stations",
 )
 
-#: Names declared outside the three loops, so the yaml check sees them too.
+#: Declared outside the three loops; the yaml check needs them too.
 OTHER_PARAMETERS = (
     "ocp_integrator",
     "max_input_age",
@@ -187,12 +174,11 @@ class CranePlanner(Node):
     def __init__(self) -> None:
         super().__init__("crane_planner")
         self._declare()
-        #: The OCP's cost weights, read and checked at construction.
+        #: OCP cost weights, read + checked at construction.
         self.weights = self._weights()
         self.planner: Planner | None = None
-        # Both producers land here and are routed when they are read, not when
-        # they arrive: the description is what says which joint name is which,
-        # and it does not always arrive first.
+        # Both producers land here, routed on read: description says which joint
+        # name is which and need not arrive first.
         self.joint_states: deque = deque(maxlen=8)
         self.scene: CollisionScene | None = None
         self.estimate: PayloadEstimate | None = None
@@ -200,12 +186,10 @@ class CranePlanner(Node):
         self.create_subscription(
             String, ROBOT_DESCRIPTION_TOPIC, self._description, latched()
         )
-        # Depth 10 and not 1: `/joint_states` carries **two** partial messages
-        # from two producers, published back to back. A depth-1 queue can drop
-        # one of them for good -- the second overwrites the first before the
-        # subscription is served -- and the planner then never sees a state
-        # carrying the actuated six. The legacy A2B server read this topic at
-        # depth 5 for the same reason.
+        # Depth 10 not 1: `/joint_states` gets **two** partial messages from two
+        # producers back to back. Depth-1 loses one for good (second overwrites
+        # first before serving) -> planner never sees actuated six. Legacy used
+        # depth 5.
         self.create_subscription(
             JointState, JOINT_STATES_TOPIC, self._joint_states, volatile(10)
         )
@@ -220,14 +204,14 @@ class CranePlanner(Node):
         )
         self.planned_path = self.create_publisher(Path, PLANNED_PATH_TOPIC, latched())
         self.legacy_tcp_path = self.create_publisher(Path, LEGACY_TCP_PATH_TOPIC, 10)
-        # Transient-local, because an RViz started after the plan should still
-        # see it -- a plan is a standing decision, not a stream.
+        # Transient-local: RViz started after the plan still sees it -- standing
+        # decision, not stream.
         self.markers = self.create_publisher(MarkerArray, MARKERS_TOPIC, latched())
         self.solver_stats = self.create_publisher(
             DiagnosticArray, SOLVER_STATS_TOPIC, latched()
         )
-        # The retained timber contract, on the same node and over the same
-        # planner: one adapter, no second set of limits.
+        # Retained timber contract, same node + planner: one adapter, one set of
+        # limits.
         self.create_service(CalcMovement, A2B_MOVEMENT_SERVICE, self._a2b)
         self.get_logger().info(f"waiting for {ROBOT_DESCRIPTION_TOPIC}")
 
@@ -237,15 +221,14 @@ class CranePlanner(Node):
         """
         Declare every knob `config/crane_planner.yaml` carries.
 
-        The machine's numbers -- how far and how fast each joint may go -- are
-        deliberately absent, read from the description instead: a limit written
-        beside a node drifts away from the description every controller in the
-        same deployment was configured against.
+        Machine numbers -- joint range and speed -- deliberately absent, read
+        from description: a limit beside a node drifts from the one every
+        controller in the deployment uses.
 
-        The name lists are module constants and not literals here because an
-        override for a name nobody declared is dropped in silence: the yaml then
-        reads as authoritative and is not. `test_every_yaml_key_is_declared`
-        compares the two, which is the only thing that notices.
+        Name lists are module constants, not literals, because an override for an
+        undeclared name is dropped silently -- yaml reads authoritative but is
+        not. `test_every_yaml_key_is_declared` compares them; only thing that
+        notices.
         """
         defaults = PlannerConfig()
         for name in FLOAT_PARAMETERS:
@@ -257,33 +240,31 @@ class CranePlanner(Node):
                 name, [float(value) for value in getattr(defaults, name)]
             )
         self.declare_parameter("ocp_integrator", str(defaults.ocp_integrator))
-        # The OCP's cost weights, nested under `weights` as the yaml writes them.
-        # Every residual row is dimensionless, so these are preferences and a
-        # scalar sets a whole block; `weights.time` prices the horizon row and is
-        # the minimum-time objective.
+        # OCP cost weights, nested under `weights` as yaml writes them. Residual
+        # rows dimensionless -> preferences, one scalar sets a block;
+        # `weights.time` prices horizon row = minimum-time objective.
         for name, value in crane_weights.DEFAULTS.items():
             self.declare_parameter(f"weights.{name}", float(value))
         self.declare_parameter("max_input_age", 0.5)
         self.declare_parameter("max_scene_age", 10.0)
-        # Test rig only: no perception running means no scene, and a request
-        # asking for collision checks is refused. Set true to plan against an
-        # empty world instead -- self-collision still checked, geometry not.
+        # Test rig only: no perception -> no scene, and a request wanting
+        # collision checks is refused. True -> plan against empty world;
+        # self-collision still checked, geometry not.
         self.declare_parameter("allow_missing_scene", True)
         self.declare_parameter("pendulum_state_deadline", 0.15)
         self.declare_parameter("payload_estimate_deadline", 1.0)
-        # C3's inversion in the effort field. A controller that does not set
-        # `effort_field_is_feedforward` rejects a trajectory carrying the field
-        # outright, so a profile without jtc_fork.md delta 3 turns this off.
+        # C3's inversion in the effort field. A controller not setting
+        # `effort_field_is_feedforward` rejects a trajectory carrying it, so
+        # profiles without that JTC fork set this false.
         self.declare_parameter("c3_feedforward", True)
 
     def _weights(self) -> dict:
         """
-        Read the cost weights once, and check them once.
+        Read the cost weights once, check them once.
 
-        `weights.matrices` is called and its answer discarded on purpose: a width
-        that does not match the residual, or a negative price, is a configuration
-        error and belongs at construction, not on the first plan a caller asks
-        for.
+        `weights.matrices` called, answer discarded on purpose: width mismatch
+        vs residual, or negative price, is a config error -- belongs here, not on
+        the first plan.
         """
         weights = {
             name: self.get_parameter(f"weights.{name}").value
@@ -317,22 +298,20 @@ class CranePlanner(Node):
                 message.data, self._config(), self.weights, build_missing=False
             )
         except SolverNotExported as missing:
-            # Quit, not degrade: the solver is exported by hand against the
-            # description a deployment publishes, so a miss means this node would
-            # plan for another machine. Dying says so while the launch that
-            # publishes the description is still up to dump from.
+            # Quit, not degrade: solver hand-exported against the published
+            # description, so a miss means planning for another machine. Dying
+            # says so while launch is still up to dump from.
             self.planner = None
             self.get_logger().fatal(str(missing))
             raise SystemExit(1) from missing
-        except Exception as failure:  # a bad description is not a crash
+        except Exception as failure:  # bad description is not a crash
             self.planner = None
             self.get_logger().error(f"the robot description was refused: {failure}")
             return
         self.joint_names = list(canonical_joints())
-        # Which machine, not just which tool: a deployment publishes several
-        # descriptions and remaps this node onto one of them, and the sha1 is
-        # what names the solver that was compiled for it. Without it, "which URDF
-        # is this planning for" is answerable only by reading the launch file.
+        # Which machine, not just which tool: several descriptions published,
+        # this node remapped onto one; sha1 names solver compiled for it. Else
+        # only the launch file answers "which URDF?".
         digest = hashlib.sha1(message.data.encode()).hexdigest()
         self.get_logger().info(
             f"planning for {Tool.PZS100.value} on the description at sha1 "
@@ -341,11 +320,11 @@ class CranePlanner(Node):
 
     def _joint_states(self, message: JointState) -> None:
         """
-        Keep the recent messages; which is which is decided when they are read.
+        Keep recent messages; which is which is decided on read.
 
-        `/joint_states` carries actuated and passive joints alike, but telling
-        them apart needs the joint names, which come from the description --
-        routing here would silently drop every state that arrived before it.
+        `/joint_states` carries actuated and passive alike; telling them apart
+        needs joint names from description, so routing here would drop states
+        arriving before it.
         """
         self.joint_states.append(message)
 
@@ -392,9 +371,8 @@ class CranePlanner(Node):
                 dq_a[slot] = actuated.velocity[where]
         self.start_stamp = actuated.header.stamp
 
-        # The passive half, and what happens when it is not there. Reading an
-        # absent sway estimate as zero is the stopped-start convention this
-        # refusal exists to remove; there is no third answer.
+        # Passive half, and what if absent. Missing sway read as zero is the
+        # stopped-start convention this refusal removes; no third answer.
         deadline = self.get_parameter("pendulum_state_deadline").value
         passive = self._newest({self.joint_names[index] for index in PASSIVE_INDICES})
         if passive is None:
@@ -413,9 +391,8 @@ class CranePlanner(Node):
         for slot, index in enumerate(PASSIVE_INDICES):
             where = names.index(self.joint_names[index])
             q[index] = passive.position[where]
-            # A broadcaster that publishes the sway without its rate leaves the
-            # OCP no boundary condition for it; zero is the honest reading only
-            # when the array is genuinely absent.
+            # Broadcaster publishing sway without its rate leaves the OCP no
+            # boundary condition; zero honest only when the array is truly absent.
             if passive.velocity:
                 dq_u[slot] = passive.velocity[where]
         return Start(q=q, dq_a=dq_a, dq_u=dq_u)
@@ -471,7 +448,7 @@ class CranePlanner(Node):
         return primitives
 
     def _payload(self, declared):
-        """Return the declared payload, overridden by a fresh and valid estimate."""
+        """Return the declared payload, overridden by a fresh valid estimate."""
         mass = float(declared.mass)
         com = np.array([declared.com.x, declared.com.y, declared.com.z])
         if self.estimate is not None and self.estimate.valid:
@@ -506,14 +483,12 @@ class CranePlanner(Node):
         """
         Answer the retained `a2b_movement` contract over the same planner.
 
-        Nothing here plans: `a2b` maps the request onto `Planner.plan`, this runs
-        it. The node's only service -- the native `/crane/plan_motion` had no
-        caller and was removed -- so also the only path publishing
-        `/crane/reference`.
+        Nothing here plans: `a2b` maps request onto `Planner.plan`, this runs it.
+        Only service here (native `/crane/plan_motion` had no caller, removed),
+        so only path publishing `/crane/reference`.
 
-        `CalcMovement.Response` has **no message field**, so a refusal cannot say
-        why. It goes to the log and the trajectory is left empty, as the legacy
-        server left it.
+        `CalcMovement.Response` has **no message field** -- refusal cannot say
+        why. Goes to log; trajectory left empty, like legacy.
         """
         response.success = False
         response.trajectory = JointTrajectory()
@@ -525,15 +500,15 @@ class CranePlanner(Node):
             return response
 
         try:
-            # The payload first, because the offset from the tip pivot to the
-            # tool is read at the pose the tool hangs at *with it on*.
+            # Payload first: tip-to-tool offset is read at the pose the tool
+            # hangs at *with it on*.
             payload, _shape = translate_payload(request)
             start = translate_start(request)
             if start is None:
                 start = self._start()
             else:
-                # A supplied feasibility state, not a measurement: it is stamped
-                # now, because there is no measurement whose clock to use.
+                # Supplied feasibility state, not a measurement: stamped now, no
+                # measurement clock to use.
                 self.start_stamp = self.get_clock().now().to_msg()
             offset = self.planner.tip_to_tcp_offset(
                 payload, request.phi_tool_n, start.q_tool
@@ -550,18 +525,17 @@ class CranePlanner(Node):
             )
         except PlanningError as refusal:
             self.get_logger().warn(f"a2b_movement refused: {refusal}")
-            # Every refusal, not only the solver's: a stream that is silent on
-            # the refusals it has no numbers for reads as "the solve was fine".
+            # Every refusal, not only the solver's: silence on refusals with no
+            # numbers reads as "solve was fine".
             self._report(DiagnosticStatus.ERROR, str(refusal), refusal.stats)
             return response
 
-        # The canonical eight, because that is what the trajectory controller
-        # this answer is fed to is configured with. The passive pair costs
-        # nothing to supply -- the OCP solved for it -- and it is the sway the
-        # plan actually claims rather than the pose the tool would settle to.
+        # Canonical eight: what the trajectory controller fed this is configured
+        # with. Passive pair free (OCP solved it) and is the sway the plan
+        # claims, not where the tool would settle.
         legacy = self._trajectory(plan, self.start_stamp, range(GENERALIZED_DOF))
-        # `publish_path` gates the topic and nothing else: the answer carries
-        # `tcp_path` either way, exactly as the legacy server answered it.
+        # `publish_path` gates the topic only: answer carries `tcp_path` either
+        # way, as legacy did.
         if request.publish_path:
             self.legacy_tcp_path.publish(path)
 
@@ -574,18 +548,17 @@ class CranePlanner(Node):
         self, start, position_m, yaw, payload, shape, avoid_collisions, speed_scale
     ):
         """Plan, then publish the reference and the drawing."""
-        # Re-read live, like `c3_feedforward` below. Safe to change between
-        # requests where the rest of the config is not: the lag enters only the
-        # post-solve reconstruction of the effort field, never the exported
-        # solver, the geometry or a cached anything. It is what lets an ablation
-        # switch feedforward laws without a relaunch.
+        # Re-read live, like `c3_feedforward` below. Safe between requests where
+        # rest is not: lag enters only post-solve effort-field reconstruction,
+        # never exported solver, geometry or cache. Lets an ablation switch
+        # feedforward laws without relaunch.
         self.planner.config.command_lag_s = np.asarray(
             self.get_parameter("command_lag_s").value, dtype=float
         )
         primitives = self._primitives(avoid_collisions)
-        # The goal and the geometry are drawn **before** the solve, so that a
-        # refusal leaves them on screen. "It said no" and "it said no, and here
-        # is the runge it would have hit" are very different messages.
+        # Goal + geometry drawn **before** solve, so a refusal leaves them on
+        # screen. "No" vs "no, and here is the runge it would have hit" are very
+        # different messages.
         checked = self.planner.prepare_scene(primitives, avoid_collisions)
         stamp = self.get_clock().now().to_msg()
         standing = viz.scene(checked, PLANNING_FRAME, stamp) + viz.goal(
@@ -618,11 +591,10 @@ class CranePlanner(Node):
         self.reference.publish(trajectory)
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
-        # `WARN` and not `OK` where the solve bought the answer with slack: a
-        # priced violation of the sway box, the settled box or the pump's
-        # planning share is a plan the machine still executes, and the residuals
-        # say nothing about it. The threshold is `plan.message`'s own, so the
-        # log line and the topic cannot disagree about whether slack was spent.
+        # `WARN` not `OK` when slack bought the answer: a priced violation of the
+        # sway box, settled box or pump share still executes and residuals say
+        # nothing. Threshold is `plan.message`'s own -- log and topic cannot
+        # disagree.
         level = (
             DiagnosticStatus.WARN
             if plan.timing.slack > SLACK_SPENT
@@ -633,13 +605,12 @@ class CranePlanner(Node):
 
     def _report(self, level: bytes, message: str, stats: dict) -> None:
         """
-        Publish what the solver did, converged or not, on one topic in one shape.
+        Publish what the solver did, converged or not, one topic one shape.
 
-        The non-convergence is the case this exists for and it is also the case
-        that returns nothing at all: `CalcMovement.Response` has no message
-        field, so before this the only trace of a failed solve was a line in
-        this node's log. `level` is a `DiagnosticStatus` constant and those are
-        `bytes`, not ints -- an int fails the field's type check.
+        Non-convergence is why this exists and returns nothing else: no message
+        field on `CalcMovement.Response`, so a failed solve used to leave only a
+        log line. `level` is a `DiagnosticStatus` constant -- those are `bytes`,
+        not ints; an int fails the field's type check.
         """
         report = DiagnosticArray()
         report.header.stamp = self.get_clock().now().to_msg()
@@ -660,14 +631,12 @@ class CranePlanner(Node):
         """
         Build a trajectory over `indices` of the canonical eight.
 
-        Two callers, two widths, and the difference is not cosmetic. The native
-        reference carries the **actuated six**, what `crane_velocity_controller`
-        claims. The `a2b_movement` answer carries the **canonical eight**: the
-        trajectory controller consuming it lists the passive tip and tilt joints
-        as state -- it commands six and tracks eight -- so a six-wide goal is
-        rejected.
+        Two callers, two widths, not cosmetic. Native reference: **actuated
+        six**, what `crane_velocity_controller` claims. `a2b_movement` answer:
+        **canonical eight** -- its trajectory controller commands six but tracks
+        passive tip and tilt too, so a six-wide goal is rejected.
 
-        `header.frame_id` is empty on purpose: joint space has no frame.
+        `header.frame_id` empty on purpose: joint space has no frame.
         """
         trajectory = JointTrajectory()
         trajectory.header.stamp = stamp
@@ -689,12 +658,12 @@ class CranePlanner(Node):
         return trajectory
 
     def _draw(self, markers: list) -> None:
-        """Replace the drawing wholesale: a `DELETEALL`, then this plan's set."""
+        """Replace the drawing wholesale: `DELETEALL`, then this plan's set."""
         self.markers.publish(viz.clear(PLANNING_FRAME, self.get_clock().now().to_msg()))
         self.markers.publish(MarkerArray(markers=markers))
 
     def _path(self, plan) -> Path:
-        """Build the tool's own geometry, for the operator. Visualization only."""
+        """Build the tool geometry for the operator. Visualization only."""
         path = Path()
         path.header.frame_id = PLANNING_FRAME
         path.header.stamp = self.get_clock().now().to_msg()

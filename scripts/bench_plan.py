@@ -2,16 +2,15 @@
 """
 Where a `Planner.plan` call spends its time. No ROS, no graph, no clock.
 
-Stage 0 of the C4 continuity work: the baseline to attribute against, taken
-before the spline degree or the OCP state vector move. Answers two questions
-the service-level benchmark (`bench_calc_movement.py`) cannot -- which stage
-costs what, and how much of the OCP's wall time is acados rather than Python.
+Stage 0 of C4 continuity work: baseline to attribute against, taken before the
+spline degree or OCP state vector move. Answers what the service-level benchmark
+(`bench_calc_movement.py`) cannot: which stage costs what, and how much of OCP
+wall time is acados not Python.
 
     ./scripts/bench_plan.py --repeats 5
 
-Wall clock is load-bound (`ocp.py`: 0.53 s idle against 4.97 s under a running
-Gazebo), so run this idle and read a regression off `sqp_iter` and the acados
-time, not off the totals.
+Wall clock is load-bound (`ocp.py`: 0.53 s idle vs 4.97 s under running Gazebo):
+run idle, read regressions off `sqp_iter` and acados time, not totals.
 """
 
 from __future__ import annotations
@@ -43,31 +42,29 @@ from crane_planning.planner import (  # noqa: E402
 
 DESCRIPTION = "pzs100.urdf"
 
-# The two servers do not agree on what a joint may do, so a request set both can
-# answer lives in the **intersection** of their boxes, which is much smaller than
-# either. Measured, per planned axis (slew, boom, arm, telescope, rotator):
+# Servers disagree on what a joint may do, so a request set both answer lives in
+# the **intersection** of their boxes, much smaller than either. Measured, per
+# planned axis (slew, boom, arm, telescope, rotator):
 #
-#     crane_planning, off the PZS100 description it reads:
+#     crane_planning, off PZS100 description it reads:
 #         [-3.71, 3.71] [-1.20, 1.563] [-0.91, 4.60] [0.00, 2.236]  unbounded
 #     a2b_ilqr_server, `qMinCtrl`/`qMaxCtrl` in `mp_parameter_pzs100.yaml`,
 #     less its 0.087 rad `qLimSafetyBuffer`:
 #         [-3.71, 3.71] [ 0.00, 1.562] [-0.91, 1.325] [0.00, 2.236] [-12.6, 12.6]
 #
-# The boom is the binding one: `a2b_ilqr_server` refuses any negative boom angle
-# ("q0[1] is not feasible: 0.00 < -0.30 < 1.56"), which is where `plan_example`'s
-# shipped -0.2 sits. So these moves keep the boom positive; they are not
-# `plan_example`'s and the two are not comparable.
+# Boom binds: `a2b_ilqr_server` refuses negative boom angle ("q0[1] is not
+# feasible: 0.00 < -0.30 < 1.56"), where `plan_example`'s shipped -0.2 sits. So
+# these moves keep boom positive; not `plan_example`'s moves, not comparable.
 
-#: The tool coordinate q8. `crane_planning`'s description bounds it to
-#: [0.20, 0.70], `mp_parameter_pzs100.yaml` to [0.00, 0.538]; 0.45 is inside
-#: both with room for the safety buffer.
+#: Tool coordinate q8. `crane_planning` description bounds it [0.20, 0.70],
+#: `mp_parameter_pzs100.yaml` [0.00, 0.538]; 0.45 inside both, room for safety
+#: buffer.
 TOOL_POSITION = 0.45
 
-#: `(name, start, goal)` in planned joint coordinates, all inside the
-#: intersection above. Spread over the axes a duration is decided by: slew
-#: alone, telescope alone, and three that move everything. Reachability is not
-#: assumed -- a goal is a joint configuration pushed through FK, so the IK stage
-#: has an answer.
+#: `(name, start, goal)` in planned joint coords, all inside intersection above.
+#: Spread over axes a duration is decided by: slew alone, telescope alone, three
+#: moving everything. Reachability not assumed -- goal is joint config pushed
+#: through FK, so IK stage has an answer.
 MOVES = (
     ("slew", (0.0, 0.4, 0.6, 1.0, 0.0), (0.9, 0.4, 0.6, 1.0, 0.0)),
     ("telescope", (0.0, 0.4, 0.6, 0.8, 0.0), (0.0, 0.4, 0.6, 1.6, 0.0)),
@@ -76,24 +73,21 @@ MOVES = (
     ("across", (-0.7, 0.3, 0.4, 0.9, -0.3), (0.8, 0.8, 1.0, 1.5, 0.5)),
 )
 
-#: One pose every `wide` move leaves from or arrives at, comfortably interior to
-#: the intersection above so that a move built off it is about the axis it names
-#: and not about a limit.
+#: One pose every `wide` move leaves from or arrives at, well interior to the
+#: intersection, so a move off it is about its named axis, not a limit.
 BASE = (0.0, 0.5, 0.6, 1.0, 0.0)
 
-#: A spread `MOVES` deliberately is not. Those five are all long multi-axis
-#: moves, which is the regime a continuity constraint costs least in: measured,
-#: the C4 jerk bound reaches only 0.75 of itself on the worst of them. Four
-#: regimes here, and the reason each is in the set:
+#: Spread `MOVES` is not. Those five are long multi-axis moves, the regime a
+#: continuity constraint costs least in: measured, C4 jerk bound reaches only
+#: 0.75 of itself on the worst. Four regimes, why each is in:
 #:
 #: - **single axis** -- which axis decides a duration, one at a time.
-#: - **short** -- displacements of 0.05-0.3 rad. A short move has to accelerate
-#:   and stop inside a fraction of a sway period, so it is where a bound on the
-#:   third derivative actually binds and where an inversion-driven feedforward
-#:   is most likely to ask for command it does not have.
-#: - **near limit** -- against the shared box, especially the boom, whose floor
-#:   is `a2b_ilqr_server`'s and not the description's.
-#: - **long** -- `MOVES` itself, kept as the anchor between the two sets.
+#: - **short** -- 0.05-0.3 rad. Short move accelerates and stops inside a
+#:   fraction of a sway period, so a third-derivative bound actually binds and
+#:   inversion-driven feedforward most likely asks for command it lacks.
+#: - **near limit** -- against shared box, boom especially, whose floor is
+#:   `a2b_ilqr_server`'s, not the description's.
+#: - **long** -- `MOVES` itself, anchor between the two sets.
 WIDE_MOVES = (
     # single axis, from one pose
     ("ax_slew", BASE, (2.5, 0.5, 0.6, 1.0, 0.0)),
@@ -101,12 +95,12 @@ WIDE_MOVES = (
     ("ax_arm", BASE, (0.0, 0.5, 1.2, 1.0, 0.0)),
     ("ax_tele", BASE, (0.0, 0.5, 0.6, 2.0, 0.0)),
     ("ax_rot", BASE, (0.0, 0.5, 0.6, 1.0, 1.5)),
-    # short -- the regime the jerk bound is for
+    # short -- regime the jerk bound is for
     ("sh_slew", BASE, (0.1, 0.5, 0.6, 1.0, 0.0)),
     ("sh_boom", BASE, (0.0, 0.55, 0.6, 1.0, 0.0)),
     ("sh_tele", BASE, (0.0, 0.5, 0.6, 1.1, 0.0)),
     ("sh_multi", BASE, (0.1, 0.55, 0.65, 1.1, 0.1)),
-    # near the shared box, boom especially
+    # near shared box, boom especially
     ("lim_boom_low", BASE, (0.0, 0.12, 0.6, 1.0, 0.0)),
     ("lim_boom_high", BASE, (0.0, 1.45, 0.6, 1.0, 0.0)),
     ("lim_tele_out", BASE, (0.0, 0.5, 0.6, 2.15, 0.0)),
@@ -118,8 +112,8 @@ WIDE_MOVES = (
 )
 
 #: Timed separately, in call order. `plan` runs them as module-level functions
-#: and two methods, so wrapping the names is enough -- no production edit, which
-#: is the point of a baseline.
+#: and two methods, so wrapping names suffices -- no production edit, the point
+#: of a baseline.
 PHASES = ("prepare_scene", "geometry", "ik", "path", "coefficients", "ocp", "resample")
 
 
@@ -189,10 +183,10 @@ def emit_requests(planner: Planner, path: Path, moves) -> None:
     """
     Write the same moves as `CalcMovement` fields, for the service benchmark.
 
-    Generated here rather than in the ROS client so both servers are handed
-    byte-identical requests off one description: the client replays a file, it
-    does not compute a goal. `y_n` is the **tip pivot K5**, which is what the
-    `.srv` names and what `a2b.translate_request` converts from -- not the TCP.
+    Here rather than in the ROS client so both servers get byte-identical
+    requests off one description: client replays a file, computes no goal.
+    `y_n` is the **tip pivot K5** -- what the `.srv` names, what
+    `a2b.translate_request` converts from -- not the TCP.
     """
     import json
 
@@ -320,8 +314,8 @@ def main() -> int:
         emit_requests(planner, options.emit_requests, moves)
         return 0
 
-    # Discarded: the first call pays for whatever the solver loaded lazily, and
-    # a baseline that carries it once is not a baseline of a served request.
+    # Discarded: first call pays for whatever the solver loaded lazily; a
+    # baseline carrying that once is no baseline of a served request.
     run(planner, moves[0], options.speed_scale)
 
     samples: dict = defaultdict(list)

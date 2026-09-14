@@ -1,4 +1,4 @@
-"""The deterministic geometric stage goes around a blocked direct corridor."""
+"""Deterministic geometric stage goes around a blocked direct corridor."""
 
 import numpy as np
 import pinocchio as pin
@@ -23,7 +23,7 @@ def limits() -> planning.Limits:
 
 
 class FakeGeometry:
-    """A Cartesian identity arm facing one low obstacle at the origin."""
+    """Cartesian identity arm facing one low obstacle at origin."""
 
     required = 0.2
 
@@ -51,7 +51,7 @@ class FakeGeometry:
         return float(np.linalg.norm(np.asarray(second) - np.asarray(first)))
 
     def check_path(self, path):
-        """The real certificate's contract: the fitted curve, not the polyline."""
+        """Real certificate's contract: fitted curve, not polyline."""
         for sigma in np.linspace(0.0, 1.0, 201):
             if not self.is_valid(path.position(sigma)):
                 raise planning.PlanningError(f"blocked at sigma = {sigma:.3f}")
@@ -86,10 +86,10 @@ def certify(geometry, start, goal):
 
 
 def test_joint_line_answers_when_the_tool_chord_does_not(identity_ik):
-    """A blocked tool chord with a clear joint line is answered without a corridor."""
+    """Blocked tool chord with a clear joint line is answered without a corridor."""
     geometry = FakeGeometry()
-    # the identity arm's joint line is the tool chord, so give the goal a
-    # configuration whose line passes above the block
+    # identity arm's joint line is the tool chord, so give goal a configuration
+    # whose line passes above the block
     start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
     goal_q_a = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
     geometry.is_valid = lambda q_a: (
@@ -104,7 +104,7 @@ def test_joint_line_answers_when_the_tool_chord_does_not(identity_ik):
 
 
 def test_unreachable_corner_refuses_its_corridors_without_lifting(monkeypatch):
-    """One IK per corner, not a lift per corridor, when the transfer plane is out of reach."""
+    """One IK per corner, not a lift per corridor, when plane is out of reach."""
     lifts, solves = [], []
 
     def solve(_geometry, _limits, _config, position, yaw, _seed, restarts=1):
@@ -133,8 +133,8 @@ def test_unreachable_corner_refuses_its_corridors_without_lifting(monkeypatch):
             np.zeros(5),
         )
     assert lifts == ["direct tool line"]
-    # two planes, two corners each; the second corner of a plane is never asked
-    # for once the first refused
+    # two planes, two corners each; second corner never asked once the first
+    # refused
     assert sum(point[2] > 0.3 for point in solves) == 2
 
 

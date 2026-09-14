@@ -1,4 +1,4 @@
-"""A start refused on clearance must say which scene body it is refused against."""
+"""A start refused on clearance must name the scene body it is refused against."""
 
 from pathlib import Path
 
@@ -70,7 +70,7 @@ def geometry(scene) -> Geometry:
 
 
 def test_the_body_the_machine_is_inside_is_the_one_named():
-    """The block sitting on the tool is named, not the one across the site."""
+    """Block sitting on the tool is named, not the one across the site."""
     tcp, _yaw = geometry([]).tcp_pose(Q_A)
     scene = geometry([box("held_block", tcp), box("far_block", tcp + [0.0, 12.0, 0.0])])
 

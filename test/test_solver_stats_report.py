@@ -1,15 +1,14 @@
 """A refused solve reports its numbers; `CalcMovement` has nowhere to put them.
 
-`CalcMovement.Response` carries no message field, so before `~/solver_stats` a
-non-convergence left exactly one trace: a line in the planner's own log. The
-numbers that diagnose it -- which of the four KKT residuals stalled -- are also
-the ones no `Trajectory` exists to carry, so they ride `PlanningError.stats`.
+`CalcMovement.Response` has no message field, so before `~/solver_stats` a
+non-convergence left one trace: a line in the planner's log. The diagnosing numbers
+-- which of the four KKT residuals stalled -- are also the ones no `Trajectory`
+exists to carry, so they ride `PlanningError.stats`.
 
-The two things that can break quietly are asserted here and not much else.
-`DiagnosticStatus.level` is a `byte` field, so rclpy types it `bytes` and an
-`int` fails its check -- on the refusal path only, which is the path nobody
-exercises until the day it matters. And a refusal raised before the solve has no
-numbers at all: it must still report, or a silent stream reads as a healthy one.
+Two quiet breakages, asserted here. `DiagnosticStatus.level` is a `byte` field, so
+rclpy types it `bytes` and an `int` fails its check -- refusal path only, which
+nobody exercises until the day it matters. And a refusal raised before the solve
+has no numbers: must still report, or a silent stream reads as healthy.
 """
 
 from types import SimpleNamespace
@@ -23,7 +22,7 @@ from diagnostic_msgs.msg import DiagnosticStatus
 
 
 class _Solver:
-    """The four `get_stats` fields `solver_stats` reads, and nothing else."""
+    """Four `get_stats` fields `solver_stats` reads, nothing else."""
 
     def __init__(self, **fields):
         self._fields = fields
@@ -41,7 +40,7 @@ class _Capture:
 
 
 def report(level, message, stats):
-    """`_report` against a stand-in node -- the formatting, without a graph."""
+    """`_report` against a stand-in node -- formatting, without a graph."""
     node = SimpleNamespace(
         solver_stats=_Capture(),
         get_name=lambda: "crane_planner",
@@ -54,9 +53,8 @@ def report(level, message, stats):
 
 
 def test_a_non_convergence_reports_its_residuals():
-    # `qp_iter` and `qp_stat` come back one entry per SQP iteration, so the
-    # report carries the total and the worst; a per-iteration vector is not a
-    # row anything can plot beside the scalars.
+    # `qp_iter`/`qp_stat` come back one entry per SQP iteration; report carries
+    # total and worst. A per-iteration vector is no row to plot beside scalars.
     solver = _Solver(
         sqp_iter=100,
         qp_iter=np.array([0.0, 16.0, 17.0]),
@@ -81,9 +79,9 @@ def test_a_non_convergence_reports_its_residuals():
 def test_the_plan_rows_are_there_either_way():
     """A consumer reads one set of keys; `nan` is how "no plan was built" reads.
 
-    The alternative -- omitting them where there is no trajectory -- makes the
-    key set depend on the outcome, so every reader has to branch before it can
-    plot, and a missing key and a zero become the same thing on a plot.
+    Omitting them where there is no trajectory makes the key set depend on the
+    outcome: every reader branches before plotting, and a missing key and a zero
+    plot the same.
     """
     solver = _Solver(
         sqp_iter=9,

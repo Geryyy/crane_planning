@@ -1,15 +1,13 @@
-"""The emitted reference must lie on the certified curve, not on its chords.
+"""Emitted reference must lie on the certified curve, not on its chords.
 
-`q_a = c(sigma)` is an identity the timing solve never leaves, so `q_a` is not an
-independent row. Resampling it with `np.interp` over the OCP nodes -- what
-`_resample` did -- reports the straight line between two on-curve points, which
-is off the curve the certificate was run on. The sample *values* are wrong, not
-only their derivatives.
+`q_a = c(sigma)` is an identity the timing solve never leaves, so `q_a` is no
+independent row. Resampling with `np.interp` over the OCP nodes -- what `_resample`
+did -- reports the straight line between two on-curve points, off the certified
+curve. Sample *values* wrong, not only derivatives.
 
-The oracle is independent of how the fix reconstructs `sigma`: recover `sigma`
-from one coordinate of an emitted row and check that the other four agree with
-the curve at that same `sigma`. A point on the chord fails this; a point on the
-curve passes it whatever produced it.
+Oracle is independent of how the fix rebuilds `sigma`: recover `sigma` from one
+coordinate of an emitted row, check the other four agree with the curve there.
+Chord point fails; curve point passes, whatever produced it.
 """
 
 from types import SimpleNamespace
@@ -20,9 +18,8 @@ from crane_planning.config import PLANNED_DOF
 from crane_planning.ocp import ORDER, evaluate
 from crane_planning.planner import actuated_samples
 
-#: One segment, so `evaluate`'s segment lookup is not what is under test. The
-#: cubic term is what makes the chord miss: a straight curve would pass the
-#: broken implementation too.
+#: One segment, so `evaluate`'s segment lookup is not under test. Cubic term makes
+#: the chord miss -- a straight curve would pass the broken implementation too.
 COEFFICIENTS = np.zeros((1, ORDER, PLANNED_DOF))
 COEFFICIENTS[0, 0] = [0.0, 0.10, -0.20, 0.30, 0.05]
 COEFFICIENTS[0, 1] = [1.20, -0.60, 0.90, 0.40, -0.30]
@@ -31,7 +28,7 @@ COEFFICIENTS[0, 3] = [0.60, -0.30, 0.40, -0.50, 0.25]
 
 
 def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
-    """A solved chain over `[0, duration]`: constant acceleration, zero above it."""
+    """Solved chain over `[0, duration]`: constant acceleration, zero above it."""
     time = np.linspace(0.0, duration, nodes + 1)
     a = 2.0 / duration**2  # sigma(0) = 0, sigma(T) = 1, from rest
     return SimpleNamespace(
@@ -46,7 +43,7 @@ def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
 
 
 def recovered_sigma(row: np.ndarray) -> float:
-    """`sigma` read back off coordinate 0, which is monotone over `[0, 1]`."""
+    """`sigma` read back off coordinate 0, monotone over `[0, 1]`."""
     dense = np.linspace(0.0, 1.0, 200001)
     return float(np.interp(row[0], evaluate(COEFFICIENTS, dense)[:, 0], dense))
 
@@ -62,7 +59,7 @@ def test_every_emitted_configuration_lies_on_the_curve():
 
 
 def test_the_chord_would_fail_this():
-    """The oracle discriminates: linear interpolation over the nodes does not pass."""
+    """Oracle discriminates: linear interpolation over the nodes does not pass."""
     plan = timing()
     stamps = np.linspace(0.0, plan.time[-1], 37)
     at_nodes = evaluate(COEFFICIENTS, plan.sigma)

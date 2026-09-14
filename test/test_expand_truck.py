@@ -8,12 +8,10 @@ import yaml
 from crane_model.collision import CollisionPrimitive
 from crane_planning.planner import PlannerConfig, expand_truck
 
-# The truck, measured in `world` off `epsilon_crane_description`'s
-# `timber_loader_AIT.urdf.xacro` expanded with `post_setup:=134` -- what
-# `crane_bringup/launch/sim.launch.py` launches, and a superset of the `13` the
-# hardware bringup uses. The box is the one `concrete_block_world_model`'s
-# `vehicle_box` ships, whose own agreement with these numbers that package
-# asserts; here it is the input, and what matters is what comes out of it.
+# Truck, measured in `world` off the description expanded with `post_setup:=134`
+# -- what sim bringup launches, superset of the `13` hardware bringup uses. Box is
+# the shipped vehicle box, agreement with these numbers asserted where it ships;
+# here it is input, and what matters is the output.
 DECK_CENTRE = np.array([-3.332, 0.0, 0.932575])
 DECK_EXTENT = np.array([5.554, 2.518, 0.662850])
 DECK_SURFACE_Z = 1.264
@@ -22,7 +20,7 @@ POST_X = (-5.593, -4.381, -1.397)
 POST_HALF_EXTENT = np.array([0.040, 0.054])
 POST_CENTRE_Y = 1.2025
 POST_Z = (1.332, 3.082)
-# The headboard closing the cab end, from `lkw_ladeflaeche_mit_rammschutz_seitlich_col.stl`.
+# Headboard closing the cab end.
 HEADBOARD_MIN = np.array([-1.005, -1.254, DECK_SURFACE_Z])
 HEADBOARD_MAX = np.array([-0.555, 1.259, 3.186])
 
@@ -30,7 +28,7 @@ TOLERANCE = 0.01
 
 
 def shipped_config() -> PlannerConfig:
-    """The planner config as launched, not as defaulted."""
+    """Planner config as launched, not as defaulted."""
     document = yaml.safe_load(
         (Path(__file__).parents[1] / "config" / "crane_planner.yaml").read_text()
     )
@@ -47,7 +45,7 @@ def shipped_config() -> PlannerConfig:
 
 
 def expanded_boxes() -> dict:
-    """The truck primitive at the measured deck, expanded, as {id: (min, max)}."""
+    """Truck primitive at measured deck, expanded, as {id: (min, max)}."""
     truck = CollisionPrimitive(
         id="truck",
         shape="box",

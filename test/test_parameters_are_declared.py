@@ -1,13 +1,10 @@
 """
 An override for a name nobody declared is dropped in silence.
 
-`rclpy` does not warn, does not raise and does not log: the yaml key is read
-from the file, matched against nothing, and discarded, and the dataclass default
-runs instead. `command_k`, `command_u_min` and `command_u_max` sat in
-`crane_planner.yaml` that way until 2026-09-07 -- the page that documents them
-as the compensator's identified domain, and the node reading `PlannerConfig`'s
-copy. They matched, so nothing moved and nothing said so, which is exactly the
-failure this file exists to make loud.
+`rclpy` does not warn, raise or log: yaml key read, matched against nothing,
+discarded; dataclass default runs. `command_k`, `command_u_min`, `command_u_max`
+sat in `crane_planner.yaml` that way while the node read `PlannerConfig`'s copy.
+They matched, so nothing moved and nothing said so.
 """
 
 from dataclasses import fields

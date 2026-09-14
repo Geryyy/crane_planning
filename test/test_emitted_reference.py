@@ -1,16 +1,12 @@
-"""What the emitted reference must satisfy: it stops where the plan stops, and
-its effort field carries the command the OCP solved for.
-
-The last point first.
+"""Emitted reference stops where the plan stops; effort carries the solved command.
 
 `joint_trajectory_controller` rejects a `FollowJointTrajectory` goal whose last
 point moves at all -- `fabs(v) > numeric_limits<float>::epsilon()`, 1.19e-7 --
-and the `a2b_movement` answer is fed straight to it. The OCP pins `v = a = j = 0`
-and `dq_u = 0` at the terminal node, but `actuated_samples` reconstructs that
-sample from the interval before it, so the multiple-shooting gap (1e-6 rad/s at
-`ocp_tolerance = 1e-4`) shows up as a moving last point. Observed in sim:
-"Velocity of last trajectory point of joint theta1_slewing_joint is not zero:
-0.000001194866194".
+and `a2b_movement` feeds it straight there. OCP pins `v = a = j = 0`, `dq_u = 0`
+at terminal node, but `actuated_samples` rebuilds that sample from the interval
+before, so multiple-shooting gap (1e-6 rad/s at `ocp_tolerance = 1e-4`) reads as
+a moving last point. Sim: "Velocity of last trajectory point of joint
+theta1_slewing_joint is not zero: 0.000001194866194".
 """
 
 from types import SimpleNamespace
@@ -32,7 +28,7 @@ COEFFICIENTS[0, 1] = [1.20, -0.60, 0.90, 0.40, -0.30]
 
 
 def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
-    """A solve that stops at `T`, whose last interval misses it by `gap` rad/s."""
+    """Solve stopping at `T`, whose last interval misses it by `gap` rad/s."""
     time = np.linspace(0.0, duration, nodes + 1)
     # sigma(t) = 3 (t/T)^2 - 2 (t/T)^3: starts and ends at rest, ends at 1.
     tau = time / duration
@@ -47,16 +43,16 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
         jerk=np.full(nodes + 1, -12.0 / duration**3),
         snap=np.zeros(nodes + 1),
         coefficients=COEFFICIENTS,
-        # A ramp per axis, so a preview that is dropped or applied backwards
-        # cannot pass: `u` at `t` and at `t + dead time` differ by a known slope.
+        # Ramp per axis: preview dropped or applied backwards cannot pass, `u`
+        # at `t` and `t + dead time` differ by known slope.
         command=np.outer(time, [0.01, 0.02, 0.03, 0.04, 0.05]),
         q_u=np.zeros((nodes + 1, 2)),
         dq_u=np.zeros((nodes + 1, 2)),
         pump_flow=np.zeros(nodes + 1),
         iterations=3,
         solve_time_s=0.1,
-        # `_resample`'s drift refusal carries the solve's own numbers on
-        # `~/solver_stats`; the stand-in only has to answer for them.
+        # `_resample`'s drift refusal puts the solve's numbers on
+        # `~/solver_stats`; stand-in only answers for them.
         report=dict,
         slack=0.0,
         terminal_sway=0.0,
@@ -65,7 +61,7 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
 
 
 def resample(gap: float, duration: float = 4.0, lag=None):
-    """`_resample` alone: it reads `self.config` and the geometry's FK, nothing else."""
+    """`_resample` alone: reads `self.config` and geometry's FK, nothing else."""
     pose = SimpleNamespace(position_m=np.zeros(3))
     geometry = SimpleNamespace(
         model=SimpleNamespace(forward_kinematics=lambda *_: pose)
@@ -85,9 +81,9 @@ def resample(gap: float, duration: float = 4.0, lag=None):
     )
 
 
-# `duration` is a solver output, so it lands anywhere against the 40 ms grid:
-# just short of a multiple (the stub), just past one (what rounding to nearest
-# extrapolated past the end of the plan), and exactly on one (measure-zero).
+# `duration` is a solver output, lands anywhere against 40 ms grid: short of a
+# multiple (stub), past one (round-to-nearest extrapolated past plan end), exactly
+# on one (measure-zero).
 @pytest.mark.parametrize("duration", [4.0, 4.001, 4.03])
 def test_the_reference_ends_where_the_plan_does(duration):
     plan = resample(1.0e-6, duration)  # the gap that failed in sim
@@ -106,9 +102,8 @@ def test_a_solve_that_did_not_stop_is_refused():
 
 def test_the_effort_field_carries_the_previewed_command():
     """
-    `jtc_fork.md` delta 3: effort is the *correction*, so what the plugin adds up
-    is `dq_d + effort = u(t + n_d)`. The OCP already bounded that `u`; nothing
-    downstream may derive it a second time.
+    Effort is *correction*: plugin sums `dq_d + effort = u(t + n_d)`. OCP already
+    bounded that `u`; nothing downstream may derive it twice.
     """
     config = PlannerConfig()
     plan = resample(1.0e-6, 4.03)
@@ -127,24 +122,23 @@ def test_the_effort_field_carries_the_previewed_command():
         ]
     ).T
 
-    # Every sample **but the last**: that one is pinned to zero, because the JTC
-    # holds it after the plan ends and a held feedforward is a permanent command
-    # bias rather than a transient. `test_the_held_last_point_carries_no_command`
-    # is the other half of this contract.
+    # Every sample **but the last**: that one pinned to zero, JTC holds it after
+    # plan ends and a held feedforward is permanent command bias, not transient.
+    # `test_the_held_last_point_carries_no_command` is the other half.
     assert commanded[:-1] == pytest.approx(previewed[:-1])
     assert np.all(plan.effort[-1] == 0.0)
-    # The pendulum and the tool are not commanded, and the field is width-checked
-    # against the joint names, so they carry a zero rather than nothing.
+    # Pendulum and tool not commanded, field is width-checked against joint
+    # names, so they carry zero rather than nothing.
     passive_and_tool = [i for i in range(plan.effort.shape[1]) if i not in planned]
     assert np.all(plan.effort[:, passive_and_tool] == 0.0)
 
 
 def test_the_pt1_arm_adds_tau_v_du_dt_and_leaves_a_zero_lag_axis_alone():
     """
-    controller_design.md 2.4's block 2 inversion, `bench_track.py`'s third arm.
+    Block 2 PT1 inversion, `bench_track.py`'s third arm.
 
     `timing`'s command is a ramp per axis, so `du/dt` is that axis's slope and
-    the whole term is a constant offset -- exact, not approximately.
+    term is constant offset -- exact, not approximate.
     """
     lag = np.array([0.100, 0.025, 0.000, 0.075, 0.125])
     slope = np.array([0.01, 0.02, 0.03, 0.04, 0.05])
@@ -153,20 +147,17 @@ def test_the_pt1_arm_adds_tau_v_du_dt_and_leaves_a_zero_lag_axis_alone():
     without = resample(1.0e-6, 4.03).effort[:, planned]
     with_lag = resample(1.0e-6, 4.03, lag=lag).effort[:, planned]
 
-    # The law is exact away from the end. The spline that reconstructs `du/dt`
-    # is clamped to zero slope at `T` -- the emitted feedforward has to land at
-    # zero because the JTC holds the last point -- so the final OCP interval
-    # carries the taper rather than the constant, and this ramp fixture cannot
-    # satisfy both. Assert the constant where the taper does not reach, and the
-    # landing separately; `test_the_held_last_point_carries_no_command` covers
-    # the pin itself.
+    # Law exact away from end. Spline rebuilding `du/dt` is clamped to zero slope
+    # at `T` -- feedforward must land at zero, JTC holds last point -- so final OCP
+    # interval carries taper, not constant, and this ramp fixture cannot satisfy
+    # both. Assert constant where taper does not reach, landing separately.
     solved = timing(1.0e-6, 4.03)
     interior = resample(1.0e-6, 4.03).time + PlannerConfig().command_dead_time_s
     interior = interior < solved.time[-2]
     assert with_lag[interior] == pytest.approx(without[interior] + lag * slope)
     assert with_lag[-1] == pytest.approx(np.zeros(len(lag)))
-    # `ka`'s fitted lag is zero, so the two arms are bit-identical on the arm
-    # axis. That is the control `bench_track.py` reads off `ax_arm`.
+    # `ka`'s fitted lag is zero, so both arms bit-identical on arm axis. Control
+    # `bench_track.py` reads off `ax_arm`.
     assert np.all(with_lag[:, 2] == without[:, 2])
 
 
@@ -174,17 +165,14 @@ def test_the_held_last_point_carries_no_command():
     """
     A held feedforward is a standing command bias, not a transient.
 
-    The JTC keeps sampling the final trajectory point once the plan ends, and
-    `PidTrajectoryPlugin` keeps adding its effort to the command. Slewing is
-    where that is fatal rather than untidy: `p: 0.07` with `i: 0` is a trim
-    integrator with a 28 s dominant time constant, so the loop settles where
-    `p e_pos` cancels the held term. Measured on the sim run of 2026-09-07,
-    before this pin: a held -0.0276 rad/s left the axis 0.355 rad off its goal
-    and still creeping toward the 0.394 rad that ratio predicts.
+    JTC keeps sampling final point after plan ends, `PidTrajectoryPlugin` keeps
+    adding effort. Fatal rather than untidy on slewing: `p: 0.07`, `i: 0` is a trim
+    integrator, 28 s dominant time constant, so loop settles where `p e_pos`
+    cancels the held term. Sim before this pin: held -0.0276 rad/s left axis
+    0.355 rad off goal, still creeping toward predicted 0.394 rad.
 
-    The plan ends at rest, so zero is the honest value and not merely the safe
-    one -- and the lag arm is asserted too, because `tau_v u'(T)` is what put a
-    non-zero number there in the first place.
+    Plan ends at rest, so zero is honest, not merely safe. Lag arm asserted too:
+    `tau_v u'(T)` put a non-zero number there.
     """
     lag = np.array([0.100, 0.025, 0.000, 0.075, 0.125])
 
@@ -194,9 +182,8 @@ def test_the_held_last_point_carries_no_command():
 
 def test_the_reference_carries_accelerations():
     """
-    Without them the JTC interpolates the tracked reference cubic while the
-    feedforward comes off the C4 curve, so the two branches follow different
-    curves between knots.
+    Without them JTC interpolates tracked reference cubic while feedforward comes
+    off the C4 curve: two branches, different curves between knots.
     """
     plan = resample(1.0e-6, 4.03)
 

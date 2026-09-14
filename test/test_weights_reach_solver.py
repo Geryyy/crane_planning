@@ -1,15 +1,15 @@
-"""The weights a caller passes must reach the *built* solver, not just the export.
+"""Weights a caller passes must reach the *built* solver, not just the export.
 
-`W` enters the generated code at code-export time, and `TrajectoryOcp` loads a
-cached `.so` rather than regenerating it -- so a weight that is only written into
-the `AcadosOcp` object is inert on every run but the one that built the tree.
-`BAKED` excludes the weights on purpose, so a changed weight does not invalidate
-the cache either, and the whole of `config/crane_planner.yaml`'s `weights` block
-goes quietly dead. Measured before the fix: `weights.time` swept 0.3 to 10 gave
-durations equal to the centisecond and identical iteration counts.
+`W` enters generated code at export time and `TrajectoryOcp` loads a cached `.so`
+rather than regenerating: a weight written only into the `AcadosOcp` object is inert
+on every run but the one that built the tree. `BAKED` excludes weights on purpose,
+so a changed weight does not invalidate the cache either, and the whole `weights`
+block of `config/crane_planner.yaml` goes quietly dead. Measured before the fix:
+`weights.time` swept 0.3 to 10 gave durations equal to the centisecond, identical
+iteration counts.
 
-Costs one solver build on a cold cache. That is the price of covering a
-configuration knob that fails silently.
+Costs one solver build on a cold cache -- price of covering a silently failing
+knob.
 """
 
 from pathlib import Path
@@ -20,13 +20,13 @@ from crane_planning import weights as crane_weights
 from crane_planning.config import PlannerConfig, read_limits
 from crane_planning.ocp import TrajectoryOcp
 
-#: The terminal residual's last row is `theta`, so `weights.time` is the corner
-#: of `W_e` -- one number that says whether the block arrived.
+#: Terminal residual's last row is `theta`, so `weights.time` is `W_e`'s corner --
+#: one number saying whether the block arrived.
 TIME_ROW = -1
 
 
 def description() -> str:
-    """The expanded PZS100 description crane_model keeps as a fixture."""
+    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"

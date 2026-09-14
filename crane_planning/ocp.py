@@ -1,43 +1,34 @@
 """
-The trajectory OCP: its definition, and the solver that answers with it.
+Trajectory OCP: definition + solver.
 
-`x = [sigma, v, a, j, q_u, dq_u, theta]`, `u = s`, on normalised time over [0, 1]
-with
-`theta = T / ocp_horizon` a state whose derivative is zero -- so one solve is
-time-optimal and there is no outer search over the duration.
+`x = [sigma, v, a, j, q_u, dq_u, theta]`, `u = s`, normalised time over [0, 1].
+`theta = T / ocp_horizon` is a zero-derivative state, so one solve is time-optimal
+-- no outer search over duration.
 
-**The machine stays on the certified curve.** `q_a` is not a decision variable:
-the geometric stage hands over `c(sigma)`, the curve `Geometry.check_path`
-certified, and this solver decides only how fast to move along it.
+**Machine stays on the certified curve.** `q_a` is not a decision variable: the
+geometric stage hands over `c(sigma)`, the curve `Geometry.check_path` certified;
+this solver picks speed along it only.
 
     q_a   = c(sigma)
     dq_a  = c'(sigma) v
     ddq_a = c''(sigma) v^2 + c'(sigma) a
 
-with `sigma` integrated four times, so the input is the snap and `q_a(t)` is C4 --
-the derivative count C3's flat inversion consumes. Holding the *acceleration*
-constant per interval, as an input is held, left `q_a(t)` C1 whatever the curve
-was.
+`sigma` integrated four times: input is snap, `q_a(t)` is C4 -- what C3's flat
+inversion consumes. Holding *acceleration* constant per interval left it C1.
 
-So the executed curve *is* the certified curve and the clearance proof holds
-verbatim -- no obstacle rows, no corridor, nothing to re-prove. The stage this
-replaced planned `q_a` freely between two endpoints and left that curve by
-0.84-1.29 m of machine displacement against 0.05 m of spare clearance, which
-voided the proof; measured against it, staying on the curve costs 0.4-4.4% of
-duration and half the SQP iterations.
+Executed curve *is* certified curve, so the clearance proof holds verbatim: no
+obstacle rows, no corridor. Predecessor planned `q_a` freely and left that curve by
+0.84-1.29 m against 0.05 m spare clearance, voiding the proof; staying on it costs
+0.4-4.4% duration and half the SQP iterations. Price: sway damped by *timing* alone.
 
-What it costs is lateral authority: sway can now only be damped by *timing*.
-That is the whole price, and the numbers above are what it comes to.
+Definition lives here, not beside the exporter, because the consumer is Python:
+`scripts/export_timing_ocp.py` is a CLI front end on `build_ocp`, `TrajectoryOcp`
+the same problem with a solver attached.
 
-The definition lives here, not beside the exporter, because this package's
-consumer is Python: `scripts/export_timing_ocp.py` is a CLI front end on
-`build_ocp`, and `TrajectoryOcp` is the same problem with a solver attached.
-
-Every residual row is divided by the limit it is measured against, so 1.0 is the
-bound and `W` is preference alone (see `weights`). Gauss-Newton builds its
-Hessian from `J' W J`, so one row left in physical units sets the conditioning of
-everything: `tau_a` in Nm stalled this solve at a stationarity residual of 1e6,
-and the horizon in seconds cost 40-60x on the same measure.
+Every residual row divided by its limit, so 1.0 is the bound and `W` is preference
+alone (see `weights`). Gauss-Newton builds its Hessian from `J' W J`, so one row in
+physical units sets conditioning of everything: `tau_a` in Nm stalled this solve at
+stationarity residual 1e6, horizon in seconds cost 40-60x.
 """
 
 from __future__ import annotations
@@ -59,14 +50,13 @@ from crane_model import symbolic as cs
 from . import weights as w
 from .config import PlanningError, passive_equilibrium
 
-#: What `scripts/export_timing_ocp.py` writes: source only, pruned, and what
-#: `--check` reviews. Nothing at run time writes here.
+#: What `scripts/export_timing_ocp.py` writes and `--check` reviews: pruned source
+#: only. Nothing at run time writes here.
 GENERATED = Path(__file__).resolve().parent.parent / "generated"
 
-#: Where the solver is compiled, deliberately **outside** the source tree. The
-#: shared exporter normalises every file it ships and cannot walk a `.so`, so a
-#: built tree and a shippable one are not the same tree; keeping the build here
-#: is what stops a run overwriting the artifact under review.
+#: Build dir, **outside** source tree on purpose. Shared exporter normalises what it
+#: ships and cannot walk a `.so`, so built tree != shippable tree; building here stops
+#: a run overwriting the artifact under review.
 CACHE = (
     Path(os.environ.get("CRANE_PLANNING_OCP_CACHE", tempfile.gettempdir()))
     / "crane_planning_ocp"
@@ -77,72 +67,65 @@ DESCRIPTION = "pzs100.urdf"
 SOLVER_NAME = f"crane_planning_ocp_{TOOL}"
 GENERATED_HEADER = "crane_planning_ocp_generated.h"
 
-#: Written beside each built solver: the `cache_key` it was built from. The tree
-#: name is a digest and says nothing about what it holds; this is what lets a
-#: missed prebake name the value that diverged instead of just recompiling.
+#: Written beside each built solver: its `cache_key`. Tree name is a digest, so this
+#: is what lets a missed prebake name the diverged value instead of just recompiling.
 MANIFEST = "cache_key.json"
 
-#: The two hinges the hanging pose is a closed form in. `crane_model.symbolic`
-#: numbers the planned axes but does not name them; `planner.py` carries the same.
+#: Two hinges hanging pose is closed form in. `crane_model.symbolic` numbers planned
+#: axes, names none; `planner.py` carries same.
 BOOM_AXIS = 1
 ARM_AXIS = 2
 
-#: Row order of `x`. The `sigma` chain is contiguous and leads, the passive pair
-#: follows, `theta` is last as the one component the solver picks.
+#: Row order of `x`: `sigma` chain leads contiguous, passive pair, then `theta` --
+#: the one component solver picks.
 X_SIGMA, X_SPEED, X_ACCEL, X_JERK = 0, 1, 2, 3
 X_PASSIVE, X_PASSIVE_RATE, X_HORIZON = 4, 6, 8
 NX, NU = 9, 1
 
-#: Row order of `h`, which the caller reads back and must not re-derive. The
-#: rate and input blocks were boxes on `x` and `u` when `q_a` was planned; they
-#: are nonlinear rows now because what they bound is an expression in `sigma`.
+#: Row order of `h`; caller reads it back, must not re-derive. Rate/input blocks were
+#: boxes on `x`/`u` when `q_a` was planned, nonlinear now: they bound expressions in
+#: `sigma`.
 H_SWAY, H_FLOW, H_RATE = 0, 2, 3
-#: How many rows the sway box occupies, at every stage and at the terminal node
-#: alike. Both nodes order `h` sway-first, so one slice reads the pair on either.
+#: Rows sway box occupies, stage and terminal alike. Both order `h` sway-first, so
+#: one slice reads the pair on either.
 NH_SWAY = 2
 H_ACCEL = 3 + cs.K_PLANNED_DOF
-#: The C3 command itself, `u = dq_a + tau_dot_a / k`, against the domain the
-#: compensator was identified over. It replaced a `dddq_a` row: bounding the
-#: third derivative was only ever a proxy for this, and a decomposed proxy --
-#: reserve the rate, reserve the acceleration, give jerk the remainder -- prices
-#: a sum of worst cases where the machine pays the sum at each instant.
+#: C3 command, `u = dq_a + tau_dot_a / k`, against the domain the compensator was
+#: identified over. Replaced a `dddq_a` row: jerk was only a proxy for this, and a
+#: decomposed proxy -- reserve rate, reserve accel, jerk gets the rest -- prices a sum
+#: of worst cases where the machine pays the sum at each instant.
 H_COMMAND = 3 + 2 * cs.K_PLANNED_DOF
 NH = 3 + 3 * cs.K_PLANNED_DOF
-#: Row order of `h_e`: the settled box the caller accepts.
+#: Row order of `h_e`: settled box caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
-#: Quintic path, so six power-basis coefficients per segment. Degree 5 with
-#: simple interior knots is `C4` in `sigma`, which is what C3's flat inversion
-#: needs -- continuity becomes a property of the parameterization rather than
-#: something a constraint has to enforce.
+#: Quintic path: six power-basis coefficients per segment. Degree 5 with simple
+#: interior knots is `C4` in `sigma`, what C3's flat inversion needs -- continuity
+#: becomes a property of the parameterization, not a constraint to enforce.
 ORDER = 6
 
-#: How many derivative levels the solver builds off the path: `c` through its
-#: fourth, because `q_a(t) = c(sigma(t))` differentiated four times reaches it.
+#: Derivative levels built off path: `c` through its fourth, since
+#: `q_a(t) = c(sigma(t))` differentiated four times reaches it.
 PATH_DERIVATIVES = 5
 
-#: Box on the input, a numerical guard and not a physical limit. `solve` refuses
-#: rather than answer if it binds, because a duration this constant decided is
-#: not the machine's.
+#: Box on input: numerical guard, not a physical limit. `solve` refuses if it binds --
+#: a duration this constant decided is not the machine's.
 #:
-#: It bounded `a` while `a` was the input, at 20.0, where `a` reached 0.01-0.02
-#: of it. It bounds the **snap** now and the old value is two derivatives too
-#: small: at 20.0 four of five bench moves refuse with the guard at exactly 1.00.
-#: Swept 20 / 200 / 2000 / 20000 on the shipped defaults at `speed_scale` 0.9:
-#: the box stops binding at 200, and above it the answer is identical to the
-#: hundredth -- same durations, same `max|s|` of 24.5 / 131.8 / 51.3 / 41.2. So
-#: the solve's own demand is ~132 and 2000 is ~15x headroom, which is what a
-#: guard should be.
+#: Bounded `a` at 20.0 while `a` was the input, where `a` reached 0.01-0.02 of it. Now
+#: bounds **snap**, two derivatives up, so 20.0 refuses four of five bench moves with
+#: the guard at exactly 1.00. Swept 20 / 200 / 2000 / 20000 on shipped defaults at
+#: `speed_scale` 0.9: binding stops at 200, above it answers agree to the hundredth --
+#: same durations, same `max|s|` 24.5 / 131.8 / 51.3 / 41.2. Demand ~132, so 2000 is
+#: ~15x headroom.
 #:
-#: The **command** carries the physical row now (`H_COMMAND`), and it contains
-#: `dddq_a` through `M_ii/k`, so this bounds only the snap and deliberately
-#: loosely: with the command bounded, `q_a''''` is finite whatever this is, and
-#: finite is what a PT1 inversion would need if one were ever done.
+#: `H_COMMAND` carries the physical row now and contains `dddq_a` through `M_ii/k`, so
+#: this bounds only snap, deliberately loosely: with command bounded `q_a''''` is
+#: finite whatever this is, all a PT1 inversion would need.
 SIGMA_INPUT_MAX = 2000.0
 
-#: What the compiled solver's structure depends on. `weights` is deliberately
-#: absent: `W` is a runtime cost field the node writes onto the built solver, so
-#: hashing it would rebuild for a number that changes nothing.
+#: What the compiled solver's structure depends on. `weights` absent on purpose: `W`
+#: is a runtime cost field the node writes onto the built solver, so hashing it would
+#: rebuild for a number that changes nothing.
 BAKED = (
     "ocp_intervals",
     "ocp_horizon",
@@ -160,44 +143,39 @@ BAKED = (
     "path_segments",
 )
 
-#: The integrator, and the stage count that makes each one order 4: ERK wants 4
-#: stages, Gauss-Legendre IRK 2. ERK4 is far cheaper per node but its stability
-#: region is finite and `theta` scales the step, so the choice is not uniform
-#: over the duration box: at `ocp_duration_max` the pendulum (w = 3.6 rad/s)
-#: sits at w*dt = 1.8, where RK4's per-step amplification is 0.854 -- 500x of
-#: fabricated damping over 40 intervals, pricing the sway rows as if the swing
-#: settled on its own. Gauss-Legendre is symplectic, |R(iy)| = 1 at any step, so
-#: it cannot invent that. `SIM_SUBSTEPS` is what keeps ERK honest instead --
-#: see there; the choice stays a knob.
+#: Integrator, and stage count making each order 4: ERK 4, Gauss-Legendre IRK 2. ERK4
+#: is far cheaper per node but its stability region is finite and `theta` scales the
+#: step, so the choice is duration-dependent: at `ocp_duration_max` the pendulum
+#: (w = 3.6 rad/s) sits at w*dt = 1.8, RK4 amplifies 0.854 per step -- 500x fabricated
+#: damping over 40 intervals, pricing sway rows as if the swing settled itself.
+#: Gauss-Legendre is symplectic, |R(iy)| = 1 at any step, cannot invent that.
+#: `SIM_SUBSTEPS` keeps ERK honest instead; stays a knob.
 INTEGRATORS = {"ERK": 4, "IRK": 2}
 
-#: Substeps per shooting interval. Not a knob: answers land at 16 s, not at the
-#: ~7 s the stability argument above was first written for, and one RK4 step per
-#: interval at w*dt = 1.43 amplifies by 0.955 -- 0.16 over 40 intervals, so the
-#: solver believes 84 % of a swing excited early has vanished by the goal. The
-#: sway rows, the settled box and the terminal pin would then be met by the
-#: integrator rather than by the timing. Three substeps put 16 s at 0.991 and
-#: 20 s at 0.965; the quartic reconstruction stays exact because each substep is
-#: still exact on the nilpotent chain.
+#: Substeps per shooting interval. Not a knob: answers land at 16 s, not the ~7 s the
+#: stability argument above assumed, and one RK4 step per interval at w*dt = 1.43
+#: amplifies 0.955 -- 0.16 over 40 intervals, so the solver believes 84 % of an early
+#: swing has vanished by the goal, and sway rows, settled box and terminal pin get met
+#: by the integrator instead of by timing. Three substeps: 16 s at 0.991, 20 s at
+#: 0.965. Quartic reconstruction stays exact, each substep still exact on the nilpotent
+#: chain.
 #:
-#: Measured over the 21 bench moves: no duration moves by more than 0.25 % and no
-#: refusal changes, so the fabricated damping was never what the answers rested
-#: on. This is a correctness fix, not a retiming, and it is free.
+#: Over the 21 bench moves no duration moves more than 0.25 % and no refusal changes:
+#: fabricated damping was never what answers rested on. Correctness fix, free.
 SIM_SUBSTEPS = 3
 
-#: How far under the path's own interior speed its start tangent may be fitted.
-#: The fit leaves along the measured start velocity, so a velocity at the encoder
-#: noise floor pins `c'(0)` at noise magnitude: `start_speed` divides by it, and
-#: the tangent then has to grow two orders inside one knot span. The first QP
-#: dies on that step -- acados status 4 at iteration 1, stationarity sitting at
-#: the slack price, on every goal. Measured live: 179x and 228x on the two noise
-#: starts that failed, 0.9x and 1.2x on the same two from rest. Two observations
-#: either side, so 10 is an order clear of both rather than a fitted number.
+#: Max ratio of interior speed to fitted start tangent. The fit leaves along the
+#: measured start velocity, so a velocity at the encoder noise floor pins `c'(0)` at
+#: noise magnitude, `start_speed` divides by it, and the tangent must grow two orders
+#: inside one knot span. First QP dies there -- acados status 4 at iteration 1,
+#: stationarity at the slack price, on every goal. Measured live: 179x and 228x on the
+#: two noise starts that failed, 0.9x and 1.2x on the same two from rest. Two either
+#: side, so 10 is an order clear of both, not fitted.
 TANGENT_STEP_MAX = 10.0
 
 
 def equilibrium(q_a):
-    """Return where the tool hangs: a two-hinge pendulum hangs straight down."""
+    """Return where tool hangs: two-hinge pendulum hangs straight down."""
     return ca.vertcat(0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi)
 
 
@@ -213,53 +191,50 @@ def description_limits(model) -> tuple:
 
 def baked_parameters(config) -> dict:
     """
-    Read the `BAKED` names off a config. One place, because three callers agree.
+    Read `BAKED` names off a config. One place, three callers agree.
 
-    Building this dict by hand is how a new `BAKED` entry goes missing: the tuple
-    is what `cache_key` iterates, so a name added there and not here is a
-    `KeyError` at best and a wrong hash at worst.
+    Hand-building this dict is how a new `BAKED` entry goes missing: the tuple is what
+    `cache_key` iterates, so a name added there and not here is a `KeyError` at best,
+    a wrong hash at worst.
     """
     return {name: getattr(config, name) for name in BAKED}
 
 
 def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     """
-    Everything a built solver is only valid for. The tree is named after it.
+    Everything a built solver is only valid for. Tree is named after it.
 
-    A cached `.so` is loaded, not compared. Every value that enters the
-    *expressions* or the dimensions therefore has to move the directory, or a
-    changed `ocp_integrator` -- or a changed `path_segments`, which changes the
-    parameter vector itself -- silently answers with the previous build.
+    Cached `.so` is loaded, not compared, so any value entering the *expressions* or
+    the dimensions must move the directory -- else a changed `ocp_integrator`, or a
+    changed `path_segments` which changes the parameter vector itself, silently answers
+    with the previous build.
 
-    The **description** is one of those values and the least visible: the
-    dynamics are built from it, the node builds its planner from whatever
-    `/robot_description` carries, and the exporter bakes from a file on disk.
-    Those two are not the same machine unless someone checked -- the sim's
-    `/robot_description` is a different xacro at `sim_hydraulics:=false` -- so it
-    is hashed here and reported by `divergence` when a prebaked tree is missed.
+    **Description** is the least visible: the node builds its planner from
+    `/robot_description`, the exporter bakes from a file on disk, and those are not the
+    same machine unless someone checked (sim's is a different xacro at
+    `sim_hydraulics:=false`). Hashed here, reported by `divergence` on a miss.
     """
     baked = {}
     for key in BAKED:
         value = parameters[key]
         baked[key] = value.tolist() if hasattr(value, "tolist") else value
     baked["pump_flow_max"] = float(hydraulics["pump_flow_max"])
-    # Not a parameter, so it cannot come from `BAKED`, and it sets the parameter
-    # vector's width: a warm cache built at a different `ORDER` would be handed a
-    # coefficient block of the wrong shape.
+    # Not a parameter, so not from `BAKED`, and it sets parameter vector width: warm
+    # cache at a different `ORDER` gets a coefficient block of the wrong shape.
     baked["path_order"] = ORDER
-    # Same reasoning for the state count: it is the solver's shape, not a
-    # parameter, and a cached `.so` is loaded rather than compared.
+    # Same for state count: solver shape, not a parameter, and cached `.so` is loaded
+    # rather than compared.
     baked["nx"] = NX
-    # And for the substep count: it is compiled into the integrator, so a cache
-    # built at one value would keep answering with that integrator's damping.
+    # And substep count: compiled into the integrator, so a cache built at one value
+    # keeps answering with that integrator's damping.
     baked["sim_substeps"] = SIM_SUBSTEPS
-    # `ocp_integrator` names the method, `INTEGRATORS` decides its order, and only
-    # the name is a config value -- editing the map alone would load the old order.
+    # `ocp_integrator` names the method, `INTEGRATORS` decides its order, and only the
+    # name is a config value -- editing the map alone would load the old order.
     baked["sim_stages"] = INTEGRATORS[parameters["ocp_integrator"]]
-    # How many levels `path_expression` builds, i.e. how long the chain is.
+    # Levels `path_expression` builds, i.e. chain length.
     baked["path_derivatives"] = PATH_DERIVATIVES
-    # The machine itself: masses, inertias, limits and the linkage the dynamics
-    # are generated from. Hashed, not stored -- a URDF is megabytes.
+    # The machine: masses, inertias, limits, linkage the dynamics come from. Hashed,
+    # not stored -- a URDF is megabytes.
     baked["description"] = hashlib.sha1(description.encode()).hexdigest()
     return baked
 
@@ -284,25 +259,22 @@ class SolverNotExported(RuntimeError):
     """No compiled solver for the description and settings the node was handed."""
 
 
-#: The four KKT residuals acados stops on, in the order it returns them.
+#: Four KKT residuals acados stops on, in the order it returns them.
 RESIDUALS = ("stationarity", "equality", "inequality", "complementarity")
 
-#: Above this the solve paid the L1 price rather than met the soft bound. One
-#: constant, because the log line and `~/solver_stats` disagreeing about whether
-#: slack was spent is the kind of contradiction nobody reconciles at 2 a.m.
+#: Above this, solve paid L1 price instead of meeting soft bound. One constant, so log
+#: line and `~/solver_stats` never disagree.
 #:
-#: **1e-6 and not the 1e-9 the log clause used to carry.** Two converged bench
-#: solves off `test_jerk_bound`'s description report 1.3e-9 and 1.6e-8 of slack
-#: with every soft bound met -- that is the QP's own floor, three to five orders
-#: under `ocp_tolerance`, and 1e-9 sits below it, so the clause printed "on
-#: 0.000 of slack" on every plan. A severity that fires on every plan is not
-#: one. Two solves is a floor observation, not a fitted number; raise it if a
-#: real violation ever lands under it.
+#: 1e-6 not 1e-9: two converged bench solves off `test_jerk_bound`'s description report
+#: 1.3e-9 and 1.6e-8 slack with every soft bound met -- QP's own floor, three to five
+#: orders under `ocp_tolerance`. 1e-9 sits below it, so old clause fired on every plan.
+#: Floor observation from two solves, not fitted; raise if a real violation lands under
+#: it.
 SLACK_SPENT = 1e-6
 
-#: What the answer costs, as against how hard it was to find. Present on every
-#: report and `nan` wherever no `Trajectory` was built, so a consumer reads one
-#: set of keys and never has to branch on the outcome to know what arrived.
+#: What answer costs, as against how hard it was to find. Present on every report, `nan`
+#: wherever no `Trajectory` was built, so a consumer reads one key set and never
+#: branches on the outcome to know what arrived.
 PLAN_ROWS = (
     "slack",
     "sway_slack",
@@ -317,16 +289,14 @@ def solver_stats(solver, status: int, elapsed: float) -> dict:
     """
     One solve as flat named numbers -- what `~/solver_stats` carries.
 
-    Built off the solver and **once**, before the outcome is branched on, so the
-    keys do not depend on whether it converged: a diagnostics stream that
-    reports fewer numbers exactly when it failed is the wrong way round. Read a
-    regression off the iteration counts and the residuals against
+    Built off the solver **once**, before the outcome is branched on, so the keys do
+    not depend on convergence: reporting fewer numbers exactly when it failed is the
+    wrong way round. Read a regression off iteration counts and residuals against
     `ocp_tolerance`, never off a time -- all three are load-bound.
 
-    `qp_iter` and `qp_stat` are **vectors**, one entry per SQP iteration, so the
-    total and the worst are what a scalar row can honestly carry. The QP status
-    is worth its own key rather than being folded into `acados_status`: acados
-    reports a QP that merely hit HPIPM's iteration limit as a success.
+    `qp_iter` and `qp_stat` are **vectors**, one entry per SQP iteration, so total and
+    worst are what a scalar row can carry. QP status gets its own key: acados reports a
+    QP that merely hit HPIPM's iteration limit as a success.
     """
     qp_iterations = np.asarray(solver.get_stats("qp_iter"), dtype=float)
     qp_status = np.asarray(solver.get_stats("qp_stat"), dtype=float)
@@ -351,17 +321,15 @@ def solver_stats(solver, status: int, elapsed: float) -> dict:
 
 def slack_spent(solver, N: int) -> tuple:
     """
-    Report what the answer paid on the soft rows: the worst of any, and sway's.
+    Report what the answer paid on the soft rows: worst of any, and sway's.
 
-    **Both sides.** `sl` alone was the whole report, and on a box symmetric about
-    zero that misses every violation overshooting the *upper* bound -- half of
-    them, and on sway the half that swings the tool whichever way the scene
-    happens to sit.
+    **Both sides.** `sl` alone was the whole report; on a box symmetric about zero that
+    misses every overshoot of the *upper* bound -- half of them, and on sway the half
+    that swings the tool whichever way the scene sits.
 
-    The sway figure excludes node `N`, whose sway rows carry the *settled* box an
-    order tighter rather than the envelope. Missing that is an arrival that is not
-    still yet, which `Planner.plan` already reports in radians; folding it in here
-    would have the envelope number fire on it.
+    Excludes node `N`, whose sway rows carry the *settled* box an order tighter, not
+    the envelope. Missing that is an arrival that is not still yet, which
+    `Planner.plan` already reports in radians.
     """
     slack, sway_slack = 0.0, 0.0
     for node in range(N + 1):
@@ -379,10 +347,10 @@ def divergence(key: dict) -> list:
     """
     Say which baked names separate `key` from each solver already in the cache.
 
-    The hash decides *that* a prebaked tree was missed; this says *what* missed
-    it, which is the whole difference between "recompiling, three minutes" and
-    "you are about to plan for a machine nobody exported for". `description`
-    appearing here means the model diverged, not a setting.
+    Hash decides *that* a prebaked tree was missed; this says *what* missed it -- the
+    difference between "recompiling, three minutes" and "you are about to plan for a
+    machine nobody exported for". `description` here means the model diverged, not a
+    setting.
     """
     lines = []
     for manifest in sorted(CACHE.glob(f"{SOLVER_NAME}_*/{MANIFEST}")):
@@ -404,11 +372,10 @@ def power_coefficients(path, segments: int) -> np.ndarray:
     """
     `(segments, ORDER, 5)`: `c(sigma) = sum_m a[k, m] (sigma - k/S)^m` on segment k.
 
-    A power basis on uniform breakpoints, not the B-spline basis, because the
-    solver has to select a segment symbolically and uniform breakpoints make that
-    a `floor` instead of a knot search. `geometry.fit` places its interior knots
-    on `linspace(0, 1, path_segments + 1)` and always uses all of them, so nothing
-    is approximated here -- the conversion is exact, and it is checked.
+    Power basis on uniform breakpoints, not B-spline: the solver selects a segment
+    symbolically and uniform breakpoints make that a `floor`, not a knot search.
+    `geometry.fit` puts interior knots on `linspace(0, 1, path_segments + 1)` and uses
+    all of them, so the conversion is exact -- and checked.
     """
     spline = path.spline
     breaks = np.unique(spline.t)
@@ -419,9 +386,8 @@ def power_coefficients(path, segments: int) -> np.ndarray:
             f"the fitted path carries {len(breaks) - 1} segments, but the solver "
             f"was generated for {segments}; its parameter vector is that shape"
         )
-    # `geometry.fit`'s degree and `ORDER` are one number written in two places,
-    # and the failure if they drift is silent: a shorter power basis truncates
-    # the curve instead of refusing it.
+    # `geometry.fit`'s degree and `ORDER` are one number in two places, and failure if
+    # they drift is silent: short power basis truncates the curve, does not refuse it.
     if spline.k != ORDER - 1:
         raise PlanningError(
             f"the fitted path is degree {spline.k}, but the solver carries "
@@ -440,9 +406,8 @@ def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
     """
     `c(sigma)` and its derivatives, from the coefficients the solver is handed.
 
-    Deliberately a mirror of `path_expression` and not a call into the spline:
-    what is reported back has to be what was constrained, and the two would drift
-    the moment the segment lookup differed.
+    Deliberately a mirror of `path_expression`, not a call into the spline: reported
+    must equal constrained, and the two drift the moment the segment lookup differs.
     """
     sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
     segments = coefficients.shape[0]
@@ -459,17 +424,16 @@ def path_expression(sigma, coefficients, segments: int) -> list:
     """
     `PATH_DERIVATIVES` levels of the path as `casadi.SX`, coefficients symbolic.
 
-    One loop over derivative order rather than a branch per level, so raising
-    `ORDER` is a constant change and not an edit here. It is the symbolic mirror
-    of `evaluate` and the two must agree at every level.
+    One loop over derivative order, not a branch per level, so raising `ORDER` is a
+    constant change. Symbolic mirror of `evaluate`; the two must agree at every level.
     """
     index = ca.fmin(ca.fmax(ca.floor(sigma * segments), 0.0), segments - 1)
     local = sigma - index / segments
     value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(PATH_DERIVATIVES)]
     for segment in range(segments):
-        # A comparison carries no derivative in casadi, so `d/dsigma` of the sum
-        # is the selected polynomial's own derivative -- which is what is wanted,
-        # and correct at a breakpoint because the curve is C4 across it.
+        # A comparison carries no derivative in casadi, so `d/dsigma` of the sum is the
+        # selected polynomial's own derivative -- what is wanted, and correct at a
+        # breakpoint because the curve is C4 across it.
         on = index == segment
         for m in range(ORDER):
             first = (segment * ORDER + m) * cs.K_PLANNED_DOF
@@ -513,38 +477,32 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     q_u = ca.SX.sym("q_u", cs.K_PASSIVE_DOF)
     speed = ca.SX.sym("v")
     dq_u = ca.SX.sym("dq_u", cs.K_PASSIVE_DOF)
-    # `theta = T / T_nominal`, one decision variable shared by every node. acados
-    # fixes `p` for a solve, so a horizon the solver picks cannot live there.
+    # `theta = T / T_nominal`, one decision variable shared by every node. acados fixes
+    # `p` for a solve, so a horizon the solver picks cannot live there.
     theta = ca.SX.sym("theta")
-    # The chain: `a` and `j` are states now, `s` is the input. Holding the
-    # *acceleration* constant per interval, as acados does with an input, made
-    # `ddq_a` discontinuous and `q_a(t)` C1 whatever the curve was; holding the
-    # snap constant leaves `q_a(t)` C4, which is what C3's inversion consumes.
+    # Chain: `a` and `j` are states, `s` the input. Holding *acceleration* constant per
+    # interval, as acados does with an input, made `ddq_a` discontinuous and `q_a(t)` C1
+    # whatever the curve; holding snap constant leaves C4, what C3's inversion consumes.
     acceleration = ca.SX.sym("a")
     jerk = ca.SX.sym("j")
     snap = ca.SX.sym("s")
-    #: The path, as `p`: `path_segments` fixes the knot vector, so only these
-    #: numbers change between requests and the solver is generated once.
+    #: Path, as `p`: `path_segments` fixes the knot vector, so only these numbers change
+    #: between requests and the solver is generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
 
-    centre, tangent, curvature, third = path_expression(sigma, coefficients, segments)[
-        :4
-    ]
-    q_a = centre
-    # Faa di Bruno on `q_a(t) = c(sigma(t))`. No `theta` here: `f_expl_expr`
-    # carries `nominal * theta`, so `v` is d sigma/dt in physical seconds
-    # already and these are the physical derivatives the limits are written
-    # against. The snap level is deliberately not built: bounding the jerk plus
-    # the input box already leaves `q_a''''` finite, which is all the command
-    # PT1 inversion needs, and a fourth row costs solve time on a problem that
-    # is already the expensive half of the plan.
+    q_a, tangent, curvature, third = path_expression(sigma, coefficients, segments)[:4]
+    # Faa di Bruno on `q_a(t) = c(sigma(t))`. No `theta`: `f_expl_expr` carries
+    # `nominal * theta`, so `v` is d sigma/dt in physical seconds and these are the
+    # physical derivatives the limits are written against. Snap level deliberately not
+    # built: jerk bound plus input box already leaves `q_a''''` finite, all the command
+    # PT1 inversion needs, and a fourth row costs solve time on the expensive half.
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration
     dddq_a = third * speed**3 + 3.0 * curvature * speed * acceleration + tangent * jerk
     sway = q_u - equilibrium(q_a)
 
     # Everything about the machine is `crane_model`'s, reached by substituting the
-    # eliminated coordinates into its graph rather than by rebuilding it.
+    # eliminated coordinates into its graph rather than rebuilding it.
     planned = ca.vertcat(model.x, model.u)
     moving = ca.vertcat(q_a, q_u, dq_a, dq_u, ddq_a)
     ddq_u = ca.substitute(model.ddq_u, planned, moving)
@@ -566,34 +524,27 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
         nominal * theta * ca.vertcat(speed, acceleration, jerk, snap, dq_u, ddq_u),
         0.0,
     )
-    # acados does not derive one form from the other: ERK reads `f_expl_expr`,
-    # IRK reads `f_impl_expr` and errors on an empty one. Both are set here
-    # unconditionally so switching integrator is a solver option, not a re-model.
+    # acados derives neither form from the other: ERK reads `f_expl_expr`, IRK reads
+    # `f_impl_expr` and errors on an empty one. Both set unconditionally, so switching
+    # integrator is a solver option, not a re-model.
     acados_model.xdot = ca.SX.sym("xdot", NX)
     acados_model.f_impl_expr = acados_model.xdot - acados_model.f_expl_expr
 
-    # What `AddC3Feedforward` will actually command for this plan, in its own
-    # arithmetic: `u_d = qdot_d + tau_dot_d / k_i` (`c3_feedforward_math.hpp`),
-    # with `tau` the same RNEA over all eight coordinates the node evaluates.
-    # `jtimes` against the state derivative is the exact total derivative --
-    # d tau/dq qdot + d tau/dqdot qddot + M qdddot, passive coupling included --
-    # and it is the expression issue 114 needs, so it is built once, here.
+    # What `AddC3Feedforward` will command: `u_d = qdot_d + tau_dot_d / k_i`, `tau` the
+    # same RNEA over all eight coordinates the node evaluates. `jtimes` against the
+    # state derivative is the exact total derivative -- d tau/dq qdot + d tau/dqdot
+    # qddot + M qdddot, passive coupling included. Built once, here.
     #
-    # Convention: `tau_a` is `crane_model`'s, which carries the mimic coupling and
-    # the transmission projection, while `command_k` was identified against a
-    # plain CRBA -- the two differ by 1.09x to 3.40x and the factor is
-    # pose-dependent, so it cannot be absorbed into a constant. The node divides
-    # exactly this `tau` by exactly this `k`, so the planner refuses what the
-    # machine will actually be asked for; correcting the convention corrects both
-    # at once. See `issues/open/113`'s notes.
+    # `tau_a` is `crane_model`'s (mimic coupling + transmission projection), `command_k`
+    # was identified against a plain CRBA: they differ 1.09x-3.40x, pose-dependent, not
+    # absorbable into a constant. The node divides exactly this `tau` by exactly this
+    # `k`, so the planner refuses what the machine will actually be asked for.
     #
-    # `f_expl_expr` is `dx/dtau` on acados' own `[0, 1]` grid -- it carries the
-    # `nominal * theta` scaling -- so `jtimes` against it gives `d tau_a/dtau`,
-    # which is `T` times the physical derivative. Dividing it back out is what
-    # makes this row a command and not a command times the answer's own duration:
-    # left in, the row's acceleration coefficient was `T D_ii/k` against a
-    # physical `d_i/k`, so it tightened as the answer lengthened and the horizon
-    # state appeared in `con_h` where no other row uses it.
+    # `f_expl_expr` is `dx/dtau` on acados' `[0, 1]` grid and carries `nominal * theta`,
+    # so `jtimes` gives `d tau_a/dtau` = `T` x physical. Divide it back out or the row
+    # is a command times the answer's own duration: left in, the acceleration
+    # coefficient was `T D_ii/k` against a physical `d_i/k`, tightening as the answer
+    # lengthened, and the horizon state appeared in `con_h` where no other row uses it.
     tau_dot_a = ca.jtimes(tau_a, acados_model.x, acados_model.f_expl_expr) / (
         nominal * theta
     )
@@ -604,11 +555,10 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # ----------------------------------------------------------------- the cost
 
-    # `tau_a` minus its value at rest on the same configuration. 91% of the raw
-    # effort integral is gravity plus held load, which no timing choice changes,
-    # so a residual against zero prices holding the block and is blind to what
-    # shakes the boom. Substituting hanging pendulum, zero rates and zero input
-    # into the same graph isolates the dynamic part exactly.
+    # `tau_a` minus its value at rest on the same configuration. 91% of the raw effort
+    # integral is gravity plus held load, which no timing choice changes, so a residual
+    # against zero prices holding the block and is blind to what shakes the boom. Hanging
+    # pendulum, zero rates, zero input into the same graph isolates the dynamic part.
     at_rest = ca.vertcat(
         q_a,
         equilibrium(q_a),
@@ -618,9 +568,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     )
     tau_static = ca.substitute(model.tau_a[: cs.K_PLANNED_DOF], planned, at_rest)
 
-    # Each row over its own limit, so 1.0 means "at the bound" on every row alike.
-    # No `q_a` row: the goal is the end of the curve, and tracking a position the
-    # machine is on by construction only adds a stiff direction to the Hessian.
+    # Each row over its own limit, so 1.0 means "at the bound" everywhere. No `q_a` row:
+    # goal is the end of the curve, and tracking a position the machine is on by
+    # construction only adds a stiff direction to the Hessian.
     residual = ca.vertcat(
         dq_a / dq_max,
         sway / q_sway_max,
@@ -640,9 +590,8 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.model = acados_model
     ocp.parameter_values = np.zeros(cs.NP + segments * ORDER * cs.K_PLANNED_DOF)
 
-    # The yaml's weights baked as defaults. Still runtime-settable -- the node
-    # writes its own onto the built solver -- so a weight change needs no
-    # re-export.
+    # Yaml weights baked as defaults. Still runtime-settable -- node writes its own onto
+    # the built solver -- so a weight change needs no re-export.
     stage_w, terminal_w = w.matrices(parameters["weights"])
     if (residual.shape[0], terminal_residual.shape[0]) != (w.NY, w.NY_E):
         raise ValueError(
@@ -656,10 +605,10 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # ---------------------------------------------------------- the constraints
 
-    # No cylinder-force row: it was the smaller chamber area times a relief
-    # pressure nothing in this workspace has measured. No `q_a` range row either
-    # -- `q_a` is on the certified curve for every `sigma` in [0, 1], and `fit`
-    # already refuses a curve that leaves joint range.
+    # No cylinder-force row: it was the smaller chamber area times a relief pressure
+    # nothing in this workspace has measured. No `q_a` range row either -- `q_a` is on
+    # the certified curve for every `sigma` in [0, 1], and `fit` already refuses a curve
+    # leaving joint range.
     pump_max = float(hydraulics["pump_flow_max"])
     scale = np.concatenate([q_sway_max, [pump_max], dq_max, ddq_a_max, command_ref])
     scale_e = np.concatenate([q_sway_max, dq_sway_max])
@@ -673,10 +622,10 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     acados_model.con_h_expr = acados_model.con_h_expr_0
     acados_model.con_h_expr_e = ca.vertcat(sway, dq_u) / scale_e
 
-    # Bounds below are placeholders the caller overwrites; what is baked is which
-    # rows exist and which are soft. Stage 0's box is the measured state, over
-    # `NX - 1` because the horizon is the one component of `x` the solver picks.
-    # `constraints.x0` would pin it and freeze the objective.
+    # Bounds below are placeholders the caller overwrites; baked is which rows exist and
+    # which are soft. Stage 0's box is the measured state, over `NX - 1` because the
+    # horizon is the one component of `x` the solver picks; `constraints.x0` would pin
+    # it and freeze the objective.
     ocp.constraints.idxbx_0 = np.arange(NX - 1)
     ocp.constraints.lbx_0 = np.zeros(NX - 1)
     ocp.constraints.ubx_0 = np.zeros(NX - 1)
@@ -693,11 +642,11 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.constraints.lh_e = -np.ones(NH_E)
     ocp.constraints.uh_e = np.ones(NH_E)
 
-    # L1, never quadratic: a quadratic price is cheap near the boundary and leaks
-    # violation everywhere, a linear one with a big enough coefficient is exact.
-    # Soft rows are the ones a caller would rather have late than refused -- sway,
-    # pump, settled box. Rate, input and progress stay hard: violating those is
-    # not a slower plan, it is a wrong one.
+    # L1, never quadratic: quadratic price is cheap near the boundary and leaks
+    # violation everywhere; linear with a big enough coefficient is exact. Soft rows are
+    # what a caller would rather have late than refused -- sway, pump, settled box.
+    # Rate, input and progress stay hard: violating those is not a slower plan but a
+    # wrong one.
     soft = np.arange(H_RATE)
     ocp.constraints.idxsh_0 = soft
     ocp.constraints.idxsh = soft
@@ -710,7 +659,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     # -------------------------------------------------------------- the backend
 
-    # Normalised time: the grid is [0, 1] and the horizon is `theta * T_nominal`.
+    # Normalised time: grid is [0, 1], horizon is `theta * T_nominal`.
     ocp.solver_options.N_horizon = int(parameters["ocp_intervals"])
     ocp.solver_options.tf = 1.0
     ocp.solver_options.nlp_solver_type = "SQP"
@@ -718,19 +667,18 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = integrator
-    # Read for IRK only. Radau IIA is L-stable and damps the swing harder than
-    # ERK4 already does, which is the wrong direction for an anti-sway problem.
+    # Read for IRK only. Radau IIA is L-stable and damps the swing harder than ERK4
+    # already does -- wrong direction for anti-sway.
     ocp.solver_options.collocation_type = "GAUSS_LEGENDRE"
     ocp.solver_options.sim_method_num_stages = INTEGRATORS[integrator]
     ocp.solver_options.sim_method_num_steps = SIM_SUBSTEPS
     ocp.solver_options.globalization = "MERIT_BACKTRACKING"
     ocp.solver_options.regularize_method = "NO_REGULARIZE"
     ocp.solver_options.levenberg_marquardt = float(parameters["levenberg_marquardt"])
-    # Set, not acados' 1e-6 default, which is a control-loop number. A plan is
-    # resampled onto a 25 Hz reference and tracked by a controller closing the
-    # loop on it, so the last two decades buy nothing and cost plenty: a solve
-    # landing at 1.69e-6 spent sixty iterations and eleven seconds failing to
-    # halve it, one landing at 5.39e-7 finished in six.
+    # Set, not acados' 1e-6 default, a control-loop number. A plan is resampled onto a
+    # 25 Hz reference and tracked by a controller closing the loop on it, so the last two
+    # decades buy nothing and cost plenty: a solve landing at 1.69e-6 spent sixty
+    # iterations and eleven seconds failing to halve it, one at 5.39e-7 finished in six.
     tolerance = float(parameters["ocp_tolerance"])
     for condition in ("stat", "eq", "ineq", "comp"):
         setattr(ocp.solver_options, f"nlp_solver_tol_{condition}", tolerance)
@@ -747,16 +695,14 @@ class Trajectory:
     dq_a: np.ndarray
     ddq_a: np.ndarray  # what the acceleration rows bound
     dddq_a: np.ndarray  # what the C3 inversion pays for, third term
-    #: `u_d = dq_a + tau_dot_a / k` per axis, what `AddC3Feedforward` will
-    #: command. This is the row `H_COMMAND` bounds.
+    #: `u_d = dq_a + tau_dot_a / k` per axis, what `AddC3Feedforward` will command. The
+    #: row `H_COMMAND` bounds.
     command: np.ndarray
-    #: The path state itself, and the coefficients it indexes. `q_a` is a
-    #: function of these and not an independent answer, so a consumer that has to
-    #: resample must resample `sigma` and evaluate the curve -- interpolating
-    #: `q_a` leaves the certified curve for the chord between two of its points.
-    #: `snap` is the solver's own input, repeated at `N` so every array here is
-    #: `N+1` long; acados holds it constant across an interval, which makes
-    #: `sigma` exactly quartic in time there.
+    #: Path state, and the coefficients it indexes. `q_a` is a function of these, not an
+    #: independent answer, so resampling means resampling `sigma` and evaluating the
+    #: curve -- interpolating `q_a` leaves the certified curve for a chord. `snap` is
+    #: the solver's own input, repeated at `N` so every array here is `N+1` long; acados
+    #: holds it constant across an interval, making `sigma` exactly quartic there.
     sigma: np.ndarray  # (N+1,)
     speed: np.ndarray  # (N+1,)
     acceleration: np.ndarray  # (N+1,)
@@ -768,36 +714,34 @@ class Trajectory:
     q_u_eq: np.ndarray
     pump_flow: np.ndarray  # (N+1,) as a fraction of the physical pump
     slack: float
-    #: The share of `slack` spent on the sway box alone, over the stage nodes, in
-    #: units of `q_sway_max`. Its own number because the clearance certificate
-    #: rests on that box and on no other soft row: `Geometry` builds the envelope
-    #: from `q_sway_max`, so sway bought with slack is a plan that swings outside
-    #: the envelope the geometric stage proved clear. Pump slack is a different
-    #: and lesser matter, and a single maximum could not tell them apart.
+    #: Share of `slack` spent on the sway box alone, over stage nodes, in units of
+    #: `q_sway_max`. Its own number because the clearance certificate rests on that box
+    #: and no other soft row: `Geometry` builds the envelope from `q_sway_max`, so sway
+    #: bought with slack swings outside the envelope the geometric stage proved clear.
+    #: Pump slack is lesser, and a single maximum could not tell them apart.
     sway_slack: float
     iterations: int
     solve_time_s: float  # wall clock around the call, so it carries Python and load
     #: acados' `time_tot` and the four KKT residuals it stopped on. Wall clock is
-    #: load-bound -- the same solve measured 0.53 s idle, 4.97 s under a running
-    #: Gazebo -- so read a regression off the iteration count and these residuals
-    #: against `ocp_tolerance`, never off the time.
+    #: load-bound -- same solve measured 0.53 s idle, 4.97 s under a running Gazebo --
+    #: so read a regression off the iteration count and these residuals against
+    #: `ocp_tolerance`, never off the time.
     acados_time_s: float
     residuals: np.ndarray  # (4,) stationarity, equality, inequality, complementarity
-    #: The same solve as flat named numbers, for `~/solver_stats`. Carried
-    #: rather than derived, because the refusals raised *after* this object is
-    #: built report the identical shape and must not rebuild it differently.
+    #: Same solve as flat named numbers, for `~/solver_stats`. Carried, not derived:
+    #: refusals raised *after* this object is built report the identical shape and must
+    #: not rebuild it differently.
     stats: dict
 
     def report(self) -> dict:
         """
-        `stats` with `PLAN_ROWS` filled in: the whole report for a built plan.
+        `stats` with `PLAN_ROWS` filled in: whole report for a built plan.
 
-        The solver half says how hard the answer was to find, this half says
-        what it costs. They are separable and the second is the one that matters
-        once a solve converges: a plan bought with `slack` violated a soft bound
-        -- the sway box, the settled box or the planning share of the pump --
-        and still drives the machine, which a clean residual vector says nothing
-        about. `pump_flow_peak` is already a fraction of the physical pump.
+        Solver half says how hard the answer was to find, this half what it costs. The
+        second matters once a solve converges: a plan bought with `slack` violated a
+        soft bound -- sway box, settled box, planning share of the pump -- and still
+        drives the machine, which a clean residual vector says nothing about.
+        `pump_flow_peak` is already a fraction of the physical pump.
         """
         return self.stats | {
             "slack": float(self.slack),
@@ -825,11 +769,10 @@ class Trajectory:
 
 class TrajectoryOcp:
     """
-    The generated solver, with the bounds one request needs written onto it.
+    Generated solver, with the bounds one request needs written onto it.
 
-    Built once. acados regenerates and recompiles into `cache_tree`, outside the
-    source tree -- seconds on a warm tree, minutes on a cold one. Construction-time
-    work, not per-request work.
+    Built once. acados regenerates and recompiles into `cache_tree`, outside the source
+    tree -- seconds warm, minutes cold. Construction-time work, not per-request.
     """
 
     def __init__(
@@ -844,20 +787,19 @@ class TrajectoryOcp:
         self.segments = int(config.path_segments)
         baked = baked_parameters(config)
         hydraulics = {"pump_flow_max": config.pump_flow_max}
-        # **Generated by `scripts/export_timing_ocp.py`, not here.** Loads a built
-        # tree; builds one on first construction, costing minutes. Regenerating
-        # unconditionally would overwrite the exporter's output and make `--check`
-        # meaningless. Decided before `build_ocp`, so a refusal costs nothing.
+        # **Generated by `scripts/export_timing_ocp.py`, not here.** Loads a built tree;
+        # builds one on first construction, costing minutes. Regenerating unconditionally
+        # would overwrite the exporter's output and make `--check` meaningless. Decided
+        # before `build_ocp`, so a refusal costs nothing.
         key = cache_key(baked, hydraulics, description_xml)
-        #: Which built solver answered. Reported by the node, so a run says on
-        #: disk what it planned with.
+        #: Which built solver answered. Reported by the node, so a run says on disk what
+        #: it planned with.
         self.tree = tree = tree_of(key)
-        library = tree / f"libacados_ocp_solver_{SOLVER_NAME}.so"
-        fresh = not library.is_file()
+        fresh = not (tree / f"libacados_ocp_solver_{SOLVER_NAME}.so").is_file()
         if fresh and not build_missing:
-            # The node takes this path: a miss means the live description or a
-            # setting is not the one anything was exported for, and compiling it
-            # here would answer minutes later for a machine nobody reviewed.
+            # Node takes this path: a miss means the live description or a setting is not
+            # what anything was exported for, and compiling here would answer minutes
+            # later for a machine nobody reviewed.
             raise SolverNotExported(
                 "\n".join(
                     [
@@ -874,8 +816,8 @@ class TrajectoryOcp:
         ocp, self.scale, model = build_ocp(
             description_xml, {**baked, "weights": weights}, hydraulics
         )
-        # The pump row in the *unreduced* coordinates, off the graph the solver
-        # constrains, so reported and bounded cannot drift apart.
+        # Pump row in the *unreduced* coordinates, off the graph the solver constrains,
+        # so reported and bounded cannot drift apart.
         flow = ca.sum1(
             model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
         )
@@ -885,9 +827,9 @@ class TrajectoryOcp:
         self.nominal = float(config.ocp_horizon)
         CACHE.mkdir(parents=True, exist_ok=True)
         if fresh:
-            # Loud, because the honest cause is usually not "nothing is exported"
-            # but "what is exported is for another machine or another setting",
-            # and the recompile hides that behind three quiet minutes.
+            # Loud: the honest cause is usually not "nothing is exported" but "what is
+            # exported is for another machine or setting", and the recompile hides that
+            # behind three quiet minutes.
             print(
                 "\n".join(
                     [
@@ -912,14 +854,12 @@ class TrajectoryOcp:
         )
         if fresh:
             write_manifest(tree, key)
-        # `W` reaches the generated code only at export time, and a cached `.so`
-        # is *loaded*, not regenerated -- so without this the weights a caller
-        # passes are inert on every run but the one that built the tree, and
-        # `BAKED` excludes them so nothing invalidates the cache either. Swept
-        # `weights.time` over 0.3 to 10 on a warm cache and got durations equal
-        # to the centisecond; rebuilt cold at 10, two moves that had refused
-        # converged and durations fell 17-18%. Writing it here is what the
-        # `BAKED` docstring already claims happens.
+        # `W` reaches generated code only at export time and a cached `.so` is *loaded*,
+        # not regenerated, so without this the weights a caller passes are inert on
+        # every run but the one that built the tree -- and `BAKED` excludes them, so
+        # nothing invalidates the cache either. Swept `weights.time` 0.3 to 10 warm:
+        # durations equal to the centisecond; rebuilt cold at 10, two moves that had
+        # refused converged and durations fell 17-18%.
         stage_w, terminal_w = w.matrices(weights)
         for node in range(self.N):
             self.solver.cost_set(node, "W", stage_w)
@@ -929,10 +869,10 @@ class TrajectoryOcp:
         """
         Return `v(0)` from the measured start velocity, and how much is lost.
 
-        A motion confined to the path can only leave along its tangent, so a
-        start velocity off it is not representable at all. The projection is the
-        best available answer and the residual says how wrong it is; `solve`
-        refuses rather than start from a state the machine is not in.
+        A motion confined to the path can only leave along its tangent, so a start
+        velocity off it is not representable. The projection is the best answer
+        available, the residual says how wrong it is; `solve` refuses rather than start
+        from a state the machine is not in.
         """
         tangent = evaluate(coefficients, 0.0, order=1)[0]
         dq_a_start = np.asarray(dq_a_start, dtype=float)
@@ -955,19 +895,17 @@ class TrajectoryOcp:
         """Solve one request, or refuse with what the solver said."""
         cfg, lim, N = self.config, self.limits, self.N
         solver, big = self.solver, 1.0e6
-        # `CalcMovement.slow_down` is a "divider to reduce max speed/acceleration",
-        # and the reference server divides qDotMax, qDDotMax and qDDDotMax by it
-        # alike (`mp_crane_lib_helpers.hpp` `apply_slow_down`). Uniform time
-        # scaling would give s**k on the k-th derivative, but it is not a symmetry
-        # of this problem -- the pendulum period is fixed, so an s**2 acceleration
-        # ceiling takes away the authority a solve needs to cancel sway at the
-        # swing frequency and it refuses instead of slowing down. The jerk ceiling
-        # is a valve budget, not a comfort choice, and scaling it at all is
-        # unnecessary; it is scaled only to stay one rule with the other two.
+        # `CalcMovement.slow_down` is a "divider to reduce max speed/acceleration", and
+        # the reference server divides qDotMax, qDDotMax and qDDDotMax by it alike.
+        # Uniform time scaling would give s**k on the k-th derivative, but that is no
+        # symmetry here: pendulum period is fixed, so an s**2 acceleration ceiling takes
+        # away the authority needed to cancel sway at the swing frequency and the solve
+        # refuses instead of slowing down. Jerk ceiling is a valve budget, not comfort;
+        # scaled only to stay one rule with the other two.
         rate_hi = accel_hi = cfg.kappa * speed_scale
-        # The command row is not scaled by `speed_scale`: `slow_down` is a request
-        # to move more gently, not a claim that the valve's domain shrank. `kappa`
-        # still applies -- it is the deployment reservation on every limit.
+        # Command row not scaled by `speed_scale`: `slow_down` asks to move more gently,
+        # it does not claim the valve's domain shrank. `kappa` still applies -- it is the
+        # deployment reservation on every limit.
         reference = np.maximum(np.abs(cfg.command_u_min), cfg.command_u_max)
         command_lo = cfg.kappa * cfg.command_u_min / reference
         command_hi = cfg.kappa * cfg.command_u_max / reference
@@ -975,20 +913,19 @@ class TrajectoryOcp:
         theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
 
         speed_start, unrepresentable = self.start_speed(coefficients, dq_a_start)
-        # 1e-6 rad/s is measurement noise; above it the path's tangent is not the
-        # direction the machine is already going, and projecting silently would
-        # put the solve on a state it is not in.
+        # 1e-6 rad/s is measurement noise; above it the path tangent is not the
+        # direction the machine is already going, and projecting silently would put the
+        # solve on a state it is not in.
         if unrepresentable > 1.0e-6:
             raise PlanningError(
                 f"the measured start velocity is {unrepresentable:.3e} rad/s off "
                 "the path tangent, and a motion confined to the path cannot leave "
                 "in any other direction"
             )
-        # Noise fitted as the direction of travel, caught here rather than left
-        # to acados: `TANGENT_STEP_MAX`. Only when the start moves at all -- at
-        # rest the fit leaves along the move and there is nothing to check --
-        # and `unrepresentable` above has already refused a zero tangent under a
-        # nonzero velocity, so the ratio below cannot divide by zero.
+        # Noise fitted as direction of travel, caught here rather than left to acados:
+        # `TANGENT_STEP_MAX`. Only when the start moves at all -- at rest the fit leaves
+        # along the move, nothing to check -- and `unrepresentable` above already refused
+        # a zero tangent under nonzero velocity, so the ratio cannot divide by zero.
         tangent_start = float(np.linalg.norm(evaluate(coefficients, 0.0, order=1)[0]))
         interior = float(
             np.median(
@@ -1009,14 +946,13 @@ class TrajectoryOcp:
                 "or plan from a machine that has settled"
             )
 
-        # `sigma` in [0, 1] and `v >= 0`: the machine may not run backwards along
-        # its own curve, which is the one thing the certificate says nothing
-        # about.
+        # `sigma` in [0, 1] and `v >= 0`: machine may not run backwards along its own
+        # curve, the one thing the certificate says nothing about.
         free = np.full(4, big)
         lbx = np.concatenate([[0.0, 0.0], -free, -cfg.dq_sway_max, theta[:1]])
         ubx = np.concatenate([[1.0, big], free, cfg.dq_sway_max, theta[1:]])
-        # No measured acceleration or jerk: the machine reports a velocity, so
-        # the chain starts flat above it rather than from an invented number.
+        # No measured acceleration or jerk: machine reports a velocity, so the chain
+        # starts flat above it rather than from an invented number.
         x0 = np.concatenate([[0.0, speed_start, 0.0, 0.0], q_u_start, dq_u_start])
         planned = cs.K_PLANNED_DOF
         lh = np.concatenate(
@@ -1043,13 +979,12 @@ class TrajectoryOcp:
                 cfg.terminal_dq_sway_max / cfg.dq_sway_max,
             ]
         )
-        # The terminal node is the one node `sway_slack` does not watch, on the
-        # grounds that its sway rows carry a box an order *tighter* than the
-        # envelope. Both are declared parameters, so that is an arrangement and
-        # not a fact: relax `terminal_q_sway_max` past `q_sway_max` -- the natural
-        # move when a goal will not settle -- and the goal configuration can sit
-        # outside the clearance envelope with neither check firing. Which is the
-        # worst place for it, the goal being where the block is set down.
+        # Terminal node is the one node `sway_slack` does not watch, its sway rows
+        # carrying a box an order *tighter* than the envelope. Both are declared
+        # parameters, so that is an arrangement, not a fact: relax `terminal_q_sway_max`
+        # past `q_sway_max` -- the natural move when a goal will not settle -- and the
+        # goal pose sits outside the clearance envelope with neither check firing. Worst
+        # place for it: the goal is where the block is set down.
         if np.any(cfg.terminal_q_sway_max > cfg.q_sway_max):
             raise PlanningError(
                 f"terminal_q_sway_max {np.asarray(cfg.terminal_q_sway_max).tolist()} "
@@ -1064,22 +999,19 @@ class TrajectoryOcp:
         price = float(cfg.ocp_slack_price)
         soft = H_RATE
 
-        # Uniform progress with the pendulum hanging: no rollout and nothing that
-        # knows the answer.
+        # Uniform progress, pendulum hanging: no rollout, nothing that knows the answer.
         #
-        # `1 / nominal` is a guess about `ocp_horizon`, not about the request, and
-        # when the answer is far from nominal the first QP fails outright --
-        # `across` needs 16 s against a nominal of 7 and dies at SQP iteration 1
-        # with a stationarity residual of 1e3, as does `pair_tuck`. Seeding from a
-        # rate- and acceleration-limited duration estimate does not fix it: both
-        # estimates come out under 7 s on every bench move including `across`,
-        # because what sets that 16 s is the sway rows and not a kinematic ceiling.
-        # A guess that helps has to know the pendulum, and that is not this change.
+        # `1 / nominal` guesses `ocp_horizon`, not the request, and when the answer is
+        # far from nominal the first QP fails outright -- `across` needs 16 s against a
+        # nominal of 7 and dies at SQP iteration 1 on a stationarity residual of 1e3, as
+        # does `pair_tuck`. A rate- and acceleration-limited duration estimate does not
+        # fix it: both come out under 7 s on every bench move, because what sets that
+        # 16 s is the sway rows, not a kinematic ceiling. A guess that helps must know
+        # the pendulum.
         #
-        # What *is* known is `speed_scale`: a request to move at half speed is a
-        # request for an answer about twice as long, so the guess carries it. Left
-        # alone the `stow` move at `speed_scale` 0.5 answers at 11.5 s against a
-        # guess of 7 and fails the same way.
+        # `speed_scale` *is* known: half speed asks for roughly twice the duration, so
+        # the guess carries it. Without it `stow` at `speed_scale` 0.5 answers at 11.5 s
+        # against a guess of 7 and fails the same way.
         duration_guess = float(
             np.clip(
                 self.nominal / speed_scale, cfg.ocp_duration_min, cfg.ocp_duration_max
@@ -1104,10 +1036,10 @@ class TrajectoryOcp:
             )
             if node < N:
                 solver.set(node, "u", np.zeros(NU))
-                # The input box is written here, not left to the export. Set
-                # only on the `AcadosOcp` it is baked into the `.so`, and it is
-                # not in the cache hash, so changing the constant on a warm tree
-                # would be inert -- the same failure the weights had.
+                # Input box written here, not left to the export. Set only on the
+                # `AcadosOcp` it bakes into the `.so`, and it is not in the cache hash,
+                # so changing the constant on a warm tree would be inert -- the same
+                # failure the weights had.
                 solver.constraints_set(node, "lbu", -np.full(NU, SIGMA_INPUT_MAX))
                 solver.constraints_set(node, "ubu", np.full(NU, SIGMA_INPUT_MAX))
                 solver.constraints_set(node, "lh", lh)
@@ -1119,8 +1051,8 @@ class TrajectoryOcp:
                 solver.constraints_set(node, "ubx", ubx)
         solver.constraints_set(0, "lbx", x0)
         solver.constraints_set(0, "ubx", x0)
-        # The goal is the end of the curve, arrived at stopped. The tool may hang
-        # where it likes; how still it has to be is `h_e`, softly.
+        # Goal is the end of the curve, arrived at stopped. Tool may hang where it
+        # likes; how still it has to be is `h_e`, softly.
         solver.constraints_set(
             N,
             "lbx",
@@ -1185,17 +1117,15 @@ class TrajectoryOcp:
             ]
         )
         stats = solver_stats(solver, status, elapsed)
-        # **The status is read before the guard**, and the order is the whole
-        # point: `guard` is computed off the returned iterate, and a diverged
-        # iterate is more likely to saturate the snap chain than a converged
-        # one, so checking the guard first reports a constant's name for what is
+        # **Status read before the guard**, and the order is the point: `guard` is
+        # computed off the returned iterate, and a diverged iterate is likelier to
+        # saturate the snap chain, so guard-first reports a constant's name for what is
         # actually a non-convergence.
         if status != 0:
-            # The residuals are the whole diagnosis of a non-convergence -- which
-            # of the four stalled says whether it is the dynamics, the goal box or
-            # a soft row -- and this is the one path where no `Trajectory` is
-            # built to carry them, so they ride the refusal itself: into the
-            # message for the log, and as `stats` for `~/solver_stats`.
+            # Residuals are the whole diagnosis -- which of the four stalled says
+            # whether it is the dynamics, the goal box or a soft row -- and this is the
+            # one path where no `Trajectory` carries them, so they ride the refusal:
+            # into the message for the log, and as `stats` for `~/solver_stats`.
             stat, eq, ineq, comp = np.asarray(
                 solver.get_stats("residuals"), dtype=float
             )

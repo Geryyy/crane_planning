@@ -1,18 +1,17 @@
 """
 Plan a motion, and time it.
 
-Two stages. `geometry` walks a bounded family of TCP corridors, lifts one into
-joint space and certifies the fitted curve; `ocp` is handed that curve and solves
-for the time-optimal way *along* it. What executes is what was certified.
+Two stages. `geometry` walks bounded family of TCP corridors, lifts one to joint
+space, certifies fitted curve; `ocp` gets that curve, solves time-optimal way
+*along* it. Executes what was certified.
 
-Everything the machine can do -- reach, hang, collide -- is asked of
-`crane_model`; nothing about the machine is written down here.
+Everything machine can do -- reach, hang, collide -- asked of `crane_model`; no
+machine knowledge here.
 
-The passive pair (tip/tilt sway) is never searched over. Where it hangs is a
-closed form, `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, good to 1e-4 rad across the
-workspace and independent of slew, telescope, rotator, tool and payload. It is a
-*state* of the OCP, so the answer is a trajectory the tool arrives nearly still
-from.
+Passive pair (tip/tilt sway) never searched. Where it hangs is closed form,
+`q_eq = (pi/2 - q_boom - q_arm, pi/2)`, good to 1e-4 rad workspace-wide, independent
+of slew, telescope, rotator, tool, payload. It is OCP *state*, so answer is
+trajectory tool arrives nearly still from.
 """
 
 from __future__ import annotations
@@ -36,9 +35,9 @@ from scipy.interpolate import CubicSpline
 
 from . import weights as crane_weights
 
-# One import site for a consumer, three modules for an author. `config` is what
-# a plan is written in, `geometry` is where the machine may go, `timing` is how
-# fast it may get there; this file is the stage that runs them in order.
+# One import site for consumer, three modules for author. `config` = what plan is
+# written in, `geometry` = where machine may go, `timing` = how fast. This file runs
+# them in order.
 from .config import (
     ARM_AXIS,
     BOOM_AXIS,
@@ -74,45 +73,43 @@ from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coeffic
 # ------------------------------------------------------------------ the planner
 
 
-#: rad/s (m/s on the telescope). Below this a measured start velocity is rest.
-#: **Measured, on the standing machine** (2026-09-08, live `/joint_states`, 993
-#: samples over 10 s): per-axis rms 0.002-0.005, max 0.0098 on the actuated five
-#: and 0.0126 on the passive pair. The old 1e-3 was a Gazebo-scale guess, 3-10x
-#: *under* that floor, so the deadband never fired on hardware: the noise was
-#: taken for motion, `start_speed` pinned `v(0)` on it against a path clamped to
-#: leave at rest, and every plan died in the first QP -- acados status 4, one
-#: iteration, stationarity 1e3. 2e-2 is twice the measured max; it is 2-4% of
-#: `dq_max`, so a real creep this slow is rest as far as the reference goes.
+#: rad/s (m/s on telescope). Below this, measured start velocity is rest.
+#: **Measured on standing machine** (live `/joint_states`, 993 samples over 10 s):
+#: per-axis rms 0.002-0.005, max 0.0098 actuated five, 0.0126 passive pair. Old 1e-3
+#: was a Gazebo-scale guess, 3-10x *under* that floor, so deadband never fired on
+#: hardware: noise read as motion, `start_speed` pinned `v(0)` on it against a path
+#: clamped to leave at rest, every plan died in the first QP -- acados status 4, one
+#: iteration, stationarity 1e3. 2e-2 = twice measured max, 2-4% of `dq_max`: creep
+#: this slow is rest.
 REST_VELOCITY = 2e-2
 
-#: m, rad. How far outside its own limit a measured coordinate may be and still
-#: be planned from. A joint parked on its stop reads a hair past it -- Gazebo
-#: settles the retracted telescope at -8e-5 and the excursion *creeps* with every
-#: move, so without this the first plan that ends fully retracted is the last
-#: plan that succeeds. Same argument as `REST_VELOCITY`, one derivative down.
+#: m, rad. How far outside its limit a measured coordinate may sit and still be
+#: planned from. Joint on its stop reads a hair past it -- Gazebo settles retracted
+#: telescope at -8e-5, excursion *creeps* every move, so without this first plan
+#: ending fully retracted is last plan that succeeds. Same argument as
+#: `REST_VELOCITY`, one derivative down.
 #:
-#: Clamped into the box rather than merely tolerated, because everything
-#: downstream -- the IK, the fit's range check, the OCP's own state box -- needs
-#: a start that is inside it. Equal to `eps_pos`, the planner's own positional
-#: acceptance, so a projection this small cannot be told from an IK solution it
-#: would have accepted. Past it the refusal stands: a state grossly outside its
-#: range means the wrong description, and projecting that hides it.
+#: Clamped into box, not merely tolerated: everything downstream -- IK, fit range
+#: check, OCP state box -- needs start inside it. Equals `eps_pos`, planner's
+#: positional acceptance, so projection this small is indistinguishable from IK
+#: solution it would accept. Past it, refusal stands: state grossly out of range
+#: means wrong description, projecting hides it.
 LIMIT_DEADBAND = 1e-3
 
-#: rad/s. What the last emitted sample may drift from the rest the OCP pinned
-#: before the plan is refused. Deliberately not `REST_VELOCITY`: that one is a
-#: claim about the encoder and is meant to be raised to a measured noise floor,
-#: which must not quietly loosen what "the solve stopped" means.
+#: rad/s. Drift of last emitted sample from rest OCP pinned, above which plan is
+#: refused. Deliberately not `REST_VELOCITY`: that claims something about encoder,
+#: meant to rise to measured noise floor, which must not quietly loosen what "solve
+#: stopped" means.
 TERMINAL_DRIFT_MAX = 1e-3
 
 
 @dataclass
 class Start:
-    """The measured state a plan leaves from."""
+    """Measured state a plan leaves from."""
 
-    q: np.ndarray  # the canonical eight
-    dq_a: np.ndarray  # the planned five
-    dq_u: np.ndarray = field(default_factory=lambda: np.zeros(2))  # the sway rate
+    q: np.ndarray  # canonical eight
+    dq_a: np.ndarray  # planned five
+    dq_u: np.ndarray = field(default_factory=lambda: np.zeros(2))  # sway rate
     passive_measured: bool = True
 
     @property
@@ -130,16 +127,13 @@ class Start:
 
 def actuated_samples(timing, stamps: np.ndarray) -> tuple:
     """
-    `q_a`, `dq_a` and `ddq_a` at `stamps`, on the curve rather than on the chord.
+    `q_a`, `dq_a`, `ddq_a` at `stamps`, on curve not chord.
 
-    `q_a = c(sigma)` is an identity the solve never leaves, so `q_a` is not a row
-    to interpolate: between two nodes the straight line joining them is off the
-    curve, and off the curve the certificate was run on. Reconstruct `sigma`
-    instead and evaluate.
-
-    The reconstruction is exact, not an interpolation of its own. acados holds
-    the input constant across an interval and `sigma'''' = s` there, so `sigma`
-    is quartic in elapsed time on each interval.
+    `q_a = c(sigma)` is identity solve never leaves, so `q_a` is no row to
+    interpolate: chord between nodes is off the certified curve. Reconstruct `sigma`
+    and evaluate instead -- exactly, not by interpolation: acados holds input
+    constant per interval and `sigma'''' = s` there, so `sigma` quartic in elapsed
+    time.
     """
     node = np.clip(
         np.searchsorted(timing.time, stamps, side="right") - 1,
@@ -169,14 +163,14 @@ def actuated_samples(timing, stamps: np.ndarray) -> tuple:
 
 @dataclass
 class Plan:
-    """A trajectory, the geometry it was found on, and how it was arrived at."""
+    """Trajectory, geometry it was found on, how it was arrived at."""
 
     time: np.ndarray
-    q: np.ndarray  # the canonical eight, resampled at Ts, one row per sample
+    q: np.ndarray  # canonical eight, resampled at Ts, one row per sample
     dq: np.ndarray
-    ddq: np.ndarray  # the actuated five only, so the JTC interpolates quintic
-    #: C3's inversion as the correction the JTC's effort field carries,
-    #: `u(t + dead time) - dq_d(t)`, zero on the passive pair and the tool.
+    ddq: np.ndarray  # actuated five only, so JTC interpolates quintic
+    #: C3 inversion as correction JTC effort field carries,
+    #: `u(t + dead time) - dq_d(t)`, zero on passive pair and tool.
     effort: np.ndarray
     tcp: np.ndarray  # tool position in K0_mounting_base, one row per sample
     timing: Trajectory
@@ -188,7 +182,7 @@ class Plan:
 
     @property
     def q_a(self) -> np.ndarray:
-        """The actuated six, which is what the native reference carries."""
+        """Actuated six -- what native reference carries."""
         return self.q[:, list(ACTUATED_INDICES)]
 
     @property
@@ -200,8 +194,7 @@ class Planner:
     """
     One description, one set of limits, many requests.
 
-    Built once: parsing the description and exporting the OCP solver both happen
-    here, not per request.
+    Built once: parsing description, exporting OCP solver -- here, not per request.
     """
 
     def __init__(
@@ -240,9 +233,8 @@ class Planner:
         """
         Answer a placement goal in `K0_mounting_base` with a timed trajectory.
 
-        Stages refuse, they do not degrade: unreachable goal, no corridor
-        surviving its certificate, and untimeable path are three answers and each
-        names itself.
+        Stages refuse, never degrade: unreachable goal, no corridor surviving its
+        certificate, untimeable path -- three answers, each names itself.
         """
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
@@ -265,12 +257,11 @@ class Planner:
             payload_shape if avoid_collisions else None,
         )
 
-        # Reachable at all? Cold solve, restarts spread over the telescope range
-        # -- the coordinate the residual is flat in. The Cartesian corridors
-        # discard its configuration: which member of the redundant family the
-        # arm ends at is decided by marching there, and pinning an independently
-        # chosen one is a discontinuity no refinement closes. The joint-space
-        # line is the one candidate that goes to it directly.
+        # Reachable at all? Cold solve, restarts spread over telescope range -- the
+        # coordinate residual is flat in. Cartesian corridors discard its
+        # configuration: which member of redundant family arm ends at is set by
+        # marching there; pinning an independently chosen one is discontinuity no
+        # refinement closes. Joint-space line goes there directly.
         goal_q_a = solve_ik(
             geometry,
             self.limits,
@@ -282,8 +273,8 @@ class Planner:
         )
         clearance, required, body = geometry.margin(start.q_a)
         if not clearance > required:
-            # Named, because "it said no" and "it said no, and the block it is
-            # holding is 0.6 m inside the tool" are answered by different people.
+            # Named: "it said no" vs "it said no, and the block it holds is 0.6 m
+            # inside the tool" go to different people.
             if body is None:
                 raise PlanningError(
                     "the measured start configuration cannot be measured against "
@@ -294,11 +285,10 @@ class Planner:
                 f"{clearance:.3f} m against the {required:.3f} m this plan requires"
             )
 
-        # A measured velocity is never exactly zero. Below the noise floor it is
-        # rest: fitting a tangent to it pins `c'(0)` at noise magnitude, which
-        # the OCP then has to grow to the move's own scale inside one knot span,
-        # and that acceleration exceeds the bound at a node where nothing can
-        # help. Refused on every start with a live encoder before this.
+        # Measured velocity never exactly zero. Below noise floor it is rest: fitting
+        # tangent pins `c'(0)` at noise magnitude, OCP must grow that to move scale
+        # within one knot span, and that acceleration breaks bound at a node where
+        # nothing helps. Before this every start with live encoder was refused.
         dq_a_start = np.asarray(start.dq_a, dtype=float)
         if np.max(np.abs(dq_a_start)) < REST_VELOCITY:
             dq_a_start = np.zeros_like(dq_a_start)
@@ -332,8 +322,8 @@ class Planner:
                 "is no plan that starts from it"
             )
 
-        # The certified curve itself, not its endpoints. The solve moves along it
-        # and decides only how fast, so what executes is what was proved clear.
+        # Certified curve itself, not endpoints. Solve moves along it, decides only
+        # how fast, so what executes is what was proved clear.
         timing = self.ocp.solve(
             coefficients=power_coefficients(path, self.ocp.segments),
             q_u_start=q_u_start,
@@ -343,26 +333,22 @@ class Planner:
             q_tool=start.q_tool,
             speed_scale=speed_scale,
         )
-        # **The certificate rests on this row and on no other.** `Geometry` builds
-        # the clearance envelope from `q_sway_max` and the geometric stage proves
-        # the corridor clear against that envelope; in the OCP the same box is
-        # *soft*, priced at `ocp_slack_price`. So on a request it cannot otherwise
-        # meet, the solve may buy its way out at the price rather than refuse, and
-        # what it returns is then a plan that swings outside the envelope the
-        # certificate covers -- converged, every residual clean while it does it,
-        # which is why nothing upstream notices.
+        # **Certificate rests on this row, no other.** `Geometry` builds clearance
+        # envelope from `q_sway_max` and geometric stage proves corridor clear against
+        # it; in OCP that box is *soft*, priced at `ocp_slack_price`. On a request it
+        # cannot otherwise meet, solve may buy its way out instead of refusing and
+        # return a plan swinging outside the certified envelope -- converged, every
+        # residual clean, so nothing upstream notices.
         #
-        # No request provoking one is known: on the shipped fixture every
-        # over-constrained request tried non-converges instead of paying (the
-        # 2026-09-14 handoff has the sweep). The row is soft and purchasable
-        # either way, and two of those near-misses stalled at a stationarity
-        # residual of 1e-4 to 1e-3, which is a solve that pays given iterations.
+        # No provoking request known: on shipped fixture every over-constrained
+        # request tried non-converges instead of paying. Row is purchasable either
+        # way, and two near-misses stalled at stationarity 1e-4 to 1e-3 -- a solve
+        # that pays given iterations.
         #
-        # Refused here rather than priced higher: raising the price trades the
-        # violation for a non-convergence, which is the same plan not arriving
-        # with a worse diagnosis. `slack` rides the message so the flow row's
-        # share is visible too -- that one is over-draw, not a breached proof,
-        # and it stays a log line.
+        # Refused here, not priced higher: raising price trades violation for
+        # non-convergence -- same plan missing, worse diagnosis. `slack` rides the
+        # message so flow row's share shows too; that one is over-draw, not breached
+        # proof, stays a log line.
         if timing.sway_slack > SLACK_SPENT:
             raise PlanningError(
                 "the timing solve bought the sway box instead of meeting it: "
@@ -377,11 +363,10 @@ class Planner:
         if np.any(terminal_offset > self.config.terminal_q_sway_max) or np.any(
             terminal_rate > self.config.terminal_dq_sway_max
         ):
-            # `timing.stats` and not nothing: this refusal is the one that most
-            # needs its numbers on the wire. A clean iteration count with every
-            # residual under `ocp_tolerance` beside a sway the solve did not
-            # close says the solver is fine and the model it was given is not --
-            # which is the opposite conclusion from an empty report.
+            # `timing.stats`, not nothing: this refusal most needs numbers on wire.
+            # Clean iteration count, every residual under `ocp_tolerance`, beside a
+            # sway solve did not close => solver fine, model it got is not. Empty
+            # report says opposite.
             raise PlanningError(
                 "the timing solve converged but did not arrive settled: terminal sway "
                 f"offset {terminal_offset.tolist()} rad against "
@@ -396,8 +381,8 @@ class Planner:
         """
         Refuse a measured state that is not one state of this description.
 
-        Returns the state to plan from, which is the measured one with any
-        coordinate resting inside `LIMIT_DEADBAND` of its stop clamped onto it.
+        Returns state to plan from: measured one, any coordinate resting within
+        `LIMIT_DEADBAND` of its stop clamped onto it.
         """
         q = np.asarray(start.q, dtype=float).reshape(-1)
         dq_a = np.asarray(start.dq_a, dtype=float).reshape(-1)
@@ -455,13 +440,12 @@ class Planner:
         """
         Return the static bodies this plan is checked against.
 
-        Not the list the request carried: `truck` has become a bed, six runges and
-        a headboard, invisible to anyone watching the scene topic. Public because
-        the node draws it -- a refusal reads far better beside the geometry that
-        caused it.
+        Not the list the request carried: `truck` expands to bed, six runges,
+        headboard -- invisible on the scene topic. Public because node draws it;
+        refusal reads far better beside geometry causing it.
 
-        What the tool carries is **not** here: it moves, so it is placed at each
-        configuration checked rather than pinned to the scene once.
+        What the tool carries is **not** here: it moves, so placed at each checked
+        configuration instead of pinned to scene once.
         """
         if not avoid_collisions:
             return []
@@ -471,7 +455,7 @@ class Planner:
         return primitives
 
     def _settled(self, q_a: np.ndarray, q_tool: float) -> np.ndarray:
-        """Return the canonical eight at `q_a` with the passive pair hanging."""
+        """Return canonical eight at `q_a` with the passive pair hanging."""
         q = np.zeros(GENERALIZED_DOF)
         q[list(PLANNED_INDICES)] = q_a
         q[TOOL_INDEX] = q_tool
@@ -492,18 +476,16 @@ class Planner:
         """
         Where the tool hangs relative to the tip pivot K5, for one yaw.
 
-        `a2b_movement` names the pivot, the native goal names the tool, so the
-        adapter needs the vector between. Read from the model at the hanging
-        equilibrium, never written down.
+        `a2b_movement` names pivot, native goal names tool, so adapter needs vector
+        between. Read from model at hanging equilibrium, never written down.
 
-        The passive pair makes the settled offset independent of boom and
-        telescope pose: once settled, only rotation about gravity moves it. So
-        measure the description's yaw at a canonical pose, turn the slew by the
-        difference, settle again, and *check* the result carries the requested
-        yaw.
+        Passive pair makes settled offset independent of boom and telescope pose:
+        once settled, only rotation about gravity moves it. So measure description's
+        yaw at canonical pose, turn slew by difference, settle again, *check* result
+        carries requested yaw.
 
-        `payload` does not enter it -- the hanging pose is closed form in boom and
-        arm angles alone. The argument is kept so the call site stays honest.
+        `payload` does not enter -- hanging pose is closed form in boom and arm
+        angles alone. Argument kept so call site stays honest.
         """
         if not (np.isfinite(yaw) and np.isfinite(q_tool)):
             raise PlanningError(
@@ -545,28 +527,23 @@ class Planner:
         """
         Put the answer on the emitted reference's own clock.
 
-        The OCP solves on a uniform grid over its own horizon, the consumer reads
-        at `Ts`, so every row is interpolated against elapsed time. The passive
-        pair is carried as the OCP **planned** it, not as the pose the tool would
-        settle to: on the way to the goal the tool is swinging, and that is what
-        the trajectory claims.
+        OCP solves on uniform grid over its horizon, consumer reads at `Ts`, so every
+        row is interpolated against elapsed time. Passive pair carried as OCP
+        **planned** it, not as pose tool would settle to: en route tool swings, and
+        that is what trajectory claims.
 
-        `q_a` is the exception and it is the whole point of the method. It is not
-        an independent row: `q_a = c(sigma)` is an identity the solve never
-        leaves, so interpolating it between nodes reports the chord and not the
-        curve -- configurations the plan never contained, off the curve the
-        certificate was run on. So `sigma` is reconstructed and the curve is
-        evaluated at it. The reconstruction is exact rather than interpolated:
-        acados holds the input constant across an interval, and `sigma'''' = s`
-        there, so `sigma` is quartic and `v` cubic on each interval.
+        `q_a` is the exception, and the whole point of the method: `q_a = c(sigma)`,
+        so interpolating between nodes reports the chord -- configurations plan never
+        held, off the certified curve. `actuated_samples` reconstructs `sigma`
+        exactly and evaluates the curve there.
         """
         Ts = float(self.config.Ts)
         stamps = np.arange(0.0, timing.duration + 0.5 * Ts, Ts)
-        # Rounding to nearest puts the last stamp up to `Ts / 2` *past* the solve's
-        # own end, and `actuated_samples` then evaluates the terminal interval
-        # outside it: a sample off the end of the certified curve, moving at
-        # `snap * overshoot^3 / 6` where the plan says it is stopped. 10 ms of it
-        # is what the JTC rejected. The reference ends when the plan does.
+        # Rounding to nearest puts last stamp up to `Ts / 2` *past* solve's own end,
+        # and `actuated_samples` then evaluates terminal interval outside it: sample
+        # off end of certified curve, moving at `snap * overshoot^3 / 6` where plan
+        # says stopped. 10 ms of it is what JTC rejected. Reference ends when plan
+        # does.
         stamps[-1] = timing.duration
 
         def sample(rows):
@@ -581,26 +558,25 @@ class Planner:
 
         q = np.zeros((len(stamps), GENERALIZED_DOF))
         dq = np.zeros_like(q)
-        # The JTC interpolates cubic between knots without accelerations and
-        # quintic with them (`trajectory.cpp`). The feedforward comes off a C4
-        # curve, so a cubic reconstruction of the tracked reference would have
-        # the two branches follow different curves. The passive pair keeps none:
-        # nothing commands it, and it is not a function of `sigma`.
+        # JTC interpolates cubic between knots without accelerations, quintic with
+        # them. Feedforward comes off C4 curve, so cubic reconstruction of tracked
+        # reference would put the two branches on different curves. Passive pair gets
+        # none: nothing commands it, not a function of `sigma`.
         ddq = np.zeros_like(q)
         q[:, list(PLANNED_INDICES)] = q_a
         dq[:, list(PLANNED_INDICES)] = dq_a
         ddq[:, list(PLANNED_INDICES)] = ddq_a
-        # No closed form for the passive pair: it is an integrated state, not a
-        # function of `sigma`, so interpolating it is the only option here.
+        # No closed form for passive pair: integrated state, not a function of
+        # `sigma`, so interpolating is the only option.
         q[:, list(PASSIVE_INDICES)] = sample(timing.q_u)
         dq[:, list(PASSIVE_INDICES)] = sample(timing.dq_u)
         q[:, TOOL_INDEX] = start.q_tool
-        # The last stamp is the terminal node, where the OCP pins `v = a = j = 0`
-        # and `dq_u = 0`: the plan ends stopped. `actuated_samples` reconstructs
-        # that sample from the interval before it, so what it reports there is
-        # the multiple-shooting gap -- 1e-6 rad/s at `ocp_tolerance`. JTC rejects
-        # a goal whose last point moves at all (`float` epsilon, 1.19e-7), so
-        # write the row the solve pinned and refuse a solve that did not stop.
+        # Last stamp is terminal node, where OCP pins `v = a = j = 0` and
+        # `dq_u = 0`: plan ends stopped. `actuated_samples` rebuilds that sample from
+        # interval before, so it reports multiple-shooting gap -- 1e-6 rad/s at
+        # `ocp_tolerance`. JTC rejects a goal whose last point moves at all (`float`
+        # epsilon, 1.19e-7), so write the row solve pinned and refuse a solve that
+        # did not stop.
         drift = float(np.max(np.abs(dq[-1])))
         if drift > TERMINAL_DRIFT_MAX:
             raise PlanningError(
@@ -611,18 +587,16 @@ class Planner:
             )
         dq[-1] = 0.0
         ddq[-1] = 0.0
-        # `c(1)` *is* the lifted goal, `geometry.fit` writes it there. What the
-        # reconstruction lands on is `c(1 - gap)`, so take the certified end.
+        # `c(1)` *is* the lifted goal, `geometry.fit` writes it there. Reconstruction
+        # lands on `c(1 - gap)`, so take certified end.
         q[-1, list(PLANNED_INDICES)] = evaluate(timing.coefficients, 1.0)[0]
 
-        # C3's feedforward, from the `u` the OCP already solved for and bounded
-        # rather than from a second derivation of it. What the effort field
-        # carries is the *correction* `u(t + n_d) - dq_d(t)`, so the plugin's
-        # `dq_d + effort` is the inversion advanced by the dead time and a
-        # controller reading a reference without one degrades to the static
-        # feedforward instead of to none -- jtc_fork.md delta 3. `np.interp`
-        # holds the terminal value past the end of the plan, which is zero:
-        # `u = dq_a + tau_dot_a / k` and the plan ends at rest.
+        # C3 feedforward, from the `u` OCP already solved for and bounded, not a
+        # second derivation. Effort field carries *correction* `u(t + n_d) - dq_d(t)`,
+        # so plugin's `dq_d + effort` is inversion advanced by dead time, and a
+        # controller reading a reference without one degrades to static feedforward,
+        # not to none. `np.interp` holds terminal value past plan end, which is zero:
+        # `u = dq_a + tau_dot_a / k`, plan ends at rest.
         effort = np.zeros_like(q)
         preview = stamps + float(self.config.command_dead_time_s)
         commanded = np.array(
@@ -631,37 +605,29 @@ class Planner:
                 for i in range(timing.command.shape[1])
             ]
         ).T
-        # Block 2, the command PT1, when an arm asks for it. `u_f` chases `u`
-        # through `tau_v`, so commanding `u + tau_v du/dt` is what lands `u_f` on
-        # the inversion; `command_lag_s` at zero leaves `commanded` untouched and
-        # this is the shipped law. The extra derivative is `q_a''''`, which is
-        # why the path is C4.
+        # Block 2, command PT1, when an arm asks for it. `u_f` chases `u` through
+        # `tau_v`, so commanding `u + tau_v du/dt` lands `u_f` on inversion;
+        # `command_lag_s` = 0 leaves `commanded` untouched, the shipped law. Extra
+        # derivative is `q_a''''` -- why path is C4.
         #
-        # **A cubic through the OCP nodes, differentiated analytically -- not a
-        # central difference on that grid.** `np.interp` is piecewise linear and
-        # differentiating its output gives a staircase, which is why the old
-        # code differentiated first; but `np.gradient` on the OCP grid is no
-        # better. That grid runs at ~183 ms on a nominal move while the emitted
-        # samples are 40 ms apart, and `u` carries curvature between nodes --
-        # with `path_segments` breakpoints the snap is piecewise constant. A
-        # central difference there flattens the peaks of `u'` and smears them
-        # onto their neighbours: measured against this spline on the `stow`
-        # bench move it lost 83% of the slewing peak and 93% of the rotator's.
-        # The lead term *is* `tau_v u'`, so an attenuated and displaced `u'` is
-        # a feedforward that pushes where it should not and barely pushes where
-        # it should -- worse than no feedforward, which is what the machine
-        # showed.
+        # **Cubic through OCP nodes, differentiated analytically -- not a central
+        # difference on that grid.** `np.interp` is piecewise linear, so
+        # differentiating it gives a staircase (why old code differentiated first);
+        # `np.gradient` on OCP grid is no better. Grid runs ~183 ms on a nominal move
+        # vs 40 ms emitted samples, and `u` carries curvature between nodes (snap
+        # piecewise constant on `path_segments` breakpoints). Central difference
+        # flattens `u'` peaks and smears them onto neighbours: vs this spline on
+        # `stow` bench move it lost 83% of slewing peak, 93% of rotator's. Lead term
+        # *is* `tau_v u'`, so attenuated, displaced `u'` pushes where it should not
+        # and barely where it should -- worse than no feedforward, as machine showed.
         #
-        # The preview is clamped into the plan rather than extrapolated, which
-        # is what `np.interp` did for `commanded` and did here before: past `T`
-        # the command is held, so the slope is held with it. Clamping is not
-        # cosmetic -- the preview reaches `command_dead_time_s` past the last
-        # stamp on every plan, and a cubic evaluated out there runs away.
+        # Preview clamped into plan, not extrapolated: past `T` command is held, so
+        # slope held too. Not cosmetic -- preview reaches `command_dead_time_s` past
+        # last stamp on every plan, and a cubic out there runs away.
         #
-        # Clipped to the identified domain, because the feedforward branch is
-        # bounded at its source (jtc_pid yaml, "TWO KNOWN DEVIATIONS") and this
-        # term is the one most likely to ask for command the machine does not
-        # have. How often it did is reported rather than swallowed.
+        # Clipped to identified domain: feedforward branch is bounded at its source
+        # and this term is likeliest to ask for command machine lacks. Saturation
+        # count reported, not swallowed.
         lag = np.asarray(self.config.command_lag_s, dtype=float)
         lag_saturation = 0.0
         if np.any(lag != 0.0):
@@ -669,36 +635,30 @@ class Planner:
                 timing.time,
                 timing.command,
                 axis=0,
-                # Natural, not scipy's not-a-knot default, and not a clamped
-                # end either. Not-a-knot *extrapolates* curvature through the
-                # last interval and ran `u'` to the largest value of the whole
-                # plan in the final three samples. Clamping `u'(T)` to zero
-                # fixes the tail but a cubic spline is **not local** -- the end
-                # condition perturbs every interval, so a ramp stops being a
-                # ramp long before the boundary and the block-2 law is no longer
-                # `tau_v u'` anywhere. Natural claims no curvature at the two
-                # ends, reproduces a ramp exactly, and the tail is handled
-                # locally by the fade below instead.
+                # Natural, not scipy's not-a-knot default, and not clamped.
+                # Not-a-knot *extrapolates* curvature through last interval and ran
+                # `u'` to plan's largest value in final three samples. Clamping
+                # `u'(T)` to zero fixes tail, but cubic spline is **not local** --
+                # end condition perturbs every interval, so a ramp stops being a ramp
+                # long before boundary and block-2 law is no longer `tau_v u'`
+                # anywhere. Natural claims no curvature at both ends, reproduces ramp
+                # exactly; tail handled locally by fade below.
                 bc_type="natural",
             ).derivative()
             rate = slope(np.clip(preview, timing.time[0], timing.time[-1]))
-            # Faded to zero across the final OCP interval, smoothstep so the
-            # lead stays C1. The feedforward has to *land* at zero -- the JTC
-            # holds the last point and `effort[-1]` is pinned below -- and the
-            # only question is whether it arrives there smoothly or steps. It
-            # stepped: measured on the `stow` bench move the slewing lead climbed
-            # to 0.0312 rad/s at `T` and was then cut to zero in one 40 ms
-            # sample, a 0.03 rad/s impulse into the axis at the instant it
-            # arrives. That is the end-of-move ringing the lag arm showed and
-            # the static arm did not. The fade is local, so `tau_v u'` is
-            # untouched everywhere the last interval does not reach -- which is
-            # also why the ramp fixture can still assert the law exactly.
+            # Faded to zero across final OCP interval, smoothstep so lead stays C1.
+            # Feedforward must *land* at zero (JTC holds last point, `effort[-1]`
+            # pinned below); question is smooth or step. It stepped: on `stow` bench
+            # move slewing lead climbed to 0.0312 rad/s at `T`, cut to zero in one
+            # 40 ms sample -- 0.03 rad/s impulse into axis as it arrives, the
+            # end-of-move ringing the lag arm showed and static arm did not. Fade is
+            # local, so `tau_v u'` untouched wherever last interval does not reach --
+            # why ramp fixture still asserts law exactly.
             #
-            # This interval is the right width and not a tuned one: it is where
-            # `u` is least trustworthy anyway. The solve pins `v = a = j = 0` at
-            # the terminal node, and the node before it carries a one-node kink
-            # (u: -0.0102, -0.0363, -0.00003 on slewing) that no derivative of
-            # `u` can tell from signal.
+            # Interval is right width, not tuned: `u` is least trustworthy there
+            # anyway. Solve pins `v = a = j = 0` at terminal node, and node before
+            # carries one-node kink (u: -0.0102, -0.0363, -0.00003 on slewing) no
+            # derivative of `u` can tell from signal.
             span = timing.time[-1] - timing.time[-2]
             x = np.clip((timing.time[-1] - preview) / span, 0.0, 1.0)
             rate = rate * (x * x * (3.0 - 2.0 * x))[:, None]
@@ -708,20 +668,17 @@ class Planner:
             )
             lag_saturation = float(np.mean(raw != commanded))
         effort[:, list(PLANNED_INDICES)] = commanded - dq[:, list(PLANNED_INDICES)]
-        # The last point is **held**, so its feedforward is not a transient: the
-        # JTC keeps sampling it after the plan ends and the PID plugin keeps
-        # adding it, forever. On slewing that is fatal rather than untidy --
-        # `p: 0.07` with `i: 0` means the loop settles where `p e_pos` cancels
-        # it, so a held -0.0276 rad/s buys a standing 0.39 rad of position
-        # error that the 28 s trim loop crawls toward and never removes.
-        # Measured: exactly that, 0.355 rad and still moving, on the run of
-        # 2026-09-07. The plan ends at rest, so the answer is zero, and it is
-        # pinned for the same reason `dq[-1]` and `ddq[-1]` above are.
+        # Last point held, so its feedforward is not transient: JTC keeps sampling it
+        # after plan ends, PID plugin keeps adding it, forever. Fatal on slewing --
+        # `p: 0.07`, `i: 0` means loop settles where `p e_pos` cancels it, so held
+        # -0.0276 rad/s buys standing 0.39 rad position error the 28 s trim loop never
+        # removes. Measured 0.355 rad and still moving. Plan ends at rest, so answer
+        # is zero; pinned like `dq[-1]` and `ddq[-1]`.
         effort[-1] = 0.0
 
-        # The tool where the plan says it is, sway included -- not where it would
-        # hang if the machine stopped at each sample. This is visualization, not
-        # the control reference, so evaluate a bounded number of poses.
+        # Tool where plan says it is, sway included -- not where it would hang if
+        # machine stopped at each sample. Visualization, not control reference, so
+        # evaluate bounded number of poses.
         visual_count = min(len(q), int(self.config.visualization_samples))
         visual_indices = np.unique(np.linspace(0, len(q) - 1, visual_count, dtype=int))
         tcp = np.array(
@@ -764,7 +721,7 @@ class Planner:
 
 
 def payload_parameters(payload: Payload | None) -> np.ndarray:
-    """Mass, centre of mass in K8 and the six independent entries of Theta_L."""
+    """Mass, centre of mass in K8, six independent entries of Theta_L."""
     values = np.zeros(symbolic_model.NP - 1)
     if payload is None or not payload.valid:
         return values
@@ -777,7 +734,7 @@ def payload_parameters(payload: Payload | None) -> np.ndarray:
     return values
 
 
-#: Re-exported so `crane_planning.planner` stays the one import site it has been.
+#: Re-exported so `crane_planning.planner` stays the one import site.
 __all__ = [
     "ACTUATED_INDICES",
     "ARM_AXIS",

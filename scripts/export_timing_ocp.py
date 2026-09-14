@@ -2,18 +2,18 @@
 """
 Code-generate the trajectory OCP that `crane_planning.ocp` defines.
 
-The problem is *not* here: it is `crane_planning/ocp.py`'s `build_ocp`, because
-this package solves it from Python and a definition beside the exporter would be
-a second copy. What is here is the command line and the tree it writes.
+Problem is *not* here: it is `crane_planning/ocp.py`'s `build_ocp` -- this
+package solves it from Python, a definition beside the exporter would be a
+second copy. Here: command line and the tree it writes.
 
     ./scripts/export_timing_ocp.py            # rewrite `generated/`
     ./scripts/export_timing_ocp.py --check    # regenerate into a scratch tree and diff
     ./scripts/export_timing_ocp.py --description live.urdf --compile-only
 
-The third is the prep step for a run: it compiles a solver for the machine the
-node will actually be handed on `/robot_description` and leaves `generated/`
-alone. Without it the node quits on the description it is handed, because the
-only solver it could load would be one baked for some *other* description.
+Third is prep for a run: compiles a solver for the machine the node gets on
+`/robot_description`, leaves `generated/` alone. Without it the node quits on
+the description it is handed -- only loadable solver would be one baked for some
+*other* description.
 
 Dump the description off a running deployment, then compile against it:
 
@@ -125,24 +125,24 @@ def compile_solver(description: str, parameters: dict, hydraulics: dict) -> None
     """
     Compile the solver into the cache the planner loads from.
 
-    Exporting without this leaves the node with nothing to load: it refuses the
-    description rather than pay for a code generation and a C build -- thirteen
-    seconds on a warm toolchain and minutes on a cold one -- inside whatever asked
-    for the plan. Doing it here means a node is ready when it starts.
+    Export without this leaves the node nothing to load: it refuses the
+    description rather than pay code generation plus a C build -- 13 s warm
+    toolchain, minutes cold -- inside whatever asked for the plan. Here means
+    node ready at start.
 
-    It is a second `build_ocp` and a second code generation on purpose: what
-    `output` gets is the pruned, normalised tree `--check` reviews, and
-    `crane_ocp`'s `finalise` reads every file it ships as text, so a compiled
-    `.so` cannot live there. Same problem, two artifacts.
+    Second `build_ocp`, second code generation, on purpose: `output` gets the
+    pruned, normalised tree `--check` reviews, and `crane_ocp`'s `finalise` reads
+    every shipped file as text, so a compiled `.so` cannot live there. Same
+    problem, two artifacts.
     """
     ocp, _, _ = build_ocp(description, parameters, hydraulics)
     CACHE.mkdir(parents=True, exist_ok=True)
-    # Named by what is baked, not by the tool alone: a cached `.so` is loaded and
-    # not compared, so a changed `path_segments`, integrator or *description* has
-    # to land in a different directory or the node answers with the previous
-    # build. The node hashes the description it was handed on `/robot_description`
-    # and says which of these it missed on, so compiling for the wrong machine is
-    # a warning at run time rather than a silent wrong answer.
+    # Named by what is baked, not by tool alone: cached `.so` is loaded, not
+    # compared, so changed `path_segments`, integrator or *description* must land
+    # in a different directory or the node answers with the previous build. Node
+    # hashes description handed on `/robot_description` and says which it missed
+    # on, so compiling for the wrong machine warns at run time instead of
+    # answering silently wrong.
     key = cache_key(parameters, hydraulics, description)
     tree = tree_of(key)
     ocp.code_export_directory = str(tree)
@@ -184,9 +184,9 @@ def main() -> int:
     )
     source = arguments.description or arguments.descriptions / DESCRIPTION
     description = source.read_text()
-    # `generated/` is the shipped tree `--check` and CI diff against, and they
-    # regenerate it from the fixture. Writing another machine into it would make
-    # every later `--check` report a diff nobody asked for.
+    # `generated/` is the shipped tree `--check` and CI diff against, regenerated
+    # from the fixture. Writing another machine into it makes every later
+    # `--check` report a diff nobody asked for.
     if arguments.description and not arguments.compile_only:
         parser.error("--description writes only into the cache: add --compile-only")
     if arguments.compile_only:
@@ -198,8 +198,8 @@ def main() -> int:
         lambda output: generate(output, description, parameters, parameters),
         "export_timing_ocp.py",
     )
-    # `--check` compares two trees and must not touch the cache; a real export
-    # leaves a compiled solver behind so the node does not build one on demand.
+    # `--check` compares two trees, must not touch the cache; a real export
+    # leaves a compiled solver so the node does not build one on demand.
     if status == 0 and not arguments.check and not arguments.no_compile:
         compile_solver(description, parameters, parameters)
     return status

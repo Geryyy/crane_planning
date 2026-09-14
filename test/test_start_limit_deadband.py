@@ -1,11 +1,11 @@
 """
-A joint parked on its stop reads a hair past it, and that is not a bad state.
+A joint parked on its stop reads a hair past it. Not a bad state.
 
-Observed in sim, four requests in a row after one successful move left the
-telescope retracted: `planned coordinate 3 is measured at -0.000079, outside
-[0.000000, 2.236000]`, then -0.000091, -0.000104, -0.000144. The excursion
-creeps, so the first plan that ends fully retracted was the last plan that
-succeeded. `REST_VELOCITY` already carries this argument one derivative up.
+Sim: four requests after one good move left the telescope retracted -- `planned
+coordinate 3 is measured at -0.000079, outside [0.000000, 2.236000]`, then
+-0.000091, -0.000104, -0.000144. Excursion creeps, so the first plan ending fully
+retracted was the last that worked. `REST_VELOCITY` = same argument, one
+derivative up.
 """
 
 import numpy as np
@@ -21,7 +21,7 @@ def planner() -> Planner:
 
 
 def start_at(built: Planner, axis: int, position: float) -> Start:
-    """The bench start with one planned coordinate moved to `position`."""
+    """Bench start with one planned coordinate moved to `position`."""
     q = np.zeros(8)
     q[list(PLANNED_INDICES)] = START
     q[TOOL_INDEX] = TOOL_POSITION
@@ -40,7 +40,7 @@ def test_a_joint_resting_on_its_stop_is_planned_from_the_stop():
 
 
 def test_a_state_well_outside_its_range_is_still_refused():
-    """The deadband is for the stop, not for the wrong description."""
+    """Deadband is for the stop, not for a wrong description."""
     built = planner()
     axis = int(np.flatnonzero(built.limits.bounded)[0])
     lower = float(built.limits.lower[axis])

@@ -1,4 +1,4 @@
-"""A measured start velocity at the noise floor is rest, not a tangent to fit."""
+"""Measured start velocity at the noise floor is rest, not a tangent to fit."""
 
 import numpy as np
 import pinocchio as pin
@@ -12,10 +12,10 @@ from test_jerk_bound import GOAL, START, TOOL_POSITION, description
 
 def test_noise_level_start_velocity_plans_as_rest():
     """
-    `fit` pins the curve's start tangent to the measured velocity, so a 1e-5
-    encoder reading is a tangent of magnitude 1e-5 that the OCP has to grow to
-    the move's scale inside one knot span -- refused at node 0, on every start
-    with a live encoder. Below `REST_VELOCITY` the plan is the rest plan.
+    `fit` pins the curve's start tangent to measured velocity, so a 1e-5 encoder
+    reading is a tangent of magnitude 1e-5 the OCP must grow to move scale inside
+    one knot span -- refused at node 0, every start with a live encoder. Below
+    `REST_VELOCITY` the plan is the rest plan.
     """
     planner = Planner(description(), PlannerConfig(), dict(crane_weights.DEFAULTS))
 

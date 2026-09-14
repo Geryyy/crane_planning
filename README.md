@@ -13,7 +13,7 @@ No stochastic sampler. Everything the machine can do -- reach, hang, collide --
 is asked of `crane_model`; nothing about the machine is written down here. Joint
 ranges and velocity limits come from the `robot_description` the profile remaps
 this node onto, the EOM from `crane_model.symbolic`. The one number the
-description lacks (pump limit) is in `config/crane_planner.yaml` with its
+description lacks (pump limit) sits in `config/crane_planner.yaml` with its
 evidence.
 
 ## The tool corridors
@@ -22,23 +22,23 @@ Each candidate is a TCP polyline in `K0_mounting_base`; yaw follows the shortest
 arc over its Cartesian length. q8 is not planned -- the low-level controller
 holds it at its start value.
 
-Direct line first. Then the **joint-space line** to the cold goal solve -- no
-IK along it, and the line the reference iLQR planner effectively moves on; a
-close-in goal the tool chord cannot reach without folding the arm through a
-limit is answered here. Then transfer planes, starting above the highest scene
+Direct line first. Then the **joint-space line** to the cold goal solve -- no IK
+along it, and the line the reference iLQR planner effectively moves on; a
+close-in goal the tool chord cannot reach without folding the arm through a limit
+is answered here. Then transfer planes, starting above the highest scene
 primitive plus the full clearance requirement and rising by
 `corridor_height_step`; each plane gets a straight traverse plus configured
 left/right offsets. A plane corner the tool cannot be placed at refuses every
 corridor through it before lifting (one IK per corner, not hundreds per
-corridor). First candidate that survives lifting, fitting and the certificate
-wins. A fit failure advances to the next candidate rather than ending the call.
+corridor). First candidate surviving lifting, fitting and the certificate wins. A
+fit failure advances to the next candidate rather than ending the call.
 
 **IK is the lift, not the check.** Each polyline sample is lifted into the five
 planned coordinates by continuation IK seeded from its predecessor; the passive
 pair is re-settled at every configuration, so what is solved is where the tool
-actually hangs. The telescope's redundancy is taken up by a weak pull towards
-the seed. Only the *goal* solve is cold, spreading `ik_restarts` over the
-telescope range -- the coordinate the residual is flat in.
+actually hangs. Telescope redundancy is taken up by a weak pull towards the seed.
+Only the *goal* solve is cold, spreading `ik_restarts` over the telescope range
+-- the coordinate the residual is flat in.
 
 Sample spacing is decided by the certificate, not a fixed count: the step halves
 until the machine's own motion fits inside `margin_interp`, and grows back by a
@@ -71,15 +71,15 @@ tunnels.
 | `envelope` | `l_tool*sin(q_sway_max)` -- how far the tool swings inside the admissible box |
 
 The envelope is **computed, not configured** -- pendulum length read from the
-description. One distance test at the hanging pose answers the whole box for
-any configuration that clears by more than `required`: no sway state can then
-reach anything.
+description. One distance test at the hanging pose answers the whole box for any
+configuration clearing more than `required`: no sway state can then reach
+anything.
 
-That test is sufficient, not necessary, and the envelope is owed by what hangs
-on the hinges and by nothing else. The column, boom and arm do not swing, so a
+That test is sufficient, not necessary, and the envelope is owed by what hangs on
+the hinges and by nothing else. Column, boom and arm do not swing, so a
 configuration inside `required` at the hanging pose is not refused on it. The
 machine is split at the upper passive hinge (`collision_queries(..., swinging=)`
-in `crane_model`) and each half is held to what it owes:
+in `crane_model`) and each half held to what it owes:
 
     swinging half:  clearance > margin_safety + margin_interp + envelope
     rigid half:     clearance > margin_safety + margin_interp
@@ -99,7 +99,7 @@ other by design.
 
 The certificate runs **once, on the fitted spline** (`Geometry.check_path`). The
 lifted polyline is not checked -- it exists to establish a continuous IK branch
-and the interpolation bound. The spline is a different curve and it is the curve
+and the interpolation bound. The spline is a different curve, and it is the curve
 that executes.
 
 ## Why the lift marches instead of bisecting
@@ -136,18 +136,18 @@ half-width of 0.2 rad.
 
 Least-squares cubic B-spline through the lifted configurations, `sigma`
 distributed by how long each chord takes at its slowest axis's limit. Twice
-differentiable because a kink is not a curve the machine can follow: `q_a''`
-is unbounded there, so the step bound refuses it.
+differentiable because a kink is not a curve the machine can follow: `q_a''` is
+unbounded there, so the step bound refuses it.
 
 It approximates rather than interpolates. Interpolation ties segment count to
 sample count, and those want opposite things -- the certificate wants samples
-dense, the curve wants long end intervals. A fixed `path_segments` breaks the
-tie and stops the fit chasing IK noise -- and it is structural besides: the OCP
-is code-generated against a parameter vector that many cubics wide, so a short
-lift is resampled along its own chords rather than fitted with fewer pieces.
+dense, the curve wants long end intervals. A fixed `path_segments` breaks the tie
+and stops the fit chasing IK noise -- and it is structural besides: the OCP is
+code-generated against a parameter vector that many cubics wide, so a short lift
+is resampled along its own chords rather than fitted with fewer pieces.
 
-Endpoints are imposed exactly by writing the two outer coefficients; the rest are
-left as fitted. The start slope is written too, but **only while the machine is
+Endpoints are imposed exactly by writing the two outer coefficients; the rest
+stay as fitted. The start slope is written too, but **only while the machine is
 moving**: the OCP follows this curve, so `dq_a = q_a'(sigma)*v` can only leave
 along the tangent and the tangent has to be the measured direction --
 `q_a'(0) = dq_a*L` is that same motion measured in sigma. From rest there is no
@@ -166,8 +166,8 @@ itself, once, through `ocp.power_coefficients`.
 
 `ocp.py` builds one acados OCP on normalised time with the horizon `T` a state
 whose derivative is zero: a single solve is time-optimal, no outer duration
-search. Every residual row is divided by the limit it is measured against, so
-1.0 is the bound on all of them alike.
+search. Every residual row is divided by the limit it is measured against, so 1.0
+is the bound on all of them alike.
 
 **`q_a` is not a decision variable.** It is handed the certified curve and moves
 *along* it, deciding only how fast:
@@ -186,16 +186,15 @@ clearance requirement of which 0.05 m is spare -- the proof was void by roughly
 iterations. It also converges where the larger problem did not: `speed_scale 0.5`
 and `kappa 0.3` both stalled at 60 iterations before and now answer in 22 and 20.
 
-What it costs is lateral authority: sway is damped by timing alone. The
-duration numbers above are the whole price. `docs/features/corridor-mpc/brief.md`
-is the design for buying some of that authority back with a corridor; on this
-evidence it is not owed.
+What it costs is lateral authority: sway is damped by timing alone. The duration
+numbers above are the whole price. A corridor would buy some of that authority
+back; on this evidence it is not owed.
 
 Joint velocity and acceleration, reserved pump flow and the sway box are
 constraints in the solve; `sigma` is boxed to [0, 1] and `v >= 0`, because the
-machine may not run backwards along its own curve. `q_a` needs no range row --
-it is on the curve, and `fit` already refused a curve leaving joint range.
-Terminal sway offset and rate are checked after the solve against
+machine may not run backwards along its own curve. `q_a` needs no range row -- it
+is on the curve, and `fit` already refused a curve leaving joint range. Terminal
+sway offset and rate are checked after the solve against
 `terminal_q_sway_max`/`terminal_dq_sway_max`; a near miss is refused, not
 published.
 
@@ -254,7 +253,7 @@ takes a Cartesian pose, which may be unreachable.
 | frame | `K0_mounting_base` throughout; nothing is converted |
 
 **Not a second writer of the machine**: `/crane/reference` is a reference, not a
-command; `crane_velocity_controller` stays the sole claimant of the six velocity
+command; `crane_velocity_controller` stays sole claimant of the six velocity
 command interfaces; this node holds no `controller_manager` client.
 
 The PZS100 Gazebo actuator reports q9 as total opening with an EPSCOPE
@@ -301,8 +300,7 @@ colours, because "why was this refused" is usually answered by which kind it hit
 
 Goal and geometry go out **before** the solve, so a refusal leaves them on screen.
 
-Display: `concrete_block_behavior_tree/rviz/cbs.rviz`, under *Planning and
-Control*.
+Display: `cbs.rviz`, under *Planning and Control*.
 
 ## The truck
 

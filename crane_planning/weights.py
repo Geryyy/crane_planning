@@ -1,30 +1,29 @@
 """
-The trajectory OCP's cost weights, and the row layout they sit on.
+Trajectory OCP cost weights, and the row layout they sit on.
 
 One place, because three things must agree: `export_timing_ocp.py` bakes these as
-the solver's defaults, the node writes its own ROS parameters onto that solver at
-construction, and anything reading a residual back needs to know which row is
-which.
+solver defaults, node writes its own ROS parameters onto that solver at
+construction, and anything reading a residual back needs to know which row is which.
 
-`W` is a **runtime cost field**, not an acados parameter. Parameters carry values
-entering the model *expressions* and are copied onto every stage before every
-solve; `W` is set once when the solver is built, so putting weights in `p` would
-pay per-stage copies for numbers that never change within a run.
+`W` is a runtime cost field, not an acados parameter. Parameters carry values
+entering model *expressions*, copied onto every stage before every solve; `W` is set
+once at build, so weights in `p` would pay per-stage copies for numbers that never
+change within a run.
 
-Every residual row is dimensionless -- the exporter divides each by the limit it
-is measured against, so 1.0 is the bound. A weight is preference and nothing
-else, and 1.0 everywhere is the honest default: one bound violated costs the same
-wherever it happens.
+Every residual row is dimensionless -- exporter divides each by the limit it is
+measured against, so 1.0 is the bound. Weight is preference, nothing else. 1.0
+everywhere is the honest default: one bound violated costs the same wherever it
+happens.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: Stage residual, in row order:
-#: `y = [dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]`. `ddq_a` was called `u`
-#: while the acceleration was the input; it is a state expression now and the
-#: input is the snap, so the name would have been actively wrong.
+#: Stage residual, row order:
+#: `y = [dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]`. `ddq_a` was `u` while
+#: acceleration was the input; state expression now, input is snap, so old name
+#: would be actively wrong.
 STAGE_BLOCKS = (
     ("dq_a", 5),
     ("sway", 2),
@@ -33,16 +32,16 @@ STAGE_BLOCKS = (
     ("ddq_a", 5),
     ("dddq_a", 5),
 )
-#: Terminal residual: no input, so no effort row; `theta` carries minimum time.
+#: Terminal residual: no input, so no effort row. `theta` carries minimum time.
 TERMINAL_BLOCKS = (("dq_a", 5), ("sway", 2), ("dq_u", 2), ("time", 1))
 
 NY = sum(width for _, width in STAGE_BLOCKS)
 NY_E = sum(width for _, width in TERMINAL_BLOCKS)
 
 
-#: What the shipped `config/crane_planner.yaml` carries, and what a node falls
-#: back to. Preferences are 1.0 because the rows are dimensionless; `time` is the
-#: measured ceiling above which the solve asks for more pump than exists.
+#: What shipped `config/crane_planner.yaml` carries, and what a node falls back to.
+#: Preferences 1.0 because rows are dimensionless. `time` is the measured ceiling
+#: above which solve asks for more pump than exists.
 DEFAULTS = {
     "dq_a": 1.0,
     "sway": 1.0,
@@ -56,7 +55,7 @@ DEFAULTS = {
 
 
 def _block(weights: dict, name: str, width: int) -> np.ndarray:
-    """One block of the diagonal, scalar or per-row, refused if it is neither."""
+    """Build one diagonal block, scalar or per-row. Refuse anything else."""
     value = np.atleast_1d(np.asarray(weights[name], dtype=float))
     if value.size == 1:
         value = np.full(width, float(value[0]))
@@ -70,17 +69,17 @@ def _block(weights: dict, name: str, width: int) -> np.ndarray:
 
 
 def stage_diagonal(weights: dict) -> np.ndarray:
-    """`W`'s diagonal, in `STAGE_BLOCKS` order."""
+    """Return `W`'s diagonal, in `STAGE_BLOCKS` order."""
     return np.concatenate([_block(weights, n, w) for n, w in STAGE_BLOCKS])
 
 
 def terminal_diagonal(weights: dict) -> np.ndarray:
     """
-    `W_e`'s diagonal.
+    Return `W_e`'s diagonal.
 
-    The blocks the terminal stage shares with a stage node are the same weights
-    scaled by `terminal_scale`, which is what keeps a preference expressed once;
-    `time` is the terminal stage's own and is the whole minimum-time objective.
+    Blocks shared with a stage node are the same weights scaled by
+    `terminal_scale`, so a preference is expressed once. `time` is the terminal
+    stage's own and is the whole minimum-time objective.
     """
     scale = float(weights["terminal_scale"])
     shared = np.concatenate(
@@ -90,5 +89,5 @@ def terminal_diagonal(weights: dict) -> np.ndarray:
 
 
 def matrices(weights: dict) -> tuple:
-    """`(W, W_e)` as acados wants them, square and dense."""
+    """Return `(W, W_e)` as acados wants them, square and dense."""
     return np.diag(stage_diagonal(weights)), np.diag(terminal_diagonal(weights))

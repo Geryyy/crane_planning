@@ -1,18 +1,15 @@
-"""`slow_down` divides rate, acceleration and jerk alike -- it is not a time scaling.
+"""`slow_down` divides rate, acceleration and jerk alike -- not a time scaling.
 
-`CalcMovement.slow_down` is documented as a "divider to reduce max
-speed/acceleration", and the reference server divides `qDotMax`, `qDDotMax` and
-`qDDDotMax` by it each (`mp_crane_lib_helpers.hpp`, `apply_slow_down`). Scaling the
-k-th derivative by `speed_scale**k` instead would be right for a uniform time
-reparametrisation, but that is not a symmetry of this problem: the pendulum period
-is fixed, so an `s**2` acceleration ceiling takes away the authority a solve needs
-to cancel sway at the swing frequency, and it refuses where it should have slowed
-down. Measured on the 21 bench moves at `s = 0.5`: 1 of 5 core moves answered under
-`s**k`, 3 of 5 under the linear rule.
+`CalcMovement.slow_down` is documented "divider to reduce max speed/acceleration";
+the reference server divides `qDotMax`, `qDDotMax`, `qDDDotMax` by it each. Scaling
+the k-th derivative by `speed_scale**k` fits a uniform time reparametrisation, no
+symmetry here: pendulum period is fixed, so an `s**2` acceleration ceiling takes
+the authority needed to cancel sway at the swing frequency and refuses where it
+should have slowed. Measured on the 21 bench moves at `s = 0.5`: 1 of 5 core moves
+answered under `s**k`, 3 of 5 under the linear rule.
 
-At `s = 1` the two rules coincide, so the ceilings are asserted at `s = 0.5`, and
-against both rules -- an answer that stays inside the linear ceilings while
-exceeding the old ones is what says which rule shipped.
+Rules coincide at `s = 1`, so ceilings are asserted at `s = 0.5` against both -- an
+answer inside the linear ceilings but past the old ones says which rule shipped.
 """
 
 import numpy as np
@@ -25,7 +22,7 @@ from crane_planning.planner import Planner, Start
 from test_jerk_bound import GOAL, START, TOOL_POSITION, description
 
 #: Half speed. `stow` answers here; at 0.25 it refuses in the QP at the first
-#: iteration, which is a start-guess failure and not a ceiling.
+#: iteration -- a start-guess failure, not a ceiling.
 SPEED_SCALE = 0.5
 
 
@@ -69,7 +66,7 @@ def test_slow_down_divides_every_ceiling_once():
         f"{config.ddq_a_max.tolist()}"
     )
 
-    # The discriminating half: under `s**k` this answer was not available -- the
+    # Discriminating half: under `s**k` this answer was not available --
     # acceleration alone reaches 1.03 and 1.48 of what `s**2` would have allowed.
     # No jerk assertion: `dddq_a_max` is a cost scale now and bounds nothing.
     assert np.any(peak_accel > config.kappa * SPEED_SCALE**2 * config.ddq_a_max)

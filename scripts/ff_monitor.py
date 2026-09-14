@@ -2,37 +2,35 @@
 """
 Republish the feedforward as a live time series, beside what the crane did.
 
-The C3 feedforward is not observable from `/trajectory_controllers/
-controller_state`: `publish_state` fills `reference.positions`, `velocities`
-and `accelerations` and never `reference.effort`
-(`joint_trajectory_controller.cpp:1429`). So the one signal the ablation is
-about is the one signal PlotJuggler cannot see.
+C3 feedforward is not observable from `/trajectory_controllers/
+controller_state`: `publish_state` fills `reference.positions`, `velocities` and
+`accelerations`, never `reference.effort`. So the one signal the ablation is
+about is the one PlotJuggler cannot see.
 
-It can be reconstructed exactly, without guessing a clock. The JTC publishes
-`reference.time_from_start` -- the sample time *inside the running
-trajectory* -- and `/crane/reference` is latched and carries the effort field.
-Interpolating one at the other is the whole node.
+Reconstructable exactly, no clock guessed: JTC publishes
+`reference.time_from_start` -- sample time *inside the running trajectory* -- and
+`/crane/reference` is latched and carries effort. Interpolating one at the other
+is the whole node.
 
 Two `JointState` topics, because PlotJuggler expands `JointState` **by joint
-name** rather than by array index, and the index orders of `/joint_states` and
-of `controller_state` disagree:
+name**, not by array index, and index orders of `/joint_states` and
+`controller_state` disagree:
 
 | topic | position | velocity | effort |
 |---|---|---|---|
-| `/crane/debug/feedforward` | reference | `qdot_d + effort`, the whole ff branch | `effort` alone, the C3 correction |
+| `/crane/debug/feedforward` | reference | `qdot_d + effort`, whole ff branch | `effort` alone, the C3 correction |
 | `/crane/debug/achieved` | feedback | feedback | the command actually written |
 
-So `.../feedforward/<joint>/velocity` against `.../achieved/<joint>/velocity`
-is the feedforward against what the machine did, by name, on one plot. They
-should differ by the plant's answer: the ff branch is previewed by the dead
-time, so the achieved rate lags the commanded one by `n_d` on an axis the
-inversion is right about.
+So `.../feedforward/<joint>/velocity` vs `.../achieved/<joint>/velocity` is
+feedforward vs what the machine did, by name, one plot. Should differ by the
+plant's answer: ff branch is previewed by the dead time, so achieved rate lags
+commanded by `n_d` on an axis the inversion is right about.
 
-`effort` on the first topic against the difference of the two velocities is
-the other useful pair: it is how much of the command the C3 correction is
-carrying, against how much the loop had to make up.
+`effort` on the first topic vs the difference of the two velocities is the other
+useful pair: how much command the C3 correction carries vs how much the loop had
+to make up.
 
-Read-only. It subscribes and publishes and commands nothing.
+Read-only. Subscribes, publishes, commands nothing.
 
     ./scripts/ff_monitor.py
     plotjuggler   # Start -> ROS2 Topic Subscriber -> both /crane/debug topics
@@ -112,8 +110,8 @@ class Monitor(Node):
         names = list(message.joint_names)
 
         def ff(name: str) -> float:
-            # Zero past the end of the plan, which is where the reference holds
-            # it too, and zero for a joint the plan does not command.
+            # Zero past end of plan, where the reference holds it too; zero for
+            # a joint the plan does not command.
             if self.stamps.size == 0 or name not in self.effort:
                 return 0.0
             return float(np.interp(when, self.stamps, self.effort[name], right=0.0))
@@ -132,8 +130,8 @@ class Monitor(Node):
         emit(
             self.feedforward,
             message.reference.positions,
-            # The whole feedforward branch, which is what the plugin adds up:
-            # `ff_velocity_scale * qdot_d + effort`, with the scale at 1.0.
+            # Whole feedforward branch, what the plugin adds up:
+            # `ff_velocity_scale * qdot_d + effort`, scale 1.0.
             [r + c for r, c in zip(reference, correction)],
             correction,
         )

@@ -1,10 +1,9 @@
 """Two machines must not share one compiled solver.
 
-The node builds its planner from whatever `/robot_description` carries; the
-exporter bakes from a file. A cached `.so` is loaded, not compared, so while the
-cache name said nothing about the description, a solver compiled for the fixture
-answered every request planned for the sim's machine -- which is a different
-xacro at `sim_hydraulics:=false`. Costs no solver build: the name is a hash.
+Node builds planner from `/robot_description`; exporter bakes from a file. Cached
+`.so` is loaded, not compared -- while the cache name ignored the description, a
+solver compiled for the fixture answered every request planned for sim's machine,
+a different xacro at `sim_hydraulics:=false`. Costs no build: name is a hash.
 """
 
 import pytest

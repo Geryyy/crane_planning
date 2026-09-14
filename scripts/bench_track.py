@@ -1,49 +1,46 @@
 #!/usr/bin/env python3
 r"""
-Drive the bench moves under each feedforward law and measure the tracking.
+Drive bench moves under each feedforward law, measure tracking.
 
-The ablation `bench_calc_movement.py` cannot do, because that one stops at the
-answer and never drives the machine.
+Ablation `bench_calc_movement.py` cannot do: that one stops at the answer, never
+drives the machine.
 
-Three arms, and the point of the design is that **all three execute the same
-plan**: `c3_feedforward` and `command_lag_s` are read after the solve, so the
-OCP answer is bit-identical across arms and the only difference is the effort
-field the reference carries. The normaliser is therefore one reference, not
-three.
+Three arms, design point: **all three execute the same plan**. `c3_feedforward`
+and `command_lag_s` are read after the solve, so the OCP answer is bit-identical
+across arms; only the reference's effort field differs. Normaliser is one
+reference, not three.
 
 | arm | effort field | what it inverts |
 |---|---|---|
-| `static` | absent | nothing. The JTC runs `ff_velocity_scale * qdot_d` -- control_architecture 2 |
+| `static` | absent | nothing. JTC runs `ff_velocity_scale * qdot_d` |
 | `inverse` | `u(t+n_d) - qdot_d` | block 3 + rigid body by RNEA, block 1 by preview |
-| `inverse_lag` | that plus `tau_v du/dt` | block 2 as well -- controller_design 2.4 |
+| `inverse_lag` | that plus `tau_v du/dt` | block 2 as well |
 
-Everything measured comes off `/trajectory_controllers/controller_state`, which
-the JTC already publishes at the controller rate carrying `reference`,
-`feedback`, `error` and `output` per joint. Nothing new is instrumented.
+All measurements come off `/trajectory_controllers/controller_state`, published
+by JTC at controller rate with `reference`, `feedback`, `error`, `output` per
+joint. Nothing new instrumented.
 
     ./scripts/bench_plan.py --emit-requests /tmp/a2b_goals.json --set all
     ./scripts/bench_track.py --requests /tmp/a2b_goals.json \\
         --only ax_slew,ax_arm,sh_multi,across --repeats 3 --out /tmp/ablation
 
 `--out` gets one wide CSV per move -- every arm's reference, feedback, error,
-command and feedforward on one time grid, which is a single drag-and-drop into
-PlotJuggler -- plus `metrics.csv`. Run `ros2 bag record -s mcap` alongside if
-you want the rest of the graph too.
+command, feedforward on one time grid, one drag-and-drop into PlotJuggler --
+plus `metrics.csv`. `ros2 bag record -s mcap` alongside for rest of graph.
 
-Bring the sim up without the GUI for a campaign; the tree is left idle and this
-script owns the controller switch, so nothing has to be clicked:
+Sim without GUI for a campaign; tree idle, this script owns controller switch,
+nothing to click:
 
     ros2 launch concrete_block_behavior_tree gazebo_wall_assembly_pzs100.launch.py \\
         controller:=pid planner:=cbs enable_livox_sim:=off gui:=false
 
 > [!warning] What this cannot tell you
-> The Gazebo plant *is* C3, with the same `k`, `d`, dead time and `tau_v` the
-> inversion is built from. `inverse_lag` therefore inverts that plant exactly
-> and will flatter itself. This measures "is the PT1 term worth the C4
-> reference", not "does it transfer to the machine".
+> Gazebo plant *is* C3, same `k`, `d`, dead time, `tau_v` the inversion is built
+> from. `inverse_lag` inverts that plant exactly, flatters itself. Measures "is
+> PT1 term worth the C4 reference", not "does it transfer to the machine".
 
-`ax_arm` is the control: its fitted lag is 0, so `inverse` and `inverse_lag`
-must come out identical there. If they do not, this script is wrong.
+`ax_arm` is the control: fitted lag 0, so `inverse` and `inverse_lag` must come
+out identical. If not, this script is wrong.
 """
 
 from __future__ import annotations
@@ -68,46 +65,42 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from timber_crane_planning_interfaces.srv import CalcMovement
 
-#: The fitted lag/dead-time split of hydraulic_actuator_model.md 2, in the
-#: planned-axis order (sw, ha, ka, sa, ro). The same numbers the Gazebo URDF
-#: carries as `tau_v`, which is why `inverse_lag` inverts that plant exactly.
+#: Fitted lag/dead-time split, planned-axis order (sw, ha, ka, sa, ro). Same
+#: numbers Gazebo URDF carries as `tau_v`, so `inverse_lag` inverts that plant
+#: exactly.
 FITTED_LAG = [0.100, 0.025, 0.000, 0.075, 0.125]
 NO_LAG = [0.0] * 5
 
-#: `(c3_feedforward, command_lag_s)`. Both are read per request by the planner,
-#: so switching arms costs a service call and not a relaunch.
+#: `(c3_feedforward, command_lag_s)`. Both read per request by planner, so
+#: switching arms costs a service call, not a relaunch.
 ARMS = {
     "static": (False, NO_LAG),
     "inverse": (True, NO_LAG),
     "inverse_lag": (True, FITTED_LAG),
 }
 
-#: Where the three arms are resampled onto for the wide CSV. Finer than the
-#: 25 Hz reference and than the 100 Hz loop, so neither is what aliases.
+#: Grid the three arms are resampled onto for the wide CSV. Finer than 25 Hz
+#: reference and 100 Hz loop, so neither aliases.
 GRID_S = 0.01
 
-#: rad, m on the telescope. A run that did not start where the plan says it
-#: started is not a run of that plan. Measured over the **five planned axes**
-#: only: the passive pair is not commanded by anyone, and the tool is owned by
-#: its own controller, carries no feedforward and has no fitted lag, so neither
-#: is evidence about a start this ablation cares about. The offset that was
-#: actually achieved goes into every metrics row rather than being hidden behind
-#: the gate.
+#: rad, m on telescope. Run that did not start where plan says is no run of that
+#: plan. Measured over **five planned axes** only: passive pair commanded by
+#: nobody; tool has own controller, no feedforward, no fitted lag -- neither is
+#: evidence about a start this ablation cares about. Achieved offset goes into
+#: every metrics row instead of hiding behind the gate.
 START_TOLERANCE = 0.05
 
-#: How long to wait for the park to settle after its goal returns. Slew's loop
-#: is a trim integrator with a 28 s dominant time constant (jtc_pid yaml), so
-#: "the goal succeeded" and "the axis has stopped moving" are not the same
-#: event and the second one is the one that matters here.
+#: Wait for park to settle after its goal returns. Slew loop is trim integrator,
+#: 28 s dominant time constant, so "goal succeeded" and "axis stopped moving"
+#: are different events; second one matters here.
 PARK_SETTLE_S = 40.0
 
-#: rad, and rad/s. **The pendulum is the reason this exists.** `q0` puts the
-#: passive pair at `passive_equilibrium` with `dq_u = 0` -- hanging straight and
-#: still -- so a run started while the tool is still swinging is a run the OCP
-#: did not plan. Measured: parking left tilt 0.224 rad off vertical, past the
-#: planner's own `q_sway_max` of 0.2, and every axis then tracked a plan whose
-#: start never happened. Nothing commands the pair, so waiting is the only
-#: instrument there is.
+#: rad, and rad/s. **Pendulum is why this exists.** `q0` puts passive pair at
+#: `passive_equilibrium` with `dq_u = 0` -- hanging straight, still -- so a run
+#: started while tool still swings is a run the OCP did not plan. Measured:
+#: parking left tilt 0.224 rad off vertical, past planner's `q_sway_max` of 0.2,
+#: every axis then tracked a plan whose start never happened. Nothing commands
+#: the pair, so waiting is the only instrument there is.
 PASSIVE_TOLERANCE = 0.03
 REST_RATE = 0.05
 
@@ -191,9 +184,9 @@ class Bench(Node):
         width = len(message.joint_names)
 
         def row(values) -> list:
-            # `output` carries the commanded joints only, which is six of eight
-            # here, so it is shorter than the other three. Padded rather than
-            # dropped, and never zero-filled: an absent command is not a zero one.
+            # `output` carries commanded joints only, six of eight here, so
+            # shorter than other three. Padded, not dropped, never zero-filled:
+            # absent command is not a zero one.
             padded = list(values) + [float("nan")] * (width - len(values))
             return padded[:width]
 
@@ -255,10 +248,9 @@ class Bench(Node):
         """Send one goal with the stamp zeroed. Returns `(status, samples)`."""
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
-        # Start now. The planner stamps its answer with the `/joint_states` it
-        # planned from, which by the time the goal is sent is seconds old; the
-        # JTC honours that stamp and would sample into the middle of the plan.
-        # The behaviour tree zeroes it for the same reason.
+        # Start now. Planner stamps answer with `/joint_states` it planned from,
+        # seconds old by the time goal is sent; JTC honours that stamp and would
+        # sample into middle of plan. Behaviour tree zeroes it for same reason.
         goal.trajectory.header.stamp.sec = 0
         goal.trajectory.header.stamp.nanosec = 0
         self.samples = []
@@ -298,8 +290,8 @@ class Bench(Node):
         """
         Drive to `q0`, then wait for the machine to stop.
 
-        Both halves are needed and neither implies the other: the goal reports
-        success on the commanded axes' tolerances, which the pendulum is not in.
+        Both halves needed, neither implies the other: goal reports success on
+        commanded axes' tolerances, which the pendulum is not in.
         """
         travel = self.offset_from(q0, order)
         status, _ = self.execute(
@@ -342,11 +334,11 @@ def metrics(samples: list, duration: float, names: list, order: list) -> list:
             continue
         goal = float(reference[-1, j])
         travel = goal - float(reference[0, j])
-        # Signed by the direction of travel, so an undershoot reads negative
-        # rather than as a zero indistinguishable from perfect.
+        # Signed by direction of travel, so undershoot reads negative instead of
+        # a zero indistinguishable from perfect.
         past = np.sign(travel) * (feedback[:, j] - goal)
-        # The last instant the loop was still outside 1 % of the move, measured
-        # from the end of the *reference* rather than of the recording.
+        # Last instant the loop was still outside 1 % of the move, measured from
+        # end of the *reference*, not of the recording.
         outside = np.nonzero(np.abs(error[:, j]) > 0.01 * span)[0]
         settle = float(t[outside[-1]] - duration) if outside.size else float("-inf")
         rows.append(
@@ -375,8 +367,8 @@ def write_move_csv(path: Path, runs: dict, names: list, order: list) -> None:
             for j, name in enumerate(names):
                 columns[f"{arm}/{name}/{label}"] = np.interp(grid, t, block[:, j])
         for j, name in enumerate(names):
-            # The ablated signal itself, held at zero past the end of the plan,
-            # which is where the reference holds it too.
+            # Ablated signal itself, held at zero past end of plan, where the
+            # reference holds it too.
             columns[f"{arm}/{name}/ff"] = np.interp(
                 grid, stamps, effort[:, j], right=0.0
             )
@@ -452,8 +444,8 @@ def main() -> int:
         node.get_logger().error(f"no {options.controller} action server after 30 s")
         return 1
 
-    # Activated once for the whole campaign rather than around every goal: the
-    # tree is idle and nothing else claims these interfaces.
+    # Activated once for the whole campaign, not around every goal: tree is idle
+    # and nothing else claims these interfaces.
     if not node.switch_controller(True):
         node.get_logger().error(f"could not activate {options.controller}")
         return 1
@@ -480,9 +472,9 @@ def main() -> int:
                 continue
             trajectory = answer.trajectory
             if not names:
-                # The plan's own order is the reporting order, and the map into
-                # the controller's is built by name. The two lists are not the
-                # same order and indexing across them is the standing footgun.
+                # Plan's own order is the reporting order; map into controller's
+                # is built by name. The two lists differ in order and indexing
+                # across them is the standing footgun.
                 names = list(trajectory.joint_names)
                 missing = [n for n in names if n not in node.state_names]
                 if missing:
@@ -497,8 +489,8 @@ def main() -> int:
                 f"{'yes' if trajectory.points[0].effort else 'no'}"
             )
             for repeat in range(options.repeats):
-                # Park first, and check it landed: a run that started somewhere
-                # else is not a run of this plan.
+                # Park first, check it landed: a run started elsewhere is no run
+                # of this plan.
                 park_status, offset, sway, speed = node.park(
                     names, move["q0"], order, options.park_rate
                 )
@@ -546,7 +538,7 @@ def main() -> int:
             write_move_csv(path, per_arm, names, order)
             print(f"  -> {path}")
 
-    # Left active on purpose. Deactivating it stops `controller_state`, and a
+    # Left active on purpose. Deactivating stops `controller_state`, and a
     # campaign that cannot be probed after it finishes cannot be debugged.
     if options.deactivate:
         node.switch_controller(False)

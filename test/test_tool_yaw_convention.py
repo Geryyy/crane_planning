@@ -12,7 +12,7 @@ from crane_planning.geometry import wrap, yaw_of
 Q_TOOL = 0.35
 
 #: `q_a = [q1 slew, q2 boom, q3 arm, q4 telescope, q8 rotator]`, spread so a
-#: formula that ignores either of the two angles that make `phi_tool` fails.
+#: formula ignoring either of the two angles that make `phi_tool` fails.
 CONFIGURATIONS = [
     (0.0, 0.2, -0.5, 0.1, 0.0),
     (0.3, 0.2, -0.5, 0.1, 0.0),
@@ -38,13 +38,12 @@ def model() -> CraneModel:
 @pytest.mark.parametrize("q_a", CONFIGURATIONS)
 def test_yaw_of_reads_the_legacy_tool_angle(q_a):
     """
-    The retained `a2b_movement` contract, pinned against the machine.
+    Retained `a2b_movement` contract, pinned against the machine.
 
-    `a2b_ilqr_server` closed the goal yaw as `theta8 = theta1 - phiTool`, so
-    `phi_tool = theta1 - theta8` exactly. It is the heading of the jaw-opening
-    direction, TCP local y. This is the only test that would catch the planner
-    answering the perpendicular axis, which is 90 deg off and still a
-    plausible-looking plan.
+    Legacy planner closed goal yaw as `theta8 = theta1 - phiTool`, so
+    `phi_tool = theta1 - theta8` exactly. Heading of jaw-opening direction, TCP
+    local y. Only test catching the planner answering the perpendicular axis --
+    90 deg off, still a plausible-looking plan.
     """
     crane = model()
     q_a = np.asarray(q_a, dtype=float)

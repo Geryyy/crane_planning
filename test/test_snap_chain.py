@@ -1,16 +1,14 @@
 """`sigma` is integrated four times, so the reference is `C4` in time.
 
-With the acceleration as the input, acados held it constant across an interval and
-`ddq_a` jumped at every node: `q_a(t)` was `C1` however smooth the curve was. With
-the snap as the input, `sigma` is quartic on each interval and `sigma`, `v`, `a`,
-`j` are all continuous across the join, so `q_a(t) = c(sigma(t))` is `C4` -- the
-derivative count `wiki/controller_design.md` section 2.4 asks for.
+Acceleration as input: acados held it constant across an interval, `ddq_a` jumped
+at every node, `q_a(t)` was `C1` however smooth the curve. Snap as input: `sigma`
+quartic per interval, `sigma`, `v`, `a`, `j` continuous across joins, so
+`q_a(t) = c(sigma(t))` is `C4` -- the derivative count controller design wants.
 
-Two things can break silently. The row order is written once in `X_*` and read back
-positionally everywhere, so a reorder that misses one reader gives plausible wrong
-numbers rather than an error. And the resampler reconstructs `sigma` from the chain
-in closed form; if it keeps a lower-order formula the samples stop being on the
-plan, which is exactly what issue 110 fixed for the previous layout.
+Two silent breakages. Row order written once in `X_*`, read back positionally
+everywhere: a reorder missing one reader gives plausible wrong numbers, not an
+error. And the resampler rebuilds `sigma` in closed form; a lower-order formula
+puts samples off the plan -- what an earlier fix cured for the previous layout.
 """
 
 from pathlib import Path
@@ -43,7 +41,7 @@ COEFFICIENTS[0, 3] = [0.60, -0.30, 0.40, -0.50, 0.25]
 
 
 def description() -> str:
-    """The expanded PZS100 description crane_model keeps as a fixture."""
+    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"
@@ -74,7 +72,7 @@ def test_the_state_layout_is_what_the_model_carries():
 
 
 def chain(snap: np.ndarray, duration: float = 2.0) -> SimpleNamespace:
-    """A solved chain: integrate a per-interval snap exactly, node to node."""
+    """Solved chain: integrate a per-interval snap exactly, node to node."""
     nodes = len(snap)
     time = np.linspace(0.0, duration, nodes + 1)
     step = duration / nodes
@@ -106,12 +104,11 @@ def chain(snap: np.ndarray, duration: float = 2.0) -> SimpleNamespace:
 
 def test_the_resampler_reproduces_the_chain_at_the_next_node():
     """
-    A lower-order reconstruction lands on the right value only at `dt = 0`.
+    A lower-order reconstruction lands right only at `dt = 0`.
 
-    Sampling exactly on the node grid would pass whatever formula the resampler
-    used, because every interval is entered at `dt = 0`. So the check is that
-    integrating interval `k` all the way across reproduces node `k+1`, which is
-    the property a quadratic or cubic formula does not have.
+    Sampling on the node grid passes whatever formula the resampler uses -- every
+    interval is entered at `dt = 0`. So: integrate interval `k` all the way across
+    and reproduce node `k+1`, which a quadratic or cubic formula cannot.
     """
     plan = chain(np.array([3.0, -2.0, 1.5, -4.0, 0.5]))
     edges = plan.time[1:] - 1.0e-12  # inside interval k, at its right edge
@@ -124,7 +121,7 @@ def test_the_resampler_reproduces_the_chain_at_the_next_node():
 
 
 def test_a_quadratic_reconstruction_would_fail_that():
-    """The oracle discriminates: the pre-112 formula misses by a wide margin."""
+    """Oracle discriminates: the old quadratic formula misses by a wide margin."""
     plan = chain(np.array([3.0, -2.0, 1.5, -4.0, 0.5]))
     step = plan.time[1] - plan.time[0]
     quadratic = (
