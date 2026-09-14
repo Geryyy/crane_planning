@@ -343,6 +343,35 @@ class Planner:
             q_tool=start.q_tool,
             speed_scale=speed_scale,
         )
+        # **The certificate rests on this row and on no other.** `Geometry` builds
+        # the clearance envelope from `q_sway_max` and the geometric stage proves
+        # the corridor clear against that envelope; in the OCP the same box is
+        # *soft*, priced at `ocp_slack_price`. So on a request it cannot otherwise
+        # meet, the solve may buy its way out at the price rather than refuse, and
+        # what it returns is then a plan that swings outside the envelope the
+        # certificate covers -- converged, every residual clean while it does it,
+        # which is why nothing upstream notices.
+        #
+        # No request provoking one is known: on the shipped fixture every
+        # over-constrained request tried non-converges instead of paying (the
+        # 2026-09-14 handoff has the sweep). The row is soft and purchasable
+        # either way, and two of those near-misses stalled at a stationarity
+        # residual of 1e-4 to 1e-3, which is a solve that pays given iterations.
+        #
+        # Refused here rather than priced higher: raising the price trades the
+        # violation for a non-convergence, which is the same plan not arriving
+        # with a worse diagnosis. `slack` rides the message so the flow row's
+        # share is visible too -- that one is over-draw, not a breached proof,
+        # and it stays a log line.
+        if timing.sway_slack > SLACK_SPENT:
+            raise PlanningError(
+                "the timing solve bought the sway box instead of meeting it: "
+                f"{timing.sway_slack:.3g} of slack on the sway rows "
+                f"({timing.sway_slack * 100.0:.1f}% of q_sway_max) out of "
+                f"{timing.slack:.3g} total, so the tool leaves the clearance "
+                "envelope the corridor was certified against",
+                stats=timing.report(),
+            )
         terminal_offset = np.abs(timing.q_u[-1] - timing.q_u_eq[-1])
         terminal_rate = np.abs(timing.dq_u[-1])
         if np.any(terminal_offset > self.config.terminal_q_sway_max) or np.any(

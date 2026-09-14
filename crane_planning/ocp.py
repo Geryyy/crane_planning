@@ -97,6 +97,9 @@ NX, NU = 9, 1
 #: rate and input blocks were boxes on `x` and `u` when `q_a` was planned; they
 #: are nonlinear rows now because what they bound is an expression in `sigma`.
 H_SWAY, H_FLOW, H_RATE = 0, 2, 3
+#: How many rows the sway box occupies, at every stage and at the terminal node
+#: alike. Both nodes order `h` sway-first, so one slice reads the pair on either.
+NH_SWAY = 2
 H_ACCEL = 3 + cs.K_PLANNED_DOF
 #: The C3 command itself, `u = dq_a + tau_dot_a / k`, against the domain the
 #: compensator was identified over. It replaced a `dddq_a` row: bounding the
@@ -302,6 +305,7 @@ SLACK_SPENT = 1e-6
 #: set of keys and never has to branch on the outcome to know what arrived.
 PLAN_ROWS = (
     "slack",
+    "sway_slack",
     "pump_flow_peak",
     "terminal_sway",
     "terminal_sway_rate",
@@ -343,6 +347,32 @@ def solver_stats(solver, status: int, elapsed: float) -> dict:
     )
     stats.update({name: float("nan") for name in PLAN_ROWS})
     return stats
+
+
+def slack_spent(solver, N: int) -> tuple:
+    """
+    Report what the answer paid on the soft rows: the worst of any, and sway's.
+
+    **Both sides.** `sl` alone was the whole report, and on a box symmetric about
+    zero that misses every violation overshooting the *upper* bound -- half of
+    them, and on sway the half that swings the tool whichever way the scene
+    happens to sit.
+
+    The sway figure excludes node `N`, whose sway rows carry the *settled* box an
+    order tighter rather than the envelope. Missing that is an arrival that is not
+    still yet, which `Planner.plan` already reports in radians; folding it in here
+    would have the envelope number fire on it.
+    """
+    slack, sway_slack = 0.0, 0.0
+    for node in range(N + 1):
+        for side in ("sl", "su"):
+            value = np.asarray(solver.get(node, side), dtype=float).ravel()
+            slack = max(slack, float(np.max(value, initial=0.0)))
+            if node < N:
+                sway_slack = max(
+                    sway_slack, float(np.max(value[:NH_SWAY], initial=0.0))
+                )
+    return slack, sway_slack
 
 
 def divergence(key: dict) -> list:
@@ -738,6 +768,13 @@ class Trajectory:
     q_u_eq: np.ndarray
     pump_flow: np.ndarray  # (N+1,) as a fraction of the physical pump
     slack: float
+    #: The share of `slack` spent on the sway box alone, over the stage nodes, in
+    #: units of `q_sway_max`. Its own number because the clearance certificate
+    #: rests on that box and on no other soft row: `Geometry` builds the envelope
+    #: from `q_sway_max`, so sway bought with slack is a plan that swings outside
+    #: the envelope the geometric stage proved clear. Pump slack is a different
+    #: and lesser matter, and a single maximum could not tell them apart.
+    sway_slack: float
     iterations: int
     solve_time_s: float  # wall clock around the call, so it carries Python and load
     #: acados' `time_tot` and the four KKT residuals it stopped on. Wall clock is
@@ -764,6 +801,7 @@ class Trajectory:
         """
         return self.stats | {
             "slack": float(self.slack),
+            "sway_slack": float(self.sway_slack),
             "pump_flow_peak": float(np.max(self.pump_flow)),
             "terminal_sway": self.terminal_sway,
             "terminal_sway_rate": self.terminal_sway_rate,
@@ -1005,6 +1043,21 @@ class TrajectoryOcp:
                 cfg.terminal_dq_sway_max / cfg.dq_sway_max,
             ]
         )
+        # The terminal node is the one node `sway_slack` does not watch, on the
+        # grounds that its sway rows carry a box an order *tighter* than the
+        # envelope. Both are declared parameters, so that is an arrangement and
+        # not a fact: relax `terminal_q_sway_max` past `q_sway_max` -- the natural
+        # move when a goal will not settle -- and the goal configuration can sit
+        # outside the clearance envelope with neither check firing. Which is the
+        # worst place for it, the goal being where the block is set down.
+        if np.any(cfg.terminal_q_sway_max > cfg.q_sway_max):
+            raise PlanningError(
+                f"terminal_q_sway_max {np.asarray(cfg.terminal_q_sway_max).tolist()} "
+                f"is looser than q_sway_max {np.asarray(cfg.q_sway_max).tolist()} on "
+                "some hinge, which would let the goal pose leave the clearance "
+                "envelope unwatched: the settled box is a tightening of the "
+                "envelope, never a relaxation of it"
+            )
         parameters = np.concatenate(
             [[q_tool], payload, np.asarray(coefficients, dtype=float).reshape(-1)]
         )
@@ -1111,9 +1164,7 @@ class TrajectoryOcp:
         )
         q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
         dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
-        slack = max(
-            float(np.max(solver.get(node, "sl"), initial=0.0)) for node in range(N + 1)
-        )
+        slack, sway_slack = slack_spent(solver, N)
         flow = np.array(
             [
                 float(
@@ -1179,6 +1230,7 @@ class TrajectoryOcp:
             q_u_eq=np.array([passive_equilibrium(row) for row in q_a]),
             pump_flow=flow,
             slack=slack,
+            sway_slack=sway_slack,
             iterations=int(solver.get_stats("sqp_iter")),
             solve_time_s=elapsed,
             acados_time_s=float(solver.get_stats("time_tot")),
