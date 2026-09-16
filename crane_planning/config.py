@@ -8,7 +8,7 @@ from knowing about each other.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from crane_model import ACTUATED_INDICES, Frame, Tool, parse
@@ -74,12 +74,35 @@ class Limits:
     lower: np.ndarray  # position, per planned coordinate; -inf where continuous
     upper: np.ndarray
     bounded: np.ndarray  # False for a `continuous` joint -- no range
+    #: The same two rows before the control-safe box narrowed them. Only the
+    #: start-state check reads these: "this measurement cannot be real" is a
+    #: statement about the description, and a machine parked outside the
+    #: control-safe box is a normal thing to plan out of.
+    description_lower: np.ndarray
+    description_upper: np.ndarray
     dq_max: np.ndarray  # velocity, per planned coordinate
     tau_max: np.ndarray  # rated actuated effort, per planned coordinate
     flow_max: float  # summed pump draw
     tool_lower: float  # held tool-coordinate position
     tool_upper: float
     tool_bounded: bool
+
+    def relaxed_to(self, q_a: np.ndarray) -> Limits:
+        """
+        Widen the position rows to contain `q_a`, and change nothing else.
+
+        The control-safe box is narrower than the description, and the machine
+        parks outside it -- the boom folds below 0.02 rad. Refusing to plan
+        there would refuse to plan at all, so the box gives way to the measured
+        pose exactly as `crane_mpc`'s `position_box` does: it may never exclude
+        where the machine is, and it still bounds where the plan goes.
+        """
+        q_a = np.asarray(q_a, dtype=float)
+        return replace(
+            self,
+            lower=np.where(self.bounded, np.minimum(self.lower, q_a), self.lower),
+            upper=np.where(self.bounded, np.maximum(self.upper, q_a), self.upper),
+        )
 
 
 def read_limits(
@@ -129,6 +152,8 @@ def read_limits(
         upper[axis] = inner.upperPositionLimit[slot.idx_q] if slot.nq == 1 else np.inf
         dq_max[axis] = inner.velocityLimit[slot.idx_v]
         tau_max[axis] = inner.effortLimit[slot.idx_v]
+    description_lower = lower.copy()
+    description_upper = upper.copy()
     box = control_safe_limits()
     axis_of = {joint: axis for axis, joint in CONTROL_SAFE_AXES.items()}
     joints = canonical_joints()
@@ -165,6 +190,8 @@ def read_limits(
     return Limits(
         lower=lower,
         upper=upper,
+        description_lower=description_lower,
+        description_upper=description_upper,
         bounded=bounded,
         dq_max=dq_max,
         tau_max=tau_max,

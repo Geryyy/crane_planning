@@ -59,3 +59,19 @@ def test_the_tool_keeps_the_descriptions_travel():
     # The box's tool row is an angle on a retired jaw gripper, not this rail.
     read = limits()
     assert (read.tool_lower, read.tool_upper) == (0.0, 0.538)
+
+
+def test_the_box_gives_way_to_where_the_machine_is():
+    # The machine parks with the boom folded below the control-safe 0.02, which
+    # is a normal thing to plan out of. crane_mpc's position_box relaxes the
+    # same way; refusing here would refuse to plan at all.
+    read = limits()
+    folded = read.lower.copy()
+    folded[1] = -0.2
+    relaxed = read.relaxed_to(folded)
+
+    assert relaxed.lower[1] == -0.2
+    assert relaxed.upper[1] == read.upper[1]
+    assert list(relaxed.lower[2:]) == list(read.lower[2:])
+    # and the description still says where the stop actually is
+    assert read.description_lower[1] == -1.2

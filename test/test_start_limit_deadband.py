@@ -1,6 +1,10 @@
 """
 A joint parked on its stop reads a hair past it. Not a bad state.
 
+The stop is the *description's*, which is what `_validate_start` reads: the
+control-safe box is narrower and the machine parks outside it, so a start there
+is relaxed into rather than refused.
+
 Sim: four requests after one good move left the telescope retracted -- `planned
 coordinate 3 is measured at -0.000079, outside [0.000000, 2.236000]`, then
 -0.000091, -0.000104, -0.000144. Excursion creeps, so the first plan ending fully
@@ -32,7 +36,7 @@ def start_at(built: Planner, axis: int, position: float) -> Start:
 def test_a_joint_resting_on_its_stop_is_planned_from_the_stop():
     built = planner()
     axis = int(np.flatnonzero(built.limits.bounded)[0])
-    lower = float(built.limits.lower[axis])
+    lower = float(built.limits.description_lower[axis])
 
     checked = built._validate_start(start_at(built, axis, lower - 1.44e-4))
 
@@ -43,7 +47,7 @@ def test_a_state_well_outside_its_range_is_still_refused():
     """Deadband is for the stop, not for a wrong description."""
     built = planner()
     axis = int(np.flatnonzero(built.limits.bounded)[0])
-    lower = float(built.limits.lower[axis])
+    lower = float(built.limits.description_lower[axis])
 
     with pytest.raises(PlanningError, match="planned coordinate"):
         built._validate_start(start_at(built, axis, lower - 10.0 * LIMIT_DEADBAND))

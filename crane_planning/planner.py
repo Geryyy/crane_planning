@@ -239,6 +239,9 @@ class Planner:
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
         start = self._validate_start(start)
+        # The control-safe box may never exclude the measured pose; everything
+        # below plans inside this one rather than `self.limits`.
+        limits = self.limits.relaxed_to(start.q_a)
         if avoid_collisions and scene is None:
             raise PlanningError(
                 "avoid_collisions was asked for with no collision scene: a plan "
@@ -249,7 +252,7 @@ class Planner:
         payload_vector = payload_parameters(payload)
         geometry = Geometry(
             self.model,
-            self.limits,
+            limits,
             primitives,
             self.config,
             start.q_tool,
@@ -264,7 +267,7 @@ class Planner:
         # refinement closes. Joint-space line goes there directly.
         goal_q_a = solve_ik(
             geometry,
-            self.limits,
+            limits,
             self.config,
             np.asarray(goal_position_m, dtype=float),
             float(goal_yaw),
@@ -295,7 +298,7 @@ class Planner:
 
         path, lifted, candidate_name = plan_fitted_path(
             geometry,
-            self.limits,
+            limits,
             self.config,
             start.q_a,
             np.asarray(goal_position_m, dtype=float),
@@ -398,15 +401,20 @@ class Planner:
         if dq_u.size != len(PASSIVE_INDICES) or not np.all(np.isfinite(dq_u)):
             raise PlanningError("the start must contain two finite passive sway rates")
         q_a = q[list(PLANNED_INDICES)]
+        # The *description's* box, not the control-safe one: this asks whether
+        # the measurement can be real. A machine parked outside the control-safe
+        # box -- the boom folds below its 0.02 rad -- is normal, and `plan`
+        # relaxes the box to wherever it is rather than refusing.
         outside = self.limits.bounded & (
-            (q_a < self.limits.lower - LIMIT_DEADBAND)
-            | (q_a > self.limits.upper + LIMIT_DEADBAND)
+            (q_a < self.limits.description_lower - LIMIT_DEADBAND)
+            | (q_a > self.limits.description_upper + LIMIT_DEADBAND)
         )
         if np.any(outside):
             axis = int(np.flatnonzero(outside)[0])
             raise PlanningError(
                 f"planned coordinate {axis} is measured at {q_a[axis]:.6f}, outside "
-                f"[{self.limits.lower[axis]:.6f}, {self.limits.upper[axis]:.6f}] by "
+                f"[{self.limits.description_lower[axis]:.6f}, "
+                f"{self.limits.description_upper[axis]:.6f}] by "
                 f"more than {LIMIT_DEADBAND:.0e}; planning from a projected state "
                 "would not match the machine"
             )
@@ -425,7 +433,7 @@ class Planner:
         projected = q.copy()
         projected[list(PLANNED_INDICES)] = np.where(
             self.limits.bounded,
-            np.clip(q_a, self.limits.lower, self.limits.upper),
+            np.clip(q_a, self.limits.description_lower, self.limits.description_upper),
             q_a,
         )
         if self.limits.tool_bounded:

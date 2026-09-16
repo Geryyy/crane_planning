@@ -13,6 +13,8 @@ def limits() -> planning.Limits:
         lower=np.full(5, -10.0),
         upper=np.full(5, 10.0),
         bounded=np.ones(5, dtype=bool),
+        description_lower=np.full(5, -10.0),
+        description_upper=np.full(5, 10.0),
         dq_max=np.ones(5),
         tau_max=np.ones(5),
         flow_max=1.0,
