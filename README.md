@@ -12,9 +12,12 @@ plan(goal position + yaw in K0_mounting_base)
 No stochastic sampler. Everything the machine can do -- reach, hang, collide --
 is asked of `crane_model`; nothing about the machine is written down here. Joint
 ranges and velocity limits come from the `robot_description` the profile remaps
-this node onto, the EOM from `crane_model.symbolic`. The one number the
-description lacks (pump limit) sits in `config/crane_planner.yaml` with its
-evidence.
+this node onto, **intersected with `crane_model/config/control_safe_limits.yaml`**
+-- narrower than the description on the boom, the arm and four velocity rows, and
+the same box `crane_mpc` enforces, so this planner cannot certify a pose or a
+speed the MPC refuses. The EOM comes from `crane_model.symbolic`. The one number
+the description lacks (pump limit) is `crane_model`'s too, and
+`config/crane_planner.yaml` carries the overridable copy.
 
 ## The tool corridors
 

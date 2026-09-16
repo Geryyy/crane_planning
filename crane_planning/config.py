@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from crane_model import ACTUATED_INDICES, Frame, Tool, parse
+from crane_model.conventions import (
+    CONTROL_SAFE_AXES,
+    canonical_joints,
+    control_safe_limits,
+)
 
 #: Five coordinates a plan moves, canonical indices. Tool axis (q8) held by
 #: low-level controller, rides the path at constant value.
@@ -85,6 +90,21 @@ def read_limits(
     """
     Read position and velocity from the description, the pump from the config.
 
+    Then intersect with `crane_model`'s control-safe box, which is narrower
+    than the description on the boom and the arm and on four velocity rows. It
+    has to be intersected and not merely read: the description admits poses the
+    four-bar cannot reach, and until it was, this planner certified poses and
+    speeds the MPC's constraint 1 hard-refuses -- the boom below 0.02 rad, the
+    arm above 1.3039, and references up to 2.7x the MPC's own velocity bound.
+    The box carries `q_a_margin` because that is what constraint 1 enforces.
+
+    Two rows are deliberately not intersected. An unbounded axis keeps its
+    unboundedness: the rotator is `continuous`, the box bounds it by turn
+    counting, and a finite range on a cos/sin slot would mean something else
+    here. The tool keeps the description's travel, because the box's tool row
+    is an angle on a retired jaw gripper and does not describe this rail --
+    that file's `known_gaps` is the long form.
+
     A `continuous` joint occupies two configuration slots (cos/sin pair) and
     carries no range; the rotator is one, so reported unbounded rather than
     given an invented range here.
@@ -109,6 +129,22 @@ def read_limits(
         upper[axis] = inner.upperPositionLimit[slot.idx_q] if slot.nq == 1 else np.inf
         dq_max[axis] = inner.velocityLimit[slot.idx_v]
         tau_max[axis] = inner.effortLimit[slot.idx_v]
+    box = control_safe_limits()
+    axis_of = {joint: axis for axis, joint in CONTROL_SAFE_AXES.items()}
+    joints = canonical_joints()
+    for axis, index in enumerate(PLANNED_INDICES):
+        name = axis_of[joints[index]]
+        dq_max[axis] = min(dq_max[axis], box["dq_a_max"][name])
+        if not bounded[axis]:
+            continue
+        lower[axis] = max(lower[axis], box["q_a_lower"][name] + box["q_a_margin"][name])
+        upper[axis] = min(upper[axis], box["q_a_upper"][name] - box["q_a_margin"][name])
+        if lower[axis] >= upper[axis]:
+            raise PlanningError(
+                f"{joints[index]} has an empty box: the description and "
+                "crane_model's control-safe limits do not overlap"
+            )
+
     if not np.all(np.isfinite(dq_max)) or np.any(dq_max <= 0.0):
         raise PlanningError(
             "the description gives a planned joint no finite positive velocity limit"
