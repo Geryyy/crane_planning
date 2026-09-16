@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import matplotlib
@@ -32,7 +31,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
     sys.path.insert(0, str(PACKAGE.parent / "crane_model"))
 
 import plan_example  # noqa: E402
-from crane_model import Frame, Payload, presets  # noqa: E402
+from crane_model import Frame, presets  # noqa: E402
 from crane_model.conventions import ACTUATED_INDICES, PASSIVE_INDICES  # noqa: E402
 from crane_model.mujoco_plant import MujocoPlant, leave  # noqa: E402
 from crane_planning import Planner, PlanningError, Start  # noqa: E402
@@ -55,7 +54,6 @@ def arguments() -> argparse.Namespace:
         metavar=("X", "Y", "Z", "YAW"),
         help="TCP pose in K0_mounting_base instead of a preset goal",
     )
-    parser.add_argument("--payload-mass", type=float, default=0.0)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument(
         "--resettle-start",
@@ -95,7 +93,6 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--output", type=Path, default=PACKAGE / "build" / "tune_planner.png"
     )
-    parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--show", action="store_true")
     return parser.parse_args()
 
@@ -127,6 +124,40 @@ def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]
     return presets.goal_here(planner.model, start.q), yaw
 
 
+def plan_for(options) -> tuple[str, Planner, Start, object]:
+    """
+    Build the planner, solve the preset move, say what came out.
+
+    Shared with `crane_mpc/scripts/tune_mpc.py`, which tunes the controller
+    against the same plan this tunes the shaping of.
+    """
+    description = plan_example.description()
+    planner = Planner(description, plan_example.configure(options))
+    start = start_of(planner, options)
+    offset = start.q[list(PASSIVE_INDICES)] - planner.model.passive_equilibrium(
+        start.q[list(ACTUATED_INDICES)]
+    )
+    print(f"start passive pair sits {np.degrees(offset)} deg off rest")
+    position, yaw = goal_of(planner, start, options)
+    print(
+        f"goal: [{position[0]:.3f} {position[1]:.3f} {position[2]:.3f}] m, "
+        f"yaw {np.degrees(yaw):.1f} deg"
+    )
+    try:
+        plan = planner.plan(
+            start,
+            position,
+            yaw,
+            scene=[],
+            avoid_collisions=True,
+            speed_scale=options.speed_scale,
+        )
+    except PlanningError as refusal:
+        raise SystemExit(f"refused: {refusal}") from refusal
+    print(plan.message)
+    return description, planner, start, plan
+
+
 def roll(planner: Planner, description: str, plan, start: Start, options):
     """Drive the plan on MuJoCo, record what the load did, return both."""
     plant = MujocoPlant(description, timestep=options.timestep)
@@ -139,9 +170,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
     times, states, tracking = [0.0], [plant.state], [still]
 
     def advance(q_ref, dq_ref, ddq_ref, duration, stamp) -> None:
-        plant.follow(
-            q_ref, dq_ref, ddq_ref, duration, options.bandwidth, q_tool_ref=q_tool
-        )
+        plant.follow(q_ref, dq_ref, ddq_ref, duration, options.bandwidth)
         times.append(stamp)
         states.append(plant.state)
         tracking.append(plant.q[rows] - q_ref)
@@ -183,7 +212,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
     }, plant
 
 
-def report(plan, rolled: dict, elapsed: float) -> list[str]:
+def report(plan, rolled: dict) -> list[str]:
     """Say what the two models make of the same motion, side by side."""
     predicted = plan.timing.q_u - plan.timing.q_u_eq
     actual = rolled["q_u"] - rolled["q_u_eq"]
@@ -194,7 +223,7 @@ def report(plan, rolled: dict, elapsed: float) -> list[str]:
 
     return [
         f"plan           {plan.duration:.2f} s, {plan.timing.iterations} SQP"
-        f" iterations, {elapsed:.3f} s end to end",
+        f" iterations, {plan.timing.solve_time_s:.3f} s in the solver",
         "",
         "                       tip       tilt   [deg]",
         f"peak sway  OCP   {pair(np.max(np.abs(predicted), axis=0))}",
@@ -209,7 +238,7 @@ def report(plan, rolled: dict, elapsed: float) -> list[str]:
     ]
 
 
-def figure(plan, rolled: dict, elapsed: float):
+def figure(plan, rolled: dict):
     import matplotlib.pyplot as plt
 
     predicted = plan.timing.q_u - plan.timing.q_u_eq
@@ -238,7 +267,7 @@ def figure(plan, rolled: dict, elapsed: float):
     axes[1, 1].text(
         0.0,
         1.0,
-        "\n".join(report(plan, rolled, elapsed)),
+        "\n".join(report(plan, rolled)),
         family="monospace",
         fontsize=8,
         va="top",
@@ -259,58 +288,15 @@ def figure(plan, rolled: dict, elapsed: float):
 
 def main() -> int:
     options = arguments()
-    description = plan_example.description()
-    planner = Planner(description, plan_example.configure(options))
-
-    start = start_of(planner, options)
-    offset = start.q[list(PASSIVE_INDICES)] - planner.model.passive_equilibrium(
-        start.q[list(ACTUATED_INDICES)]
-    )
-    print(f"start passive pair sits {np.degrees(offset)} deg off rest")
-    position, yaw = goal_of(planner, start, options)
-    print(
-        f"goal: [{position[0]:.3f} {position[1]:.3f} {position[2]:.3f}] m, "
-        f"yaw {np.degrees(yaw):.1f} deg"
-    )
-
-    payload = Payload(mass_kg=options.payload_mass, valid=options.payload_mass > 0.0)
-    began = time.monotonic()
-    try:
-        plan = planner.plan(
-            start,
-            position,
-            yaw,
-            payload=payload if payload.valid else None,
-            scene=[],
-            avoid_collisions=True,
-            speed_scale=options.speed_scale,
-        )
-    except PlanningError as refusal:
-        print(f"refused: {refusal}", file=sys.stderr)
-        return 1
-    elapsed = time.monotonic() - began
-    print(plan.message)
-
+    description, planner, start, plan = plan_for(options)
     rolled, plant = roll(planner, description, plan, start, options)
-    for line in report(plan, rolled, elapsed):
+    for line in report(plan, rolled):
         print(line)
-
-    if options.csv is not None:
-        np.savetxt(
-            options.csv,
-            np.column_stack(
-                [rolled["time"], rolled["q_u"], rolled["q_u_eq"], rolled["dq_u"]]
-            ),
-            delimiter=",",
-            header="time_s,q_tip,q_tilt,q_tip_eq,q_tilt_eq,dq_tip,dq_tilt",
-            comments="",
-        )
-        print(f"wrote {options.csv}")
 
     if not options.show:
         matplotlib.use("Agg")
     options.output.parent.mkdir(parents=True, exist_ok=True)
-    figure(plan, rolled, elapsed).savefig(options.output, dpi=150)
+    figure(plan, rolled).savefig(options.output, dpi=150)
     print(f"wrote {options.output}")
     if options.show:
         import matplotlib.pyplot as plt
