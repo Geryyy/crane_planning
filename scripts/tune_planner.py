@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 """
-Plan one motion and roll it on MuJoCo, so the sway claim gets a second opinion.
+Plan one motion and roll it on MuJoCo, so the sway claim has a second opinion.
 
-`plan_example.py` answers "what did the OCP decide"; this answers "and was it
-right". The planner's sway trace is its own model's prediction, so a plan that
-arrives at rest on paper proves nothing about the plan -- only about the
-agreement between the OCP and the model it was exported from. MuJoCo is an
-independent articulated-body solver on the same URDF, so the gap between the two
-traces is the modelling error the planner is actually exposed to.
+`plan_example.py` says what the OCP decided; its sway trace is the OCP's own
+model predicting itself. This drives the same plan through an independent solver
+on the same URDF and plots the two against each other.
 
-    ./scripts/tune_planner.py --goal out --show
+    ./scripts/tune_planner.py --goal out --viewer
     ./scripts/tune_planner.py --goal here --kappa 0.6 --settle 8
 
-Start pose is `initialization_outside.yaml` (`crane_model.presets.OUTSIDE`).
-`--goal out` is a TCP placement at (4, 0, 2) m in `K0_mounting_base`; `--goal
-here` lifts the start TCP to z = 2 m and leaves x and y alone. Both are goals
-that could have been typed into the RViz panel, because that is the frame and
-the shape `crane_msgs/srv/PlanMotion` carries.
-
-What this does **not** simulate is the controller: the planned axes are driven
-onto the reference with gravity, damping and the mimic's pull cancelled, which
-is as close to an ideal drive as the plant allows. Tracking error is reported so
-a run says when that assumption is the thing being measured. The MPC's own
-tracking is `crane_mpc/scripts/tune_mpc.py`, and the hydraulics are in neither
-(`wiki/hydraulics.md` §5.1).
+Start is `crane_model.presets.OUTSIDE`. The planned axes are driven onto the
+reference with the resistance cancelled, as close to an ideal drive as the plant
+allows -- the controller is `crane_mpc/scripts/tune_mpc.py`, the hydraulics are
+in neither.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -46,7 +34,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
 import plan_example  # noqa: E402
 from crane_model import Frame, Payload, presets  # noqa: E402
 from crane_model.conventions import ACTUATED_INDICES, PASSIVE_INDICES  # noqa: E402
-from crane_model.mujoco_plant import MujocoPlant, viewer_was_opened  # noqa: E402
+from crane_model.mujoco_plant import MujocoPlant, leave  # noqa: E402
 from crane_planning import Planner, PlanningError, Start  # noqa: E402
 from crane_planning.planner import PLANNED_INDICES, TOOL_INDEX, yaw_of  # noqa: E402
 
@@ -72,11 +60,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument(
         "--resettle-start",
         action="store_true",
-        help=(
-            "replace the preset's passive pair with its own equilibrium. The "
-            "yaml's is about 20 mrad off, and that transient adds to every sway "
-            "number a run prints"
-        ),
+        help="start the passive pair at its own equilibrium, not the preset's",
     )
 
     tuning = parser.add_argument_group("timing")
@@ -90,55 +74,24 @@ def arguments() -> argparse.Namespace:
 
     plant = parser.add_argument_group("the plant")
     plant.add_argument(
-        "--settle",
-        type=float,
-        default=6.0,
-        help="seconds to hold the final pose after the plan ends, watching",
+        "--settle", type=float, default=6.0, help="seconds to hold the final pose"
     )
-    plant.add_argument(
-        "--timestep",
-        type=float,
-        default=5.0e-4,
-        help=(
-            "MuJoCo step. Pairs with --bandwidth: the drive is explicit, so "
-            "raising one without lowering the other diverges, and the plant "
-            "says so rather than quietly resetting a body"
-        ),
-    )
+    plant.add_argument("--timestep", type=float, default=5.0e-4)
     plant.add_argument(
         "--bandwidth",
         type=float,
         default=100.0,
-        help=(
-            "rad/s of the drive that puts the axes on the reference. The "
-            "arrival sway moves with it until it converges -- 30 rad/s still "
-            "reports half a degree of drive lag as if it were sway -- so a "
-            "number worth quoting is one that survives doubling this"
-        ),
+        help="rad/s of the drive. The arrival sway moves with it until it "
+        "converges, so a number worth quoting survives doubling this",
     )
-    plant.add_argument(
-        "--viewer",
-        action="store_true",
-        help="watch it in MuJoCo's passive viewer while it runs",
-    )
+    plant.add_argument("--viewer", action="store_true")
     plant.add_argument(
         "--realtime",
         type=float,
         default=1.0,
-        help=(
-            "viewer playback factor: 1.0 is a simulated second per second, 0 is "
-            "as fast as it computes. Pacing only, the run is the same either way"
-        ),
-    )
-    plant.add_argument(
-        "--collision",
-        action="store_true",
-        help="let MuJoCo resolve contacts too; off by default, the planner "
-        "already proved clearance against Coal",
+        help="viewer playback factor; 0 is as fast as it computes. Pacing only",
     )
 
-    # `build/` is ignored, which is where an artefact of a tuning run belongs;
-    # `mpc_a2b.py` writes its own beside it.
     parser.add_argument(
         "--output", type=Path, default=PACKAGE / "build" / "tune_planner.png"
     )
@@ -154,14 +107,14 @@ def start_of(planner: Planner, options) -> Start:
         q[list(PASSIVE_INDICES)] = planner.model.passive_equilibrium(
             q[list(ACTUATED_INDICES)]
         )
-    return Start(q=q, dq_a=np.zeros(len(ACTUATED_INDICES) - 1))
+    return Start(q=q, dq_a=np.zeros(len(PLANNED_INDICES)))
 
 
 def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]:
-    """Where the tool goes, and the yaw it keeps, both in K0_mounting_base."""
-    pose = planner.model.forward_kinematics(start.q, Frame.MOUNTING_BASE, Frame.TCP)
+    """Where the tool goes and the yaw it keeps, in K0_mounting_base."""
     import pinocchio as pin
 
+    pose = planner.model.forward_kinematics(start.q, Frame.MOUNTING_BASE, Frame.TCP)
     yaw = yaw_of(
         pin.XYZQUATToSE3(
             np.concatenate([pose.position_m, pose.orientation_xyzw])
@@ -175,96 +128,73 @@ def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]
 
 
 def roll(planner: Planner, description: str, plan, start: Start, options):
-    """
-    Drive the plan on MuJoCo and record what the load did; return both.
-
-    The plan is a sampled reference at its own `Ts`, so the plant is advanced
-    one sample at a time on the same grid; after the last sample the final pose
-    is held for `--settle` seconds, which is where a plan that merely *arrives*
-    quiet separates from one that *leaves* the load quiet.
-    """
-    plant = MujocoPlant(
-        description, timestep=options.timestep, collision=options.collision
-    )
-    plant.set_state(start.q, np.zeros(len(start.q)))
-    if options.viewer:
-        plant.open_viewer(realtime=options.realtime)
-
-    times, states, tracking = [0.0], [plant.state], [np.zeros(len(PLANNED_INDICES))]
-    sample = float(plan.time[1] - plan.time[0])
+    """Drive the plan on MuJoCo, record what the load did, return both."""
+    plant = MujocoPlant(description, timestep=options.timestep)
+    plant.set_state(start.q)
     q_tool = float(start.q[TOOL_INDEX])
+    sample = float(plan.time[1] - plan.time[0])
+    still = np.zeros(len(PLANNED_INDICES))
+    rows = list(PLANNED_INDICES)
+
+    times, states, tracking = [0.0], [plant.state], [still]
 
     def advance(q_ref, dq_ref, ddq_ref, duration, stamp) -> None:
         plant.follow(
-            q_ref,
-            dq_ref,
-            ddq_ref,
-            duration,
-            bandwidth_rad_s=options.bandwidth,
-            q_tool_ref=q_tool,
+            q_ref, dq_ref, ddq_ref, duration, options.bandwidth, q_tool_ref=q_tool
         )
         times.append(stamp)
         states.append(plant.state)
-        tracking.append(plant.q[list(PLANNED_INDICES)] - q_ref)
+        tracking.append(plant.q[rows] - q_ref)
 
+    if options.viewer:
+        plant.open_viewer(options.realtime)
     for index in range(1, plan.time.size):
         advance(
-            plan.q[index, list(PLANNED_INDICES)],
-            plan.dq[index, list(PLANNED_INDICES)],
-            plan.ddq[index, list(PLANNED_INDICES)],
+            plan.q[index, rows],
+            plan.dq[index, rows],
+            plan.ddq[index, rows],
             float(plan.time[index] - plan.time[index - 1]),
             float(plan.time[index]),
         )
-    held = plan.q[-1, list(PLANNED_INDICES)]
-    still = np.zeros(len(PLANNED_INDICES))
+    # A plan that merely *arrives* quiet separates here from one that leaves the
+    # load quiet.
     for step in range(int(round(options.settle / sample))):
-        advance(held, still, still, sample, float(plan.time[-1] + (step + 1) * sample))
+        advance(
+            plan.q[-1, rows],
+            still,
+            still,
+            sample,
+            float(plan.time[-1] + (step + 1) * sample),
+        )
 
     state = np.array(states)
-    # Sway is an offset from rest, and rest moves with the machine: the passive
-    # pair's equilibrium is a function of where the actuated axes are, so it is
-    # re-solved per sample rather than taken at the start pose.
-    equilibrium = np.array(
-        [
-            planner.model.passive_equilibrium(
-                _canonical(row, q_tool)[list(ACTUATED_INDICES)]
-            )
-            for row in state
-        ]
-    )
+    # Rest moves with the machine, so the equilibrium is re-solved per sample.
+    equilibrium = []
+    for row in state:
+        q = np.zeros(8)
+        q[rows], q[list(PASSIVE_INDICES)], q[TOOL_INDEX] = row[0:5], row[5:7], q_tool
+        equilibrium.append(planner.model.passive_equilibrium(q[list(ACTUATED_INDICES)]))
     return {
         "time": np.array(times),
-        "q_a": state[:, 0:5],
         "q_u": state[:, 5:7],
-        "dq_a": state[:, 7:12],
         "dq_u": state[:, 12:14],
-        "q_u_eq": equilibrium,
+        "q_u_eq": np.array(equilibrium),
         "tracking": np.array(tracking),
     }, plant
 
 
-def _canonical(rigid: np.ndarray, q_tool: float) -> np.ndarray:
-    q = np.zeros(8)
-    q[list(PLANNED_INDICES)] = rigid[0:5]
-    q[list(PASSIVE_INDICES)] = rigid[5:7]
-    q[TOOL_INDEX] = q_tool
-    return q
-
-
-def report(plan, rolled: dict, planning_elapsed: float) -> list[str]:
+def report(plan, rolled: dict, elapsed: float) -> list[str]:
     """Say what the two models make of the same motion, side by side."""
-    timing = plan.timing
-    predicted = timing.q_u - timing.q_u_eq
+    predicted = plan.timing.q_u - plan.timing.q_u_eq
     actual = rolled["q_u"] - rolled["q_u_eq"]
     arrival = int(np.searchsorted(rolled["time"], plan.duration))
 
     def pair(values) -> str:
-        tip, tilt = np.degrees(values)
-        return f"{tip:9.3f}  {tilt:9.3f}"
+        return "{:9.3f}  {:9.3f}".format(*np.degrees(values))
 
     return [
-        f"plan           {plan.duration:.2f} s, {timing.iterations} SQP iterations",
-        f"planner call   {planning_elapsed:.3f} s end to end",
+        f"plan           {plan.duration:.2f} s, {plan.timing.iterations} SQP"
+        f" iterations, {elapsed:.3f} s end to end",
         "",
         "                       tip       tilt   [deg]",
         f"peak sway  OCP   {pair(np.max(np.abs(predicted), axis=0))}",
@@ -274,61 +204,54 @@ def report(plan, rolled: dict, planning_elapsed: float) -> list[str]:
         f"after settle     {pair(actual[-1])}",
         f"settled rate     {pair(rolled['dq_u'][-1])}  [deg/s]",
         "",
-        f"drive error    {np.max(np.abs(rolled['tracking'])):.2e} worst axis, "
-        "worst instant",
-        "               (raise --bandwidth if this is the size of the sway)",
+        f"drive error    {np.max(np.abs(rolled['tracking'])):.2e} worst axis and"
+        " instant; raise --bandwidth if that is the size of the sway",
     ]
 
 
-def figure(plan, rolled: dict, planning_elapsed: float):
+def figure(plan, rolled: dict, elapsed: float):
     import matplotlib.pyplot as plt
 
-    timing = plan.timing
-    predicted = timing.q_u - timing.q_u_eq
+    predicted = plan.timing.q_u - plan.timing.q_u_eq
     actual = rolled["q_u"] - rolled["q_u_eq"]
     t = rolled["time"]
-
     fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+
     for index, label in enumerate(("tip", "tilt")):
         colour = f"C{index}"
-        axes[0, 0].plot(
-            timing.time, predicted[:, index], colour, ls="--", label=f"{label} OCP"
-        )
-        axes[0, 0].plot(t, actual[:, index], colour, label=f"{label} MuJoCo")
-        axes[0, 1].plot(
-            timing.time, timing.dq_u[:, index], colour, ls="--", label=f"{label} OCP"
-        )
-        axes[0, 1].plot(t, rolled["dq_u"][:, index], colour, label=f"{label} MuJoCo")
+        for cell, ocp, mjc in (
+            (axes[0, 0], predicted[:, index], actual[:, index]),
+            (axes[0, 1], plan.timing.dq_u[:, index], rolled["dq_u"][:, index]),
+        ):
+            cell.plot(plan.timing.time, ocp, colour, ls="--", label=f"{label} OCP")
+            cell.plot(t, mjc, colour, label=f"{label} MuJoCo")
     axes[0, 0].set_ylabel(r"sway offset $q_u - q_u^{eq}$ [rad]")
     axes[0, 1].set_ylabel("sway rate [rad/s]")
-    for cell in (axes[0, 0], axes[0, 1]):
+    for cell in axes[0]:
         cell.axvline(plan.duration, color="k", lw=0.8, ls=":")
 
-    names = [f"q{index + 1}" for index in PLANNED_INDICES]
-    for axis, name in enumerate(names):
-        axes[1, 0].plot(t, rolled["tracking"][:, axis], label=name)
+    for axis, index in enumerate(PLANNED_INDICES):
+        axes[1, 0].plot(t, rolled["tracking"][:, axis], label=f"q{index + 1}")
     axes[1, 0].set_ylabel("drive error, plant - reference [rad, m]")
 
     axes[1, 1].axis("off")
     axes[1, 1].text(
         0.0,
         1.0,
-        "\n".join(report(plan, rolled, planning_elapsed)),
+        "\n".join(report(plan, rolled, elapsed)),
         family="monospace",
         fontsize=8,
         va="top",
         transform=axes[1, 1].transAxes,
     )
-
-    for row in axes:
-        for cell in row:
-            cell.grid(alpha=0.3)
-            cell.set_xlabel("time [s]")
-            if cell.get_legend_handles_labels()[0]:
-                cell.legend(fontsize=7, ncol=2)
+    for cell in axes.flat:
+        cell.grid(alpha=0.3)
+        cell.set_xlabel("time [s]")
+        if cell.get_legend_handles_labels()[0]:
+            cell.legend(fontsize=7, ncol=2)
     fig.suptitle(
-        f"plan of {plan.duration:.2f} s rolled on MuJoCo; dotted = the OCP's own "
-        "prediction, solid = the plant"
+        f"plan of {plan.duration:.2f} s on MuJoCo; dotted = the OCP's own"
+        " prediction, solid = the plant"
     )
     fig.tight_layout()
     return fig
@@ -340,7 +263,9 @@ def main() -> int:
     planner = Planner(description, plan_example.configure(options))
 
     start = start_of(planner, options)
-    offset = presets.settled(planner.model, start.q)
+    offset = start.q[list(PASSIVE_INDICES)] - planner.model.passive_equilibrium(
+        start.q[list(ACTUATED_INDICES)]
+    )
     print(f"start passive pair sits {np.degrees(offset)} deg off rest")
     position, yaw = goal_of(planner, start, options)
     print(
@@ -361,49 +286,36 @@ def main() -> int:
             speed_scale=options.speed_scale,
         )
     except PlanningError as refusal:
-        print(f"refused: {refusal}")
+        print(f"refused: {refusal}", file=sys.stderr)
         return 1
-    planning_elapsed = time.monotonic() - began
+    elapsed = time.monotonic() - began
     print(plan.message)
 
     rolled, plant = roll(planner, description, plan, start, options)
-    for line in report(plan, rolled, planning_elapsed):
+    for line in report(plan, rolled, elapsed):
         print(line)
 
     if options.csv is not None:
-        header = "time_s," + ",".join(
-            [f"q{index + 1}" for index in PLANNED_INDICES]
-            + ["q_tip", "q_tilt", "q_tip_eq", "q_tilt_eq", "dq_tip", "dq_tilt"]
-        )
         np.savetxt(
             options.csv,
             np.column_stack(
-                [
-                    rolled["time"],
-                    rolled["q_a"],
-                    rolled["q_u"],
-                    rolled["q_u_eq"],
-                    rolled["dq_u"],
-                ]
+                [rolled["time"], rolled["q_u"], rolled["q_u_eq"], rolled["dq_u"]]
             ),
             delimiter=",",
-            header=header,
+            header="time_s,q_tip,q_tilt,q_tip_eq,q_tilt_eq,dq_tip,dq_tilt",
             comments="",
         )
         print(f"wrote {options.csv}")
 
     if not options.show:
         matplotlib.use("Agg")
-    fig = figure(plan, rolled, planning_elapsed)
     options.output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(options.output, dpi=150)
+    figure(plan, rolled, elapsed).savefig(options.output, dpi=150)
     print(f"wrote {options.output}")
     if options.show:
         import matplotlib.pyplot as plt
 
         plt.show()
-    # The window outlives the run: the interesting part of a lift is often the
-    # pose it ends in, and the report and the figure are worth having first.
     if options.viewer:
         print("close the viewer window to finish")
     plant.hold_viewer()
@@ -411,12 +323,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    status = main()
-    # A viewer run would otherwise exit 139: MuJoCo's viewer segfaults on
-    # interpreter teardown here, after every file is written. `os._exit` leaves
-    # without tearing down.
-    if viewer_was_opened():
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os._exit(status)
-    raise SystemExit(status)
+    raise SystemExit(leave(main()))
