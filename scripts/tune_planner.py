@@ -137,7 +137,11 @@ def arguments() -> argparse.Namespace:
         "already proved clearance against Coal",
     )
 
-    parser.add_argument("--output", type=Path, default=Path("tune_planner.png"))
+    # `build/` is ignored, which is where an artefact of a tuning run belongs;
+    # `mpc_a2b.py` writes its own beside it.
+    parser.add_argument(
+        "--output", type=Path, default=PACKAGE / "build" / "tune_planner.png"
+    )
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--show", action="store_true")
     return parser.parse_args()
@@ -391,6 +395,7 @@ def main() -> int:
     if not options.show:
         matplotlib.use("Agg")
     fig = figure(plan, rolled, planning_elapsed)
+    options.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(options.output, dpi=150)
     print(f"wrote {options.output}")
     if options.show:

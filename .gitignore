@@ -9,3 +9,5 @@ __pycache__/
 # acados compiles the solver here at construction; the shippable tree that
 # `scripts/export_timing_ocp.py` writes is not committed for now.
 generated/
+# MuJoCo appends its warnings here, in whatever directory a run started in.
+MUJOCO_LOG.TXT
