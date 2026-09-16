@@ -5,6 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -13,6 +14,7 @@ def generate_launch_description() -> LaunchDescription:
     parameter_file = LaunchConfiguration("parameter_file")
     joint_states_topic = LaunchConfiguration("joint_states_topic")
     allow_missing_scene = LaunchConfiguration("allow_missing_scene")
+    c3_feedforward = LaunchConfiguration("c3_feedforward")
 
     default_parameter_file = (
         PathSubstitution(FindPackageShare("crane_planning"))
@@ -45,6 +47,16 @@ def generate_launch_description() -> LaunchDescription:
                     "collision scene is published, instead of refusing."
                 ),
             ),
+            DeclareLaunchArgument(
+                "c3_feedforward",
+                default_value="true",
+                description=(
+                    "Write C3's inversion into the trajectory effort field. "
+                    "False for controllers that neither consume it nor set "
+                    "`effort_field_is_feedforward`: the JTC rejects the goal "
+                    "outright rather than ignoring the field."
+                ),
+            ),
             Node(
                 package="crane_planning",
                 executable="crane_planner_node",
@@ -54,6 +66,7 @@ def generate_launch_description() -> LaunchDescription:
                     parameter_file,
                     {"use_sim_time": use_sim_time},
                     {"allow_missing_scene": allow_missing_scene},
+                    {"c3_feedforward": ParameterValue(c3_feedforward, value_type=bool)},
                 ],
                 remappings=[("/joint_states", joint_states_topic)],
             ),

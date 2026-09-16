@@ -277,14 +277,13 @@ crane_planner:
 
     # --- the one hydraulic number the description does not carry -------------
     #
-    # `pump_flow_max` is parameters.md 4's Q_P^max = 1.4e-3 m^3/s, *measured 2023,
-    # pre-retrofit, not re-verified*: taken on a machine since rebuilt and never
-    # checked against the pump on the crane today. `pump_flow_planning_factor` is
-    # that page's 0.95 planning discount and is **not** a second kappa -- kappa is
-    # a separate, larger reservation. The two multiply.
+    # Both are `crane_model/config/hydraulics.yaml`'s `pump` block, which is the
+    # source and carries the provenance; `crane_mpc` declares the same pair and
+    # test_parameters_are_declared pins this copy to it. Overridable here because
+    # a deployment may have to, not because this is where the number is decided.
     #
-    # Closing this needs a flow measurement on the retrofitted machine; the
-    # control_recordings/ bags do not contain one. It is now the **only** actuator
-    # limit the planner enforces, which raises what measuring it is worth.
-    pump_flow_max: 0.0014
+    # It is the **only** actuator limit the planner enforces, and it is measured
+    # 2023, pre-retrofit and not re-verified, which raises what measuring it on
+    # the retrofitted machine is worth.
+    pump_flow_max: 1.4e-3
     pump_flow_planning_factor: 0.95
