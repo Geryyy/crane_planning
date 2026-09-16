@@ -38,8 +38,14 @@ from crane_planning import Planner, PlanningError, Start  # noqa: E402
 from crane_planning.planner import PLANNED_INDICES, TOOL_INDEX, yaw_of  # noqa: E402
 
 
-def arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+def plan_arguments(parser: argparse.ArgumentParser) -> None:
+    """
+    Add every flag `plan_for` and `plan_example.configure` read, and no other.
+
+    `tune_mpc.py` calls this too, so the two tools cannot drift into meaning
+    different things by the same flag. Its own `--output` and `--show` stay out:
+    it forwards unknown flags to `mpc_a2b`, which owns those.
+    """
     parser.add_argument(
         "--goal",
         choices=("out", "here"),
@@ -69,6 +75,11 @@ def arguments() -> argparse.Namespace:
     clearance = parser.add_argument_group('what "clear" means, in metres')
     clearance.add_argument("--margin-safety", type=float, default=None)
     clearance.add_argument("--margin-interp", type=float, default=None)
+
+
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    plan_arguments(parser)
 
     plant = parser.add_argument_group("the plant")
     plant.add_argument(
