@@ -29,6 +29,7 @@ tracking is `crane_mpc/scripts/tune_mpc.py`, and the hydraulics are in neither
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -45,7 +46,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
 import plan_example  # noqa: E402
 from crane_model import Frame, Payload, presets  # noqa: E402
 from crane_model.conventions import ACTUATED_INDICES, PASSIVE_INDICES  # noqa: E402
-from crane_model.mujoco_plant import MujocoPlant  # noqa: E402
+from crane_model.mujoco_plant import MujocoPlant, viewer_was_opened  # noqa: E402
 from crane_planning import Planner, PlanningError, Start  # noqa: E402
 from crane_planning.planner import PLANNED_INDICES, TOOL_INDEX, yaw_of  # noqa: E402
 
@@ -116,6 +117,20 @@ def arguments() -> argparse.Namespace:
         ),
     )
     plant.add_argument(
+        "--viewer",
+        action="store_true",
+        help="watch it in MuJoCo's passive viewer while it runs",
+    )
+    plant.add_argument(
+        "--realtime",
+        type=float,
+        default=1.0,
+        help=(
+            "viewer playback factor: 1.0 is a simulated second per second, 0 is "
+            "as fast as it computes. Pacing only, the run is the same either way"
+        ),
+    )
+    plant.add_argument(
         "--collision",
         action="store_true",
         help="let MuJoCo resolve contacts too; off by default, the planner "
@@ -155,9 +170,9 @@ def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]
     return presets.goal_here(planner.model, start.q), yaw
 
 
-def roll(planner: Planner, description: str, plan, start: Start, options) -> dict:
+def roll(planner: Planner, description: str, plan, start: Start, options):
     """
-    Drive the plan on MuJoCo and record what the load did.
+    Drive the plan on MuJoCo and record what the load did; return both.
 
     The plan is a sampled reference at its own `Ts`, so the plant is advanced
     one sample at a time on the same grid; after the last sample the final pose
@@ -168,6 +183,8 @@ def roll(planner: Planner, description: str, plan, start: Start, options) -> dic
         description, timestep=options.timestep, collision=options.collision
     )
     plant.set_state(start.q, np.zeros(len(start.q)))
+    if options.viewer:
+        plant.open_viewer(realtime=options.realtime)
 
     times, states, tracking = [0.0], [plant.state], [np.zeros(len(PLANNED_INDICES))]
     sample = float(plan.time[1] - plan.time[0])
@@ -219,7 +236,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options) -> dic
         "dq_u": state[:, 12:14],
         "q_u_eq": equilibrium,
         "tracking": np.array(tracking),
-    }
+    }, plant
 
 
 def _canonical(rigid: np.ndarray, q_tool: float) -> np.ndarray:
@@ -345,7 +362,7 @@ def main() -> int:
     planning_elapsed = time.monotonic() - began
     print(plan.message)
 
-    rolled = roll(planner, description, plan, start, options)
+    rolled, plant = roll(planner, description, plan, start, options)
     for line in report(plan, rolled, planning_elapsed):
         print(line)
 
@@ -380,8 +397,21 @@ def main() -> int:
         import matplotlib.pyplot as plt
 
         plt.show()
+    # The window outlives the run: the interesting part of a lift is often the
+    # pose it ends in, and the report and the figure are worth having first.
+    if options.viewer:
+        print("close the viewer window to finish")
+    plant.hold_viewer()
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    status = main()
+    # A viewer run would otherwise exit 139: MuJoCo's viewer segfaults on
+    # interpreter teardown here, after every file is written. `os._exit` leaves
+    # without tearing down.
+    if viewer_was_opened():
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(status)
+    raise SystemExit(status)
