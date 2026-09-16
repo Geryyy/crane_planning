@@ -10,14 +10,21 @@ plan(goal position + yaw in K0_mounting_base)
 ```
 
 No stochastic sampler. Everything the machine can do -- reach, hang, collide --
-is asked of `crane_model`; nothing about the machine is written down here. Joint
-ranges and velocity limits come from the `robot_description` the profile remaps
-this node onto, **intersected with `crane_model/config/control_safe_limits.yaml`**
--- narrower than the description on the boom, the arm and four velocity rows, and
-the same box `crane_mpc` enforces, so this planner cannot certify a pose or a
-speed the MPC refuses. The EOM comes from `crane_model.symbolic`. The one number
-the description lacks (pump limit) is `crane_model`'s too, and
-`config/crane_planner.yaml` carries the overridable copy.
+is asked of `crane_model`; nothing about the machine is written down here. The
+EOM comes from `crane_model.symbolic`, and the pump limit the description lacks
+is `crane_model`'s too, with `config/crane_planner.yaml` carrying an overridable
+copy.
+
+Joint ranges and velocity limits come from the `robot_description` the profile
+remaps this node onto, **intersected with
+`crane_model/config/control_safe_limits.yaml`** -- narrower than the description
+on the boom, the arm and four velocity rows, and the same box `crane_mpc`
+enforces, so this planner cannot certify a pose or a speed the MPC refuses. That
+box may never exclude the measured pose: the machine parks with the boom folded
+below its 0.02 rad, so `Limits.relaxed_to` widens the row to wherever the
+machine is, exactly as the MPC's `position_box` does. The start state is still
+checked against the *description*'s stops, which is a different question -- can
+this measurement be real.
 
 ## The tool corridors
 
@@ -135,63 +142,57 @@ half-width of 0.2 rad.
 22.6 ms versus two subtractions. That is why the pendulum can be settled at
 *every* configuration the lift checks.
 
-## The C2 fit
+## The certified curve
 
-Least-squares cubic B-spline through the lifted configurations, `sigma`
-distributed by how long each chord takes at its slowest axis's limit. Twice
-differentiable because a kink is not a curve the machine can follow: `q_a''` is
-unbounded there, so the step bound refuses it.
+Least-squares **quintic** B-spline through the lifted configurations, `sigma`
+distributed by how long each chord takes at its slowest axis's limit. Degree 5,
+not 3: simple interior knots make a degree-`d` B-spline C(d-1), so a quintic is
+C4 in sigma -- the derivative count C3's flat inversion consumes, out of the
+parameterisation rather than enforced. A kink is not a curve the machine can
+follow either way. `geometry.fit`'s docstring carries the rest; `ocp.ORDER` must
+stay `degree + 1`.
 
-It approximates rather than interpolates. Interpolation ties segment count to
-sample count, and those want opposite things -- the certificate wants samples
-dense, the curve wants long end intervals. A fixed `path_segments` breaks the tie
-and stops the fit chasing IK noise -- and it is structural besides: the OCP is
-code-generated against a parameter vector that many cubics wide, so a short lift
-is resampled along its own chords rather than fitted with fewer pieces.
+It approximates rather than interpolates: the certificate wants samples dense
+and the curve wants long end intervals, and interpolating a dense path spikes
+`q_a''` at the endpoint, 361 against 0.4 in the interior. A fixed
+`path_segments` breaks the tie. It is structural besides -- the OCP is
+code-generated against a parameter vector that many polynomials wide, so a short
+lift is resampled along its own chords rather than fitted with fewer pieces.
 
-Endpoints are imposed exactly by writing the two outer coefficients; the rest
-stay as fitted. The start slope is written too, but **only while the machine is
-moving**: the OCP follows this curve, so `dq_a = q_a'(sigma)*v` can only leave
-along the tangent and the tangent has to be the measured direction --
-`q_a'(0) = dq_a*L` is that same motion measured in sigma. From rest there is no
-direction to honour, and writing one anyway sets `q_a'(0) = 0`, where
-`ddq_a = q_a'' v^2 + q_a' a` contains no `a`: a singular input, not a slow one.
-
-The goal end is never clamped, for the same reason. Arriving stopped is `v = 0`,
-a condition on the timing; asking the geometry for it as well is asking twice and
-paying twice. What comes out is within 5% of unit speed in the `dq_max` metric
-over the whole path -- arclength in that metric, without anyone reparametrising.
-
-`Path` carries `position(sigma)`. The OCP wants derivatives and reads the spline
-itself, once, through `ocp.power_coefficients`.
+Endpoints are imposed exactly by writing the two outer coefficients. The start
+slope is written too, but **only while the machine is moving**: the OCP leaves
+along the tangent, so the tangent has to be the measured direction. From rest
+there is no direction to honour, and writing one anyway sets `q_a'(0) = 0`,
+where `ddq_a = q_a'' v^2 + q_a' a` contains no `a` -- a singular input, not a
+slow one. The goal end is never clamped at all: arriving stopped is `v = 0`, a
+condition on the timing, and asking the geometry for it too pays twice.
 
 ## The timing OCP
 
-`ocp.py` builds one acados OCP on normalised time with the horizon `T` a state
-whose derivative is zero: a single solve is time-optimal, no outer duration
-search. Every residual row is divided by the limit it is measured against, so 1.0
-is the bound on all of them alike.
+`ocp.py` builds one acados OCP on normalised time with the horizon a
+zero-derivative state: a single solve is time-optimal, no outer duration search.
+Every residual row is divided by the limit it is measured against, so 1.0 is the
+bound on all of them alike -- and it has to be, because Gauss-Newton builds its
+Hessian from `J' W J`, so one row left in physical units sets the conditioning of
+everything.
 
 **`q_a` is not a decision variable.** It is handed the certified curve and moves
 *along* it, deciding only how fast:
 
     q_a = c(sigma)   dq_a = c'(sigma) v   ddq_a = c''(sigma) v^2 + c'(sigma) a
 
-with `v = dsigma/dt` a state and `a` the input, so `x` is 7 wide and `u` is 1.
+`sigma` is integrated **four** times -- `x = [sigma, v, a, j, q_u, dq_u, theta]`
+and the input is snap -- so `q_a(t)` is C4, which is what C3's flat inversion
+consumes. Holding acceleration constant per interval left it C1. The jerk the C3
+feedforward can afford is a hard row per axis; `c3_feedforward:=false` at launch
+is for a controller that does not consume the effort field at all.
+
 The executed curve is the certified curve, so the clearance proof holds verbatim
--- no obstacle rows, no corridor, nothing to re-prove.
-
-The stage this replaced planned `q_a` freely between the curve's two endpoints.
-Measured against it, on the shipped defaults: that freedom took the machine
-**0.84-1.29 m** of displacement off the certified curve, against a 0.303 m
-clearance requirement of which 0.05 m is spare -- the proof was void by roughly
-25x the margin. Giving it up costs **0.4-4.4% of duration** and halves the SQP
-iterations. It also converges where the larger problem did not: `speed_scale 0.5`
-and `kappa 0.3` both stalled at 60 iterations before and now answer in 22 and 20.
-
-What it costs is lateral authority: sway is damped by timing alone. The duration
-numbers above are the whole price. A corridor would buy some of that authority
-back; on this evidence it is not owed.
+-- no obstacle rows, no corridor, nothing to re-prove. Planning `q_a` freely
+between the curve's endpoints instead took the machine 0.84-1.29 m off it against
+0.05 m of spare clearance, voiding the proof; staying on it costs 0.4-4.4% of
+duration and buys back half the SQP iterations. The price is lateral authority:
+sway is damped by timing alone.
 
 Joint velocity and acceleration, reserved pump flow and the sway box are
 constraints in the solve; `sigma` is boxed to [0, 1] and `v >= 0`, because the
@@ -204,19 +205,21 @@ published.
 ## Cost
 
 PZS100, `scripts/plan_example.py` in a clear scene at shipped defaults, on this
-development image:
+development image, one run:
 
 | | |
 |---|---|
 | lifted configurations | 177 |
-| OCP solve | 0.07-0.20 s, 14 SQP iterations |
-| planner call | 1.1-1.2 s |
-| trajectory duration | 6.28 s |
+| OCP solve | 1.95 s, 20 SQP iterations |
+| planner call | 2.32 s |
+| trajectory duration | 6.43 s |
 | terminal sway | 0.39 deg, 0.000 rad/s |
 | peak pump draw | 0.76 of the limit at kappa = 0.8 |
 
-The geometric stage is nearly all of it: one IK solve plus one collision query
-per lifted configuration. `margin_interp` is the knob -- halving it roughly
+The solve is now most of it. Two more integrator states and the C3 command row
+cost roughly an order of magnitude over the acceleration-input stage these
+numbers replaced. `margin_interp` is the knob on the geometric half -- one IK
+solve plus one collision query per lifted configuration, and halving it roughly
 doubles the configurations.
 
 ## Tuning
@@ -225,23 +228,14 @@ doubles the configurations.
 description -- no ROS, no graph, no clock.
 
 ```bash
-./scripts/plan_example.py --show
-./scripts/plan_example.py --payload-mass 400 --csv plan.csv
-./scripts/plan_example.py --margin-interp 0.02
+./scripts/plan_example.py --show     # --help for the rest
 ```
 
-Two views of one answer. Physical panels: joint positions, velocities,
-`u = ddq_a`, sway offset and rate, pump draw, each beside its limit. Normalised
-panel: every constrained row over its bound, so which row decided the duration is
-one glance. Beside it, what the solve did -- iterations, four KKT residuals
-against `ocp_tolerance`, chosen horizon, slack paid.
-
-Read a regression off iterations and residuals, **never off solve time**: the
+Every constrained row is plotted over its own bound, so which row decided the
+duration is one glance. Read a regression off iterations and residuals, **never off solve time**: the
 same problem measures 0.27 s idle and 4.97 s inside a running Gazebo.
 
-It exercises every stage, so its refusal is the node's refusal. `--goal` takes a
-joint configuration and puts its tool pose through the real IK; `--goal-pose`
-takes a Cartesian pose, which may be unreachable.
+It exercises every stage, so its refusal is the node's refusal.
 
 ## The node
 
@@ -252,6 +246,7 @@ takes a Cartesian pose, which may be unreachable.
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's name, for RViz |
 | | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |
+| | `~/solver_stats` (`diagnostic_msgs/DiagnosticArray`, transient-local) |
 | subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
 | frame | `K0_mounting_base` throughout; nothing is converted |
 
