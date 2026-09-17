@@ -2,14 +2,13 @@
 """
 Plan one motion offline, plot it. No ROS, no graph, no clock.
 
-Runs deployment's own `Planner` against checked-in description: what is tuned
-here is what the node solves. Judge timing and clearance off the profile:
-traversal time, sway, actuated force, pump draw.
+Runs deployment's own Planner against checked-in description, so what is
+tuned here is what the node solves.
 
     ./scripts/plan_example.py --duration-step 0.5 --show
 
-Goal defaults to joint target pushed through real IK as Cartesian pose, so a run
-exercises every stage.
+Goal defaults to joint target pushed through real IK as Cartesian pose, so a
+run exercises every stage.
 """
 
 from __future__ import annotations
@@ -116,16 +115,12 @@ def configure(options) -> PlannerConfig:
 
 def bounds(planner: Planner, speed_scale: float) -> dict:
     """
-    Give every bound `TrajectoryOcp.solve` writes onto solver, in one place.
+    Every bound TrajectoryOcp.solve writes onto the solver, one place.
 
-    Limit lines and normalisation both read it, so no plot claims a bound the
-    solve did not use. `speed_scale` enters every row once: reference server's
-    `slow_down` divider, dividing rate, acceleration, jerk alike, not a time
-    reparametrisation -- see `TrajectoryOcp.solve`. Command row is exception,
-    `kappa` alone: `slow_down` asks gentler move, does not shrink valve domain.
-
-    No `dddq_a` entry: nothing bounds third derivative alone any more. Spent on
-    the command, its own row.
+    So no plot claims a bound the solve didn't use. speed_scale scales every
+    row (matches slow_down) except command, which is kappa alone -- slow_down
+    asks a gentler move, doesn't shrink valve domain. No dddq_a: nothing
+    bounds third derivative alone any more, spent on command's own row.
     """
     limits, config = planner.limits, planner.config
     return {
@@ -141,21 +136,19 @@ def bounds(planner: Planner, speed_scale: float) -> dict:
 
 def usage(planner: Planner, plan, speed_scale: float) -> dict:
     """
-    Give each constrained row over its own bound, worst axis per instant.
+    Each constrained row over its own bound, worst axis per instant.
 
-    `ocp.py` divides every residual and `h` row by its own limit: 1.0 = at the
-    bound everywhere, rows mutually comparable (physical panels not). Row
-    touching 1.0 decided duration; all rows well under means `ocp_duration_max`
-    or the weights decided, not the machine.
+    ocp.py divides every residual/h row by its own limit so rows are
+    comparable (1.0 = at bound); a row touching 1.0 decided duration, else
+    ocp_duration_max or the weights did.
     """
     limits, config, timing = planner.limits, planner.config, plan.timing
     limit = bounds(planner, speed_scale)
     box = limits.bounded  # continuous joint: no range to be a fraction of
     centre = 0.5 * (limits.upper[box] + limits.lower[box])
     half = 0.5 * (limits.upper[box] - limits.lower[box])
-    # Last node not on stage box: `solve` writes `h_e` there with
-    # `terminal_q_sway_max`, 10x tighter. Normalising whole trace against stage
-    # bound plots deciding sample at a tenth of where it sits.
+    # Last node isn't on the stage box: solve writes h_e there with
+    # terminal_q_sway_max, 10x tighter than the stage bound.
     sway_bound = np.tile(config.q_sway_max, (timing.time.size, 1))
     rate_bound = np.tile(config.dq_sway_max, (timing.time.size, 1))
     sway_bound[-1] = config.terminal_q_sway_max
@@ -183,15 +176,14 @@ def solver_report(planner: Planner, plan, elapsed: float) -> list:
     """
     Report what the solve did, not what it answered.
 
-    Wall clock is no regression signal: same problem, 0.53 s idle vs 4.97 s in
-    running Gazebo. Iterations and four residuals against `ocp_tolerance` do not
-    move with load.
+    Wall clock isn't a regression signal (same problem: 0.53 s idle vs
+    4.97 s under Gazebo); iterations and the four residuals against
+    ocp_tolerance don't move with load.
     """
     config, timing = planner.config, plan.timing
     stat, eq, ineq, comp = timing.residuals
-    # Element-wise then worst: tip and tilt are different axes, tolerances need
-    # not be equal. Max offset over max tolerance would compare tip excursion
-    # against tilt allowance.
+    # Element-wise then worst: tip/tilt tolerances differ, so max-over-max
+    # would compare tip excursion against tilt allowance.
     terminal = max(
         np.max(np.abs(timing.q_u[-1] - timing.q_u_eq[-1]) / config.terminal_q_sway_max),
         np.max(np.abs(timing.dq_u[-1]) / config.terminal_dq_sway_max),
@@ -238,9 +230,8 @@ def figure(planner: Planner, plan, options, elapsed: float):
             axes[1, 0].axhline(
                 sign * limit["ddq_a"][axis], color=colour, ls=":", lw=0.7
             )
-    # Far-off limit line must not set scale: rotator bounds sit an order of
-    # magnitude above anything these plans use, flattening the other four axes.
-    # Read closeness to a bound off normalised panel, not here.
+    # Far-off limit line must not set scale: rotator bounds are an order of
+    # magnitude above what these plans use, flattening the other four axes.
     for cell, rows in ((axes[0, 1], timing.dq_a), (axes[1, 0], timing.ddq_a)):
         span = max(float(np.max(np.abs(rows))), 1.0e-6)
         cell.set_ylim(-1.2 * span, 1.2 * span)
@@ -263,8 +254,7 @@ def figure(planner: Planner, plan, options, elapsed: float):
     axes[2, 0].set_ylabel(r"sway offset $q_u - q_u^{eq}$ [rad]")
     axes[2, 1].set_ylabel("sway rate [rad/s]")
 
-    # `pump_flow` is already a fraction of physical pump (row the OCP
-    # constrains); reservation is what it may actually use.
+    # pump_flow is already a fraction of physical pump; reservation is what it may actually use.
     axes[1, 1].plot(t, timing.pump_flow, color="tab:red", label="sum")
     axes[1, 1].axhline(
         limit["flow"], color="tab:red", ls=":", lw=0.7, label="reservation"
@@ -293,8 +283,7 @@ def figure(planner: Planner, plan, options, elapsed: float):
             cell.grid(alpha=0.3)
             if cell.get_legend_handles_labels()[0]:
                 cell.legend(fontsize=7, ncol=3)
-    # Solver panel is text, so sway-rate panel above ends its column and keeps
-    # its own axis.
+    # Solver panel is text, so sway-rate panel above keeps its own x-axis.
     axes[2, 1].tick_params(labelbottom=True)
     for cell in (axes[2, 1], axes[3, 0]):
         cell.set_xlabel("time [s]")

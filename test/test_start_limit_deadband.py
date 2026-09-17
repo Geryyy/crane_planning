@@ -1,16 +1,4 @@
-"""
-A joint parked on its stop reads a hair past it. Not a bad state.
-
-The stop is the *description's*, which is what `_validate_start` reads: the
-control-safe box is narrower and the machine parks outside it, so a start there
-is relaxed into rather than refused.
-
-Sim: four requests after one good move left the telescope retracted -- `planned
-coordinate 3 is measured at -0.000079, outside [0.000000, 2.236000]`, then
--0.000091, -0.000104, -0.000144. Excursion creeps, so the first plan ending fully
-retracted was the last that worked. `REST_VELOCITY` = same argument, one
-derivative up.
-"""
+"""Stop is the description's, narrower control-safe box; sim crept -0.000079 to -0.000144 rad."""
 
 import numpy as np
 import pytest

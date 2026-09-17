@@ -1,15 +1,5 @@
-"""`sigma` is integrated four times, so the reference is `C4` in time.
-
-Acceleration as input: acados held it constant across an interval, `ddq_a` jumped
-at every node, `q_a(t)` was `C1` however smooth the curve. Snap as input: `sigma`
-quartic per interval, `sigma`, `v`, `a`, `j` continuous across joins, so
-`q_a(t) = c(sigma(t))` is `C4` -- the derivative count controller design wants.
-
-Two silent breakages. Row order written once in `X_*`, read back positionally
-everywhere: a reorder missing one reader gives plausible wrong numbers, not an
-error. And the resampler rebuilds `sigma` in closed form; a lower-order formula
-puts samples off the plan -- what an earlier fix cured for the previous layout.
-"""
+"""Snap as input makes sigma quartic per interval, C4 in time -- accel-as-input
+held ddq_a constant per node and only gave C1."""
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,7 +31,6 @@ COEFFICIENTS[0, 3] = [0.60, -0.30, 0.40, -0.50, 0.25]
 
 
 def description() -> str:
-    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"
@@ -103,13 +92,8 @@ def chain(snap: np.ndarray, duration: float = 2.0) -> SimpleNamespace:
 
 
 def test_the_resampler_reproduces_the_chain_at_the_next_node():
-    """
-    A lower-order reconstruction lands right only at `dt = 0`.
-
-    Sampling on the node grid passes whatever formula the resampler uses -- every
-    interval is entered at `dt = 0`. So: integrate interval `k` all the way across
-    and reproduce node `k+1`, which a quadratic or cubic formula cannot.
-    """
+    """Sampling on the node grid passes any formula (dt=0 every interval); this
+    integrates interval k all the way across, which only the exact formula survives."""
     plan = chain(np.array([3.0, -2.0, 1.5, -4.0, 0.5]))
     edges = plan.time[1:] - 1.0e-12  # inside interval k, at its right edge
     q_a, dq_a, _ = actuated_samples(plan, edges)

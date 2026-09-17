@@ -1,46 +1,29 @@
 #!/usr/bin/env python3
 r"""
-Drive bench moves under each feedforward law, measure tracking.
+Drive bench moves under each feedforward law and measure tracking.
 
-Ablation `bench_calc_movement.py` cannot do: that one stops at the answer, never
-drives the machine.
+Unlike bench_calc_movement.py, which never drives the machine. Three arms run
+the identical OCP solve; c3_feedforward/command_lag_s are read per-request
+after the solve, so only the reference's effort field differs. static: no
+effort (JTC uses ff_velocity_scale*qdot_d). inverse: inverts block 3 + rigid
+body via RNEA + preview. inverse_lag: also inverts the PT1 lag.
 
-Three arms, design point: **all three execute the same plan**. `c3_feedforward`
-and `command_lag_s` are read after the solve, so the OCP answer is bit-identical
-across arms; only the reference's effort field differs. Normaliser is one
-reference, not three.
-
-| arm | effort field | what it inverts |
-|---|---|---|
-| `static` | absent | nothing. JTC runs `ff_velocity_scale * qdot_d` |
-| `inverse` | `u(t+n_d) - qdot_d` | block 3 + rigid body by RNEA, block 1 by preview |
-| `inverse_lag` | that plus `tau_v du/dt` | block 2 as well |
-
-All measurements come off `/trajectory_controllers/controller_state`, published
-by JTC at controller rate with `reference`, `feedback`, `error`, `output` per
-joint. Nothing new instrumented.
+Reads /trajectory_controllers/controller_state; nothing new instrumented.
 
     ./scripts/bench_plan.py --emit-requests /tmp/a2b_goals.json --set all
     ./scripts/bench_track.py --requests /tmp/a2b_goals.json \\
         --only ax_slew,ax_arm,sh_multi,across --repeats 3 --out /tmp/ablation
 
-`--out` gets one wide CSV per move -- every arm's reference, feedback, error,
-command, feedforward on one time grid, one drag-and-drop into PlotJuggler --
-plus `metrics.csv`. `ros2 bag record -s mcap` alongside for rest of graph.
-
-Sim without GUI for a campaign; tree idle, this script owns controller switch,
-nothing to click:
+--out writes one wide CSV per move (all arms on one grid) plus metrics.csv.
+Run sim headless alongside, tree idle:
 
     ros2 launch concrete_block_behavior_tree gazebo_wall_assembly_pzs100.launch.py \\
         controller:=pid planner:=cbs enable_livox_sim:=off gui:=false
 
-> [!warning] What this cannot tell you
-> Gazebo plant *is* C3, same `k`, `d`, dead time, `tau_v` the inversion is built
-> from. `inverse_lag` inverts that plant exactly, flatters itself. Measures "is
-> PT1 term worth the C4 reference", not "does it transfer to the machine".
+Warning: Gazebo plant IS C3 (same k, d, dead time, tau_v), so inverse_lag
+flatters itself here -- not evidence it transfers to hardware.
 
-`ax_arm` is the control: fitted lag 0, so `inverse` and `inverse_lag` must come
-out identical. If not, this script is wrong.
+ax_arm has fitted lag 0: inverse and inverse_lag must match there exactly.
 """
 
 from __future__ import annotations
@@ -65,9 +48,8 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from timber_crane_planning_interfaces.srv import CalcMovement
 
-#: Fitted lag/dead-time split, planned-axis order (sw, ha, ka, sa, ro). Same
-#: numbers Gazebo URDF carries as `tau_v`, so `inverse_lag` inverts that plant
-#: exactly.
+#: Fitted lag/dead-time split, planned-axis order (sw,ha,ka,sa,ro); same as
+#: Gazebo URDF tau_v, so inverse_lag inverts that plant exactly.
 FITTED_LAG = [0.100, 0.025, 0.000, 0.075, 0.125]
 NO_LAG = [0.0] * 5
 
@@ -79,34 +61,28 @@ ARMS = {
     "inverse_lag": (True, FITTED_LAG),
 }
 
-#: Grid the three arms are resampled onto for the wide CSV. Finer than 25 Hz
-#: reference and 100 Hz loop, so neither aliases.
+#: Resample grid for the wide CSV; finer than 25 Hz reference and 100 Hz loop.
 GRID_S = 0.01
 
-#: rad, m on telescope. Run that did not start where plan says is no run of that
-#: plan. Measured over **five planned axes** only: passive pair commanded by
-#: nobody; tool has own controller, no feedforward, no fitted lag -- neither is
-#: evidence about a start this ablation cares about. Achieved offset goes into
-#: every metrics row instead of hiding behind the gate.
+#: rad, m on telescope. Checked over the five planned axes only -- passive pair
+#: and tool have no feedforward/fitted lag, not evidence for this ablation.
+#: Achieved offset also goes into every metrics row, not just gated on.
 START_TOLERANCE = 0.05
 
-#: Wait for park to settle after its goal returns. Slew loop is trim integrator,
-#: 28 s dominant time constant, so "goal succeeded" and "axis stopped moving"
-#: are different events; second one matters here.
+#: Settle wait after park goal returns: slew loop is a trim integrator with
+#: 28 s dominant time constant, so "goal succeeded" != "axis stopped moving".
 PARK_SETTLE_S = 40.0
 
-#: rad, and rad/s. **Pendulum is why this exists.** `q0` puts passive pair at
-#: `passive_equilibrium` with `dq_u = 0` -- hanging straight, still -- so a run
-#: started while tool still swings is a run the OCP did not plan. Measured:
-#: parking left tilt 0.224 rad off vertical, past planner's `q_sway_max` of 0.2,
-#: every axis then tracked a plan whose start never happened. Nothing commands
-#: the pair, so waiting is the only instrument there is.
+#: rad, rad/s. q0 assumes passive pair hanging still at passive_equilibrium;
+#: measured parking left tilt 0.224 rad off vertical (planner's q_sway_max is
+#: 0.2), so a run starting mid-swing is a run the OCP never planned. Nothing
+#: commands the pair, so waiting is the only fix.
 PASSIVE_TOLERANCE = 0.03
 REST_RATE = 0.05
 
 
 def parked(names: list, q0, seconds: float) -> JointTrajectory:
-    """Build a one-point goal at `q0`. The JTC interpolates from wherever."""
+    """Build a one-point goal at `q0`."""
     trajectory = JointTrajectory()
     trajectory.joint_names = list(names)
     point = JointTrajectoryPoint()
@@ -119,7 +95,7 @@ def parked(names: list, q0, seconds: float) -> JointTrajectory:
 
 
 def request_of(move: dict) -> CalcMovement.Request:
-    """One bench request. The same fields `bench_calc_movement.build` sets."""
+    """One bench request; same fields bench_calc_movement.build sets."""
     request = CalcMovement.Request()
     request.y_n.x, request.y_n.y, request.y_n.z = (float(v) for v in move["y_n"])
     request.phi_tool_n = float(move["phi_tool_n"])
@@ -132,7 +108,7 @@ def request_of(move: dict) -> CalcMovement.Request:
 
 
 def sampled(trajectory: JointTrajectory) -> tuple:
-    """`(t, effort)` of the answer, zero-filled on an arm that carries none."""
+    """`(t, effort)`, zero-filled on an arm that carries none."""
     stamps = np.array(
         [
             point.time_from_start.sec + point.time_from_start.nanosec * 1e-9
@@ -174,7 +150,7 @@ class Bench(Node):
             50,
         )
 
-    # -- recording ------------------------------------------------------------
+    # -- recording --
 
     def _state(self, message: JointTrajectoryControllerState) -> None:
         self.state_names = list(message.joint_names)
@@ -184,9 +160,8 @@ class Bench(Node):
         width = len(message.joint_names)
 
         def row(values) -> list:
-            # `output` carries commanded joints only, six of eight here, so
-            # shorter than other three. Padded, not dropped, never zero-filled:
-            # absent command is not a zero one.
+            # output carries commanded joints only (6 of 8 here); padded not
+            # dropped -- absent command isn't a zero one.
             padded = list(values) + [float("nan")] * (width - len(values))
             return padded[:width]
 
@@ -210,7 +185,7 @@ class Bench(Node):
         rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
         return future.result() if future.done() else None
 
-    # -- the four things this script does -------------------------------------
+    # -- the four things this script does --
 
     def arm(self, name: str) -> bool:
         """Set the two parameters that select a feedforward law. Live."""
@@ -248,9 +223,8 @@ class Bench(Node):
         """Send one goal with the stamp zeroed. Returns `(status, samples)`."""
         goal = FollowJointTrajectory.Goal()
         goal.trajectory = trajectory
-        # Start now. Planner stamps answer with `/joint_states` it planned from,
-        # seconds old by the time goal is sent; JTC honours that stamp and would
-        # sample into middle of plan. Behaviour tree zeroes it for same reason.
+        # Zero the stamp: planner stamps with the /joint_states it planned
+        # from, seconds old by send time; JTC would otherwise sample mid-plan.
         goal.trajectory.header.stamp.sec = 0
         goal.trajectory.header.stamp.nanosec = 0
         self.samples = []
@@ -288,10 +262,9 @@ class Bench(Node):
 
     def park(self, names: list, q0, order: list, rate: float) -> tuple:
         """
-        Drive to `q0`, then wait for the machine to stop.
+        Drive to q0, then wait for it to stop.
 
-        Both halves needed, neither implies the other: goal reports success on
-        commanded axes' tolerances, which the pendulum is not in.
+        Success gates on commanded axes only, not the pendulum.
         """
         travel = self.offset_from(q0, order)
         status, _ = self.execute(
@@ -310,7 +283,7 @@ class Bench(Node):
             self.spin(0.25)
 
 
-# ---------------------------------------------------------------- the numbers
+# -- the numbers --
 
 
 def channels(samples: list, order: list) -> tuple:
@@ -334,11 +307,11 @@ def metrics(samples: list, duration: float, names: list, order: list) -> list:
             continue
         goal = float(reference[-1, j])
         travel = goal - float(reference[0, j])
-        # Signed by direction of travel, so undershoot reads negative instead of
-        # a zero indistinguishable from perfect.
+        # Signed by travel direction, so undershoot reads negative not
+        # zero-like-perfect.
         past = np.sign(travel) * (feedback[:, j] - goal)
-        # Last instant the loop was still outside 1 % of the move, measured from
-        # end of the *reference*, not of the recording.
+        # Last instant outside 1% of the move, measured from end of
+        # reference, not of the recording.
         outside = np.nonzero(np.abs(error[:, j]) > 0.01 * span)[0]
         settle = float(t[outside[-1]] - duration) if outside.size else float("-inf")
         rows.append(
@@ -367,8 +340,7 @@ def write_move_csv(path: Path, runs: dict, names: list, order: list) -> None:
             for j, name in enumerate(names):
                 columns[f"{arm}/{name}/{label}"] = np.interp(grid, t, block[:, j])
         for j, name in enumerate(names):
-            # Ablated signal itself, held at zero past end of plan, where the
-            # reference holds it too.
+            # ff held at zero past end of plan, matching the reference.
             columns[f"{arm}/{name}/ff"] = np.interp(
                 grid, stamps, effort[:, j], right=0.0
             )
@@ -444,8 +416,8 @@ def main() -> int:
         node.get_logger().error(f"no {options.controller} action server after 30 s")
         return 1
 
-    # Activated once for the whole campaign, not around every goal: tree is idle
-    # and nothing else claims these interfaces.
+    # Activated once for whole campaign (tree idle, nothing else claims these
+    # interfaces).
     if not node.switch_controller(True):
         node.get_logger().error(f"could not activate {options.controller}")
         return 1
@@ -472,9 +444,8 @@ def main() -> int:
                 continue
             trajectory = answer.trajectory
             if not names:
-                # Plan's own order is the reporting order; map into controller's
-                # is built by name. The two lists differ in order and indexing
-                # across them is the standing footgun.
+                # Plan order != controller order; map built by name. Indexing
+                # across the two lists by position is the standing footgun.
                 names = list(trajectory.joint_names)
                 missing = [n for n in names if n not in node.state_names]
                 if missing:
@@ -489,8 +460,8 @@ def main() -> int:
                 f"{'yes' if trajectory.points[0].effort else 'no'}"
             )
             for repeat in range(options.repeats):
-                # Park first, check it landed: a run started elsewhere is no run
-                # of this plan.
+                # Park first and check it landed -- a run started elsewhere is
+                # no run of this plan.
                 park_status, offset, sway, speed = node.park(
                     names, move["q0"], order, options.park_rate
                 )
@@ -538,8 +509,8 @@ def main() -> int:
             write_move_csv(path, per_arm, names, order)
             print(f"  -> {path}")
 
-    # Left active on purpose. Deactivating stops `controller_state`, and a
-    # campaign that cannot be probed after it finishes cannot be debugged.
+    # Left active on purpose: deactivating stops controller_state, breaking
+    # post-run debugging.
     if options.deactivate:
         node.switch_controller(False)
 

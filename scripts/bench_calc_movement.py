@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 r"""
-Time one `CalcMovement` server over fixed request set. Server-agnostic.
+Time one CalcMovement server over a fixed request set. Server-agnostic.
 
-Stage 0 of C4 continuity work and the acceptance measure: `a2b_ilqr_server` and
-`crane_planning` both implement this service, so one request file through both
-is apples-to-apples. Requests come from `bench_plan.py --emit-requests`, never
-here -- a client computing its own goal hands each server a different one.
+a2b_ilqr_server and crane_planning both implement it, so one request file
+through both is apples-to-apples. Requests come from bench_plan.py
+--emit-requests, never computed here.
 
     ./scripts/bench_plan.py --emit-requests /tmp/a2b_goals.json
     ./scripts/bench_calc_movement.py --requests /tmp/a2b_goals.json --label ilqr
     ./scripts/bench_calc_movement.py --requests /tmp/a2b_goals.json \\
         --service /crane/a2b_movement --label crane_planning
 
-Both claim `a2b_movement`: run one at a time or namespace one. `--service` picks.
-
-Wall time = served request end to end, under whatever else runs. Say what ran
-when quoting: `ocp.py` records same solve 0.53 s idle, 4.97 s in Gazebo.
+Both claim a2b_movement: run one at a time or namespace via --service.
+Wall time is served request end to end; say what ran when quoting (ocp.py:
+same solve 0.53 s idle, 4.97 s in Gazebo).
 """
 
 from __future__ import annotations
@@ -34,12 +32,11 @@ from timber_crane_planning_interfaces.srv import CalcMovement
 
 SERVICE = "a2b_movement"
 
-#: `CraneNodeBase` builds parameter base **lazily, in `/joint_states`
-#: callback**: `a2b_ilqr_server` that never saw one segfaults on first request,
-#: null `crane_parameter_base_` deref. Publishing topic makes reference server
-#: answerable outside full bringup. Names = `mp_parameter_pzs100.yaml` `joints`
-#: + its one `aux_joints` entry; `crane_planning` reads `/joint_states` by name
-#: too, ignores it when request carries `q0`.
+#: CraneNodeBase builds its parameter base lazily in the /joint_states
+#: callback -- a2b_ilqr_server that never saw one segfaults (null
+#: crane_parameter_base_ deref) on first request. Names = mp_parameter_pzs100
+#: joints + aux_joints; crane_planning reads /joint_states too but ignores it
+#: once the request carries q0.
 JOINT_NAMES = (
     "theta1_slewing_joint",
     "theta2_boom_joint",
@@ -62,19 +59,18 @@ def build(move: dict, slow_down: float, avoid_collisions: bool) -> CalcMovement.
     request.slow_down = float(slow_down)
     request.check_log_collision = avoid_collisions
     request.check_gripper_collision = avoid_collisions
-    # Path topic is side effect with own cost; neither server measured on draw
-    # speed.
+    # Path topic is a side effect with its own cost; neither server measured on draw speed.
     request.publish_path = False
     return request
 
 
 def answer_shape(response) -> dict:
     """
-    Report what came back beyond success: duration, sample count, which arrays.
+    Duration, sample count, which arrays came back.
 
-    Acceleration column is the continuity evidence: `a2b_ilqr_server` sends
-    velocities, no accelerations, so JTC interpolates cubic and executes `C1`.
-    Per server, so the claim is measured not read off source.
+    Acceleration column is continuity evidence: a2b_ilqr_server sends
+    velocities, no accelerations, so JTC interpolates cubic (C1) -- measured
+    per server, not read off source.
     """
     points = response.trajectory.points
     if not points:
@@ -107,12 +103,11 @@ def joint_states(node: Node, q0) -> None:
 
 def collision_scene(node: Node) -> None:
     """
-    Publish empty, always-fresh collision scene on `/crane/collision_scene`.
+    Publish an empty, always-fresh scene on /crane/collision_scene.
 
-    `crane_planning` refuses a collision-avoiding request when it never saw one,
-    and once last is older than `max_scene_age`. Empty is what `bench_plan.py`
-    plans against offline (`scene=[]`, `avoid_collisions=True`), keeping the two
-    numbers comparable. `a2b_ilqr_server` does not subscribe: costs it nothing.
+    crane_planning refuses a collision-avoiding request without one, or once
+    stale past max_scene_age. Empty matches what bench_plan.py plans against
+    offline, keeping numbers comparable; a2b_ilqr_server doesn't subscribe.
     """
     from crane_msgs.msg import CollisionScene
     from rclpy.qos import DurabilityPolicy, QoSProfile
@@ -166,8 +161,8 @@ def main() -> int:
     if not options.no_joint_states:
         joint_states(node, moves[0]["q0"])
         collision_scene(node)
-        # Spun, not slept: server needs topic *before* first request, timer only
-        # fires while this node spins.
+        # Spun not slept: server needs the topic before first request, and the
+        # timer only fires while this node spins.
         end = time.perf_counter() + options.settle
         while time.perf_counter() < end:
             rclpy.spin_once(node, timeout_sec=0.05)

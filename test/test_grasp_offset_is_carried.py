@@ -23,13 +23,8 @@ def request(*, s_log_8, p_cyl_8):
 
 
 def test_the_measured_lateral_offset_reaches_the_payload():
-    """
-    `p_cyl_8` is x-only, so its zero y contradicts nothing in `s_log_8`.
-
-    Behaviour tree measures grasp offset after a pick, sends it in `s_log_8`; every
-    caller leaves `p_cyl_8.y` at the .srv default. Reading that default as a second
-    opinion refused every move after a real pick.
-    """
+    """p_cyl_8 is x-only, so its zero y contradicts nothing in s_log_8 -- reading that
+    default as a second opinion refused every move after a real pick."""
     payload, shape = translate_payload(
         request(s_log_8=(0.0, -0.0712, math.nan), p_cyl_8=(0.0, 0.0, 0.0))
     )

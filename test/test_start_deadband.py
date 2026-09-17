@@ -11,12 +11,8 @@ from test_jerk_bound import GOAL, START, TOOL_POSITION, description
 
 
 def test_noise_level_start_velocity_plans_as_rest():
-    """
-    `fit` pins the curve's start tangent to measured velocity, so a 1e-5 encoder
-    reading is a tangent of magnitude 1e-5 the OCP must grow to move scale inside
-    one knot span -- refused at node 0, every start with a live encoder. Below
-    `REST_VELOCITY` the plan is the rest plan.
-    """
+    """fit pins the start tangent to measured velocity; a 1e-5 encoder reading would
+    force the OCP to grow scale inside one knot span. Below REST_VELOCITY, rest plan."""
     planner = Planner(description(), PlannerConfig(), dict(crane_weights.DEFAULTS))
 
     def configuration(coordinates):

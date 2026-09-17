@@ -2,17 +2,16 @@
 """
 Plan one motion and roll it on MuJoCo, so the sway claim has a second opinion.
 
-`plan_example.py` says what the OCP decided; its sway trace is the OCP's own
-model predicting itself. This drives the same plan through an independent solver
-on the same URDF and plots the two against each other.
+plan_example.py's sway trace is the OCP's own model predicting itself; this
+drives the same plan through an independent solver on the same URDF and plots
+the two against each other.
 
     ./scripts/tune_planner.py --goal out --viewer
     ./scripts/tune_planner.py --goal here --kappa 0.6 --settle 8
 
-Start is `crane_model.presets.OUTSIDE`. The planned axes are driven onto the
-reference with the resistance cancelled, as close to an ideal drive as the plant
-allows -- the controller is `crane_mpc/scripts/tune_mpc.py`, the hydraulics are
-in neither.
+Start is crane_model.presets.OUTSIDE. Planned axes are driven onto the
+reference with resistance cancelled -- as close to ideal as the plant allows;
+the controller is crane_mpc/scripts/tune_mpc.py, hydraulics are in neither.
 """
 
 from __future__ import annotations
@@ -40,11 +39,11 @@ from crane_planning.planner import PLANNED_INDICES, TOOL_INDEX, yaw_of  # noqa: 
 
 def plan_arguments(parser: argparse.ArgumentParser) -> None:
     """
-    Add every flag `plan_for` and `plan_example.configure` read, and no other.
+    Every flag plan_for/plan_example.configure read, no other.
 
-    `tune_mpc.py` calls this too, so the two tools cannot drift into meaning
-    different things by the same flag. Its own `--output` and `--show` stay out:
-    it forwards unknown flags to `mpc_a2b`, which owns those.
+    tune_mpc.py calls this too, so the two can't drift on what a flag means.
+    --output/--show stay out: it forwards unknown flags to mpc_a2b, which
+    owns those.
     """
     parser.add_argument(
         "--goal",
@@ -139,7 +138,7 @@ def plan_for(options) -> tuple[str, Planner, Start, object]:
     """
     Build the planner, solve the preset move, say what came out.
 
-    Shared with `crane_mpc/scripts/tune_mpc.py`, which tunes the controller
+    Shared with crane_mpc/scripts/tune_mpc.py, which tunes the controller
     against the same plan this tunes the shaping of.
     """
     description = plan_example.description()
@@ -196,8 +195,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
             float(plan.time[index] - plan.time[index - 1]),
             float(plan.time[index]),
         )
-    # A plan that merely *arrives* quiet separates here from one that leaves the
-    # load quiet.
+    # A plan that merely arrives quiet separates here from one that leaves the load quiet.
     for step in range(int(round(options.settle / sample))):
         advance(
             plan.q[-1, rows],

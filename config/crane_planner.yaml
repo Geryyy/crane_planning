@@ -1,183 +1,138 @@
 # The `crane_planner` node, as the `fake` and `hardware` profiles compose it.
 #
-# Almost everything here is a property of the *solve*, not of the machine. How
-# far and how fast each joint may go is read from the `robot_description` the
-# profile remaps this node onto and deliberately does not appear below: a limit
-# written beside a node drifts away from the description every controller in the
-# same deployment was configured against. The one exception is the pump, which
-# the URDF does not carry; it is at the end with its evidence.
+# Almost everything here is a property of the *solve*, not of the machine. Joint
+# range and rate come from the `robot_description` and deliberately do not appear
+# below -- a limit written beside a node drifts from the description every
+# controller was configured against. The pump is the exception; the URDF lacks it.
 crane_planner:
   ros__parameters:
-    # Reservation held back from the pump and every rate limit, so the
-    # controller keeps authority to correct with. Not reachable from a request.
+    # Reservation held back from the pump and every rate limit, so the controller
+    # keeps authority to correct with. Not reachable from a request.
     kappa: 0.8
 
     # --- the endpoint inverse kinematics -------------------------------------
-    #
-    # Acceptance test in metres and radians. Not a closed-form inverse: the
-    # passive pair is re-settled at every configuration tested, so the answer
-    # goes through an FK residual and a miss is a refusal carrying the number.
-    # Raising these does not make the planner better at reaching a goal, only
-    # quieter about missing.
-    #
-    # `ik_restarts` applies to the **goal alone**, spread over the telescope
-    # range -- the coordinate the residual is flat in. Samples along a corridor
-    # take one restart seeded from the predecessor, which is both the right seed
-    # and what keeps the lift on one IK branch.
+    # Acceptance test in m/rad, not a closed form: the passive pair is re-settled
+    # per configuration, so the answer goes through an FK residual and a miss is a
+    # refusal carrying the number. Raising these quiets the miss, not the reach.
+    # `ik_restarts` applies to the **goal alone**, spread over the telescope range
+    # -- the coordinate the residual is flat in. Corridor samples take one restart
+    # seeded from the predecessor, which keeps the lift on one IK branch.
     eps_pos: 0.001
     eps_yaw: 0.001
     ik_restarts: 5
 
     # --- the geometric stage, and what "clear" means -------------------------
-    #
     # **No stochastic sampling planner.** Direct TCP line first; if blocked, a
-    # bounded deterministic family of lift/traverse/descend paths at
-    # successively higher transfer planes, with symmetric lateral corridors.
-    # Each is lifted into the five planned coordinates by continuation IK.
+    # bounded deterministic family of lift/traverse/descend paths at successively
+    # higher transfer planes with symmetric lateral corridors, each lifted into the
+    # five planned coordinates by continuation IK.
     #
-    # Sampling alone proves nothing. What makes it a proof is a margin paired
-    # with a bound on how far anything moves between two samples: rotating a
-    # planned joint by dq displaces any point below it by at most r*dq, so if
-    # every checked configuration clears by more than the sum below and no
-    # consecutive pair moves the machine further than `margin_interp`, nothing
-    # touches anything in between.
-    #
+    # Proof = margin + step bound. Rotating a planned joint by dq displaces any
+    # point below it by at most r*dq, so if every checked configuration clears
     #     required = margin_safety + margin_interp + swing envelope
-    #
-    # Each part spent once. `margin_safety` is the clearance the answer carries.
-    # The envelope is `l_pendulum * sin(q_sway_max)`, computed rather than
-    # configured. It is owed by the links hanging on the hinges only: a
-    # configuration inside it at the hanging pose is split at the upper hinge,
-    # and the rigid half needs just the two margins (README, "The collision
-    # certificate").
-    #
-    # Halving `margin_interp` roughly doubles the lifted configurations and so
-    # the stage's cost. Raising it spends clearance on resolution.
+    # and no consecutive pair moves further than `margin_interp`, nothing touches
+    # in between. Each part spent once; `margin_safety` is the clearance the answer
+    # carries. Envelope is `l_pendulum * sin(q_sway_max)`, computed not configured,
+    # owed by the hanging links only (README, "The collision certificate"). Halving
+    # `margin_interp` roughly doubles cost.
     margin_safety: 0.05
     margin_interp: 0.10
-    # How far the tool's collision geometry reaches past the TCP. Enters the step
-    # bound as an over-estimate of the machine's outermost point: too large costs
-    # samples, too small is unsound. The carried body's reach is added per request.
+    # Tool collision reach past the TCP. Over-estimate on purpose: too large costs
+    # samples, too small is unsound. Carried body's reach added per request.
     tool_radius: 1.0
-    # Cap on lifted configurations. Reaching it means the arm reconfigures faster
-    # than the corridor resolves -- a singularity or an IK branch change -- and is
-    # a refusal. Same test that sets the resolution, so a branch jump cannot pass
-    # unseen.
+    # Cap on lifted configurations. Hitting it means the arm reconfigures faster
+    # than the corridor resolves (singularity or IK branch change) and is a refusal
+    # -- same test that sets resolution, so a branch jump cannot pass unseen.
     max_lift_samples: 4096
 
-    # Clearance above the highest scene primitive, additional transfer planes,
-    # lateral offsets per plane. Bounded at
-    # 1 + height_samples * (1 + 2*lateral_samples) candidates.
+    # Clearance above highest scene primitive, extra transfer planes, lateral
+    # offsets per plane. Bounded at 1 + height_samples * (1 + 2*lateral_samples).
     corridor_clearance: 0.15
     corridor_height_step: 0.35
     corridor_height_samples: 3
     corridor_lateral_step: 0.50
     corridor_lateral_samples: 2
 
-    # **The admissible sway bound, and this is where it lives.** The swing
-    # envelope is derived from it and it is the state box the OCP holds the
-    # pendulum inside. Design value. The tilt-to-TCP pendulum measures 0.770 m,
-    # so 0.2 rad is ~0.15 m of tool travel.
+    # **The admissible sway bound, and this is where it lives.** Swing envelope is
+    # derived from it; it is also the OCP's state box on the pendulum. Design
+    # value. Tilt-to-TCP pendulum 0.770 m, so 0.2 rad is ~0.15 m of tool travel.
     q_sway_max: [0.2, 0.2]
 
-    # The truck, as a property of the vehicle. **Legacy dimensions, preserved and
-    # no longer hard-coded**: the scene carries one primitive with the reserved id
-    # `truck`, and the bed and six runges are placed on it. Move it, they move.
+    # The truck. **Legacy dimensions, preserved and no longer hard-coded**: the
+    # scene carries one primitive with reserved id `truck`; bed and six runges ride
+    # on it, so moving it moves them.
     #
-    # 0.28 x 0.31 x 2.12 stays: the description's post is 0.080 x 0.108 x 1.750,
-    # so the box is an inflation and `expand_truck` grows it inboard from the bed
-    # edge, where the real post's outer face is. 0.30 m taller than the real post,
-    # which over-approximates and is safe.
+    # 0.28 x 0.31 x 2.12 inflates the description's 0.080 x 0.108 x 1.750 post;
+    # `expand_truck` grows it inboard from the bed edge, where the real post's
+    # outer face is. 0.30 m taller than the post: over-approximates, safe.
     #
     # Stations are offsets from the box centre. For the shipped `vehicle_box` they
-    # put the runges at world x -5.593, -4.381, -1.397, where `lkw_rungen_134.stl`
+    # put runges at world x -5.593, -4.381, -1.397, where `lkw_rungen_134.stl`
     # stands the posts (`post_setup:=134` in sim, subset `13` on hardware). Keep
     # equal to `world_model.vehicle_box.runge_stations_m`.
     truck_runge_dimensions: [0.28, 0.31, 2.12]
     truck_runge_stations: [-2.261, -1.049, 1.935]
     truck_bed_thickness: 0.10
-    # The headboard closing the cab end -- the plate the load butts against plus
-    # the side rails behind it, as one box across the bed's full width.
-    # `lkw_ladeflaeche_mit_rammschutz_seitlich_col.stl` puts it at world
-    # x -1.005..-0.555 reaching z 3.186: 0.450 thick, 1.922 off a bed at 1.264.
-    # Placed flush against the box's +x face, the end the outermost runge is at.
-    # Zero either to drop it.
+    # Headboard closing the cab end: butt plate plus side rails behind it, one box
+    # across the bed's full width. `lkw_ladeflaeche_mit_rammschutz_seitlich_col.stl`
+    # puts it at world x -1.005..-0.555 reaching z 3.186: 0.450 thick, 1.922 off a
+    # bed at 1.264. Flush against the box's +x face. Zero either to drop it.
     truck_headboard_thickness: 0.45
     truck_headboard_height: 1.922
 
-    # Cubic segments in the fitted path, whatever the sample count. **The dial
-    # that keeps the certificate and the curve from fighting.** The certificate
-    # wants samples dense; the curve wants its end intervals long, because it is
-    # clamped to leave and arrive at rest and the flattening has to go somewhere.
-    # Interpolating ties the two together and squeezes the clamp into a sliver of
-    # sigma -- measured |q_a''| of 361 at sigma = 0 against 0.4 in the interior.
-    # Approximating with far fewer control points gives both, and stops the fit
-    # chasing IK noise between neighbours.
+    # Cubic segments in the fitted path, whatever the sample count. **The dial that
+    # keeps the certificate and the curve from fighting**: the certificate wants
+    # dense samples, the curve wants long end intervals (clamped to leave/arrive at
+    # rest). Interpolating squeezes the clamp into a sliver of sigma -- measured
+    # |q_a''| 361 at sigma = 0 against 0.4 in the interior.
     path_segments: 12
 
     # --- what "settled" and "admissible" mean --------------------------------
-    # The box the answer must arrive inside, and the boxes it may not leave on the
-    # way. The settled pair is a soft terminal row; the sway pair is a state box
-    # at every node.
+    # Settled pair is a soft terminal row; sway pair is a state box at every node.
     terminal_q_sway_max: [0.02, 0.02]
     terminal_dq_sway_max: [0.04, 0.04]
-    # rad/s and rad/s^2. The sway rate is control_architecture's own bound; the
-    # joint accelerations are a comfort limit the description does not carry.
+    # rad/s and rad/s^2. `ddq_a_max` is a comfort limit the description lacks.
     dq_sway_max: [1.0, 0.5]
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
-    # rad/s^3 (m/s^3 on the telescope). **Not a limit.** It is the scale the
-    # jerk row of the *cost* is measured in, so 1.0 there means "as much third
-    # derivative as the fitted pose could pay for" and the weight stays a
-    # preference. What the machine can actually afford is the command row below,
-    # which bounds the command itself rather than a proxy for it.
+    # rad/s^3 (m/s^3 on the telescope). **Not a limit** -- the scale the jerk row
+    # of the *cost* is measured in, so 1.0 means "as much third derivative as the
+    # fitted pose could pay for". What the machine can afford is the command row
+    # below, which bounds the command itself.
     #
-    # It was a limit until issue 113's notes: derived as
-    # `dddq_a_max = w_n^2 (u_max - kappa dq_max - 2 zeta / w_n ddq_a_max)` at the
-    # `m_ii_median` of `c3_full_model.json`. Two things were wrong with that. The
-    # inertia is not a constant -- slewing runs 2.4x to 8.8x that median over the
-    # 21 bench moves -- and reserving the rate and the acceleration separately
-    # prices a sum of worst cases, when the valve pays the sum at each instant:
-    # measured, it refuses `across`, whose real command is 0.46 of the domain.
+    # Was a limit until issue 113: derived at a constant median inertia, but
+    # slewing runs 2.4x-8.8x that median over the 21 bench moves, and reserving
+    # rate and acceleration separately prices a sum of worst cases the valve pays
+    # at each instant -- it refused `across`, whose real command is 0.46 of domain.
     dddq_a_max: [21.2, 2.72, 12.5, 236.0, 44.4]
+
     # --- what the C3 feedforward will command --------------------------------
-    #
-    # `u_d = qdot_d + tau_dot_d / k_i`, the inversion `AddC3Feedforward` writes
-    # into the trajectory's effort field, bounded by the domain the compensator
-    # was identified over. Same three lists as `bt_server_override.yaml`'s
-    # `c3_feedforward.{k,u_min,u_max}`, and they must stay the same lists: the
-    # planner exists to refuse what the feedforward cannot deliver, so a second
-    # derivation of these numbers is a second answer to one question.
+    # `u_d = qdot_d + tau_dot_d / k_i`, the inversion `AddC3Feedforward` writes into
+    # the effort field, bounded by the domain the compensator was identified over.
+    # Must stay the same lists as `bt_server_override.yaml`'s
+    # `c3_feedforward.{k,u_min,u_max}`: the planner exists to refuse what the
+    # feedforward cannot deliver, and a second derivation is a second answer.
     #
     # `k` is N m/rad, N/m on the telescope, from
-    # `wiki/diagrams/hydraulic_calibration/c3_full_model.json`. The telescope's is
-    # a geometry prior rather than a fit (controller_design.md 3.4) and the
-    # rotator's rests on four bags (hydraulics 6.1) -- indicative, not measured.
+    # `crane_model/config/c3_full_model.json`; the telescope's is a geometry prior
+    # not a fit and the rotator's rests on four bags -- indicative, not measured.
     # `u_min`/`u_max` are Psi's identified domain, min_x/max_x of
     # `velocity_characteristic.yaml`; outside it the compensator extrapolates a
     # monotone spline past its data.
     command_k: [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
     command_u_min: [-0.9635, -0.3134, -0.3342, -0.5551, -2.3969]
     command_u_max: [0.9357, 0.2977, 0.3059, 0.5849, 2.4636]
-    # s. The reference carries `u` in its effort field advanced by this much:
-    # the feedforward branch is open loop against a plant that answers late, and
-    # controller_design.md 4.3 measures inversion and preview at x25-x52 together
-    # against a fraction of that for either alone. Common to every axis, because
-    # the fit pinned the dead time common. Was `c3_feedforward.dead_time_s` in
-    # bt_server_override.yaml, when a BT node rebuilt the inversion downstream.
+    # s. Effort field advanced by this much: the feedforward branch is open loop
+    # against a plant that answers late, and inversion plus preview measure x25-x52
+    # together against a fraction of that for either alone. Common to every axis --
+    # the fit pinned the dead time common.
     command_dead_time_s: 0.06
-    # s per axis, block 2 of C3 -- the fitted command PT1. **Zero is the shipped
-    # law.** The emitted feedforward then carries hydraulic_actuator_model.md
-    # 5.3 as written: blocks 3 and the rigid body by RNEA, block 1 by the preview
-    # above, block 2 not at all. controller_design.md 2.4 is where the third
-    # inversion is named, and it costs a C4 reference -- which the path already
-    # is, so the term is affordable; whether it is worth it is what an ablation
-    # measures.
+    # s per axis, the fitted command PT1 (block 2 of C3). **Zero is the shipped
+    # law**, so the emitted feedforward carries blocks 3 and the rigid body by
+    # RNEA, block 1 by the preview above, block 2 not at all.
     #
-    # The arm that turns it on: [0.100, 0.025, 0.000, 0.075, 0.125] -- the fitted
-    # split of hydraulic_actuator_model.md 2 (sw, ha, ka, sa, ro), the same
-    # numbers the Gazebo URDF carries as `tau_v`. Only the lag/dead-time *sum* is
-    # identified, so these are a choice, not a measurement.
-    #
+    # The arm that turns it on: [0.100, 0.025, 0.000, 0.075, 0.125] (sw, ha, ka,
+    # sa, ro), the same numbers the Gazebo URDF carries as `tau_v`. Only the
+    # lag/dead-time *sum* is identified, so these are a choice, not a measurement.
     # Live: read per request, so an ablation flips arms without a relaunch.
     command_lag_s: [0.0, 0.0, 0.0, 0.0, 0.0]
     # Visualization is not the control reference: bound the authoritative FK calls
@@ -188,39 +143,32 @@ crane_planner:
     Ts: 0.04
 
     # --- the trajectory OCP --------------------------------------------------
-    #
-    # The generated acados solver `scripts/export_timing_ocp.py` writes. Posed on
+    # The acados solver `scripts/export_timing_ocp.py` generates. Posed on
     # normalised time over [0, 1] and solving for its own horizon, so nothing here
-    # is a duration except `ocp_horizon`, which is a scaling.
+    # is a duration except `ocp_horizon`, a scaling.
     #
-    # 40 shooting intervals is deliberately coarser than the emitted `Ts`: the
-    # answer is resampled onto the 25 Hz reference afterwards, so solver and
-    # reference resolution are independent, and the sway rows need an interval
-    # near a fifth of the pendulum period, not a fortieth.
+    # 40 intervals is deliberately coarser than the emitted `Ts`: the answer is
+    # resampled onto 25 Hz afterwards, and the sway rows need an interval near a
+    # fifth of the pendulum period, not a fortieth.
     ocp_intervals: 40
     # What `theta` is measured in: `T = theta * ocp_horizon`. A scaling, not a
-    # bound -- `theta`'s box limits `T` -- so the horizon enters the Jacobian at
-    # the same magnitude as every other state instead of an order above.
+    # bound (`theta`'s box limits `T`), so the horizon enters the Jacobian at the
+    # same magnitude as every other state instead of an order above.
     ocp_horizon: 7.0
-    # `ERK` (4-stage explicit RK) or `IRK` (2-stage Gauss-Legendre collocation).
-    # Both order 4; IRK costs 2-4x per node and buys an integrator that cannot
-    # damp the pendulum. `theta` scales the step, so one ERK4 step per interval
-    # fabricates damping as the horizon grows -- 84% of the swing gone at the
-    # 16 s answers actually land on. `ocp.py`'s `SIM_SUBSTEPS` is the fix and
-    # holds to 0.965 at `ocp_duration_max`; switch here only past that.
+    # `ERK` (4-stage explicit RK) or `IRK` (2-stage Gauss-Legendre collocation),
+    # both order 4; IRK costs 2-4x per node and buys an integrator that cannot damp
+    # the pendulum. `theta` scales the step, so one ERK4 step per interval
+    # fabricates damping as the horizon grows -- 84% of the swing gone at the 16 s
+    # answers actually land on. `ocp.py`'s `SIM_SUBSTEPS` fixes that and holds to
+    # 0.965 at `ocp_duration_max`; switch here only past that.
     ocp_integrator: ERK
     # --- the cost, as preference alone ---------------------------------------
-    #
     # Every residual row is divided by the limit it is measured against, so 1.0 is
-    # the bound and these are preferences, not unit conversions. 1.0 everywhere is
-    # the honest default: one bound violated costs the same wherever it happens. A
-    # scalar sets a whole block.
-    #
-    # `time` is the odd one out and a **ceiling, not a preference**: it prices the
-    # terminal horizon row, which is the whole minimum-time objective. 0.3 lands
-    # the answer at 0.91 of the pump reservation in 17 iterations; above it the
-    # solve asks for more flow than the pump delivers and stops converging -- the
-    # regime whose honest answer is "no such plan".
+    # the bound and these are preferences, not unit conversions. Scalar sets a
+    # whole block. `time` is a **ceiling, not a preference**: it prices the
+    # terminal horizon row, i.e. the whole minimum-time objective. 0.3 lands the
+    # answer at 0.91 of the pump reservation in 17 iterations; above it the solve
+    # asks for more flow than the pump delivers and stops converging.
     weights:
       dq_a: 1.0
       sway: 1.0
@@ -230,11 +178,11 @@ crane_planner:
       dddq_a: 1.0
       terminal_scale: 1.0
       time: 0.3
-    # The command row is a stiffer direction than the `dddq_a` row it replaced:
-    # `ax_slew` needs 70 iterations against 48 before, and 60 refuses it. Not
-    # higher, because a refusal spends the whole budget before saying so:
-    # `sh_boom` takes 29.9 s to refuse at 200, against the tree's 30 s call
-    # timeout. `ax_rot` does not converge at any budget tried; see 113's notes.
+    # The command row is stiffer than the `dddq_a` row it replaced: `ax_slew` needs
+    # 70 iterations against 48 before, and 60 refuses it. Not higher, because a
+    # refusal spends the whole budget first -- `sh_boom` takes 29.9 s to refuse at
+    # 200, against the tree's 30 s call timeout. `ax_rot` never converges; issue
+    # 113's notes.
     ocp_max_iterations: 100
     # The duration box `theta` is limited by, in seconds.
     ocp_duration_min: 2.0
@@ -242,48 +190,40 @@ crane_planner:
     # The L1 price on every soft row: sway, pump, settled box.
     ocp_slack_price: 1.0e3
     # Where the SQP stops. acados defaults to 1e-6 on all four residuals, a
-    # control-loop number: this answer is resampled onto the 25 Hz reference and
-    # tracked by a controller closing the loop on it, so the last two decades buy
-    # nothing and cost plenty -- a horizon settling just the wrong side of 1e-6
-    # spends every remaining iteration failing to halve it.
+    # control-loop number: this answer is resampled onto 25 Hz and closed-loop
+    # tracked, so the last two decades buy nothing -- a horizon settling just the
+    # wrong side of 1e-6 spends every remaining iteration failing to halve it.
     ocp_tolerance: 1.0e-4
-    # Added identically every iteration; not adaptive. Raising it to 1e-3 was
-    # tried against the `telescope` refusal review.md finding 4 reports: on this
-    # HEAD that move already answers in 10 iterations, and 1e-3 changes neither a
+    # Added identically every iteration; not adaptive. 1e-3 was tried against
+    # `docs/features/planner-continuity/review.md` finding 4 and changed neither a
     # duration nor an iteration count on any of the 21 bench moves. Left alone.
     levenberg_marquardt: 1.0e-6
 
     # --- freshness -----------------------------------------------------------
+    # How old each input may be and still be planned from. A `/joint_states`
+    # message with no `velocity` array is refused, not read as a standstill.
     #
-    # How old each input may be and still be planned from. `/joint_states` carries
-    # rates as well as positions, and a message with no `velocity` array is
-    # refused rather than read as a standstill.
+    # The passive pair gets its own deadline: `sensor_msgs/JointState` has no
+    # `valid` flag, so freshness is the whole test, and reading an absent sway
+    # estimate as zero is what this refusal removes.
     #
-    # The passive pair has its own deadline rather than one age shared by every
-    # input: `sensor_msgs/JointState` has no `valid` flag, so freshness is the
-    # whole test. Reading an absent sway estimate as zero is the stopped-start
-    # convention this refusal removes.
-    #
-    # The scene's age is its own number too. 0.5 s is the age of a 100 Hz
-    # measurement of a machine that moves; the scene is republished on a 2 s
-    # heartbeat, so ten seconds fires on "the world model has stopped", not on
-    # "nothing has moved lately". It matters because that subscription is
-    # transient-local: a scene published once is latched and handed to every
-    # planner that starts later, so without an age a dead world model reads live.
+    # 0.5 s suits a 100 Hz measurement; the scene is republished on a 2 s
+    # heartbeat, so ten seconds fires on "world model stopped", not "nothing moved
+    # lately". Footgun: that subscription is transient-local, so a scene published
+    # once is latched and handed to every later planner -- without an age a dead
+    # world model reads live.
     max_input_age: 0.5
     pendulum_state_deadline: 0.15
     max_scene_age: 10.0
     payload_estimate_deadline: 1.0
 
     # --- the one hydraulic number the description does not carry -------------
+    # Source is `crane_model/config/hydraulics.yaml`'s `pump` block, which carries
+    # the provenance; `crane_mpc` declares the same pair and
+    # test_parameters_are_declared pins this copy to it. Overridable here because a
+    # deployment may have to, not because the number is decided here.
     #
-    # Both are `crane_model/config/hydraulics.yaml`'s `pump` block, which is the
-    # source and carries the provenance; `crane_mpc` declares the same pair and
-    # test_parameters_are_declared pins this copy to it. Overridable here because
-    # a deployment may have to, not because this is where the number is decided.
-    #
-    # It is the **only** actuator limit the planner enforces, and it is measured
-    # 2023, pre-retrofit and not re-verified, which raises what measuring it on
-    # the retrofitted machine is worth.
+    # The **only** actuator limit the planner enforces, measured 2023,
+    # pre-retrofit, not re-verified.
     pump_flow_max: 1.4e-3
     pump_flow_planning_factor: 0.95

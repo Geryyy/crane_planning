@@ -25,12 +25,11 @@ from crane_planning.geometry import Geometry
 from crane_planning.planner import payload_parameters
 
 Q_TOOL = 0.35
-#: Block roughly the size CBS sets, as `(shape, dimensions, offset)`.
+#: (shape, dimensions, offset), roughly CBS block size
 PAYLOAD_SHAPE = ("box", np.array([0.40, 0.20, 0.20]), np.array([0.0, 0.0, -0.30]))
 
 
 def description() -> str:
-    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"
@@ -75,13 +74,8 @@ def geometry(payload_shape) -> Geometry:
 
 
 def carried_point(model: CraneModel, sway, reach: float) -> np.ndarray:
-    """
-    Where the farthest carried point sits, for a pair of hinge angles.
-
-    Block hangs below TCP along tool's own z axis, so it rides tool rotation --
-    why upper hinge matters. Sway is offset from hanging equilibrium, where the
-    box is centred.
-    """
+    """Block hangs below TCP along tool's own z axis, so it rides tool rotation --
+    why upper hinge matters. Sway offsets hanging equilibrium, where box is centred."""
     q = np.zeros(GENERALIZED_DOF)
     q[TOOL_INDEX] = Q_TOOL
     q[list(PASSIVE_INDICES)] = passive_equilibrium(np.zeros(PLANNED_DOF)) + np.asarray(
@@ -94,7 +88,6 @@ def carried_point(model: CraneModel, sway, reach: float) -> np.ndarray:
 
 
 def measured_swing(model: CraneModel, bounds, reach: float) -> float:
-    """Farthest the carried point gets from rest, swept over sway box."""
     rest = carried_point(model, (0.0, 0.0), reach)
     grid = [np.linspace(-bound, bound, 41) for bound in bounds]
     return max(
@@ -106,13 +99,8 @@ def measured_swing(model: CraneModel, bounds, reach: float) -> float:
 
 @pytest.mark.parametrize("payload_shape", [None, PAYLOAD_SHAPE])
 def test_envelope_bounds_both_hinges(payload_shape):
-    """
-    Envelope is an upper bound on real swing, and a tight one.
-
-    Oracle: sweep sway box through model. One-hinge formula this replaced returns
-    0.153 m against a real 0.250 m -- fails bound. Adding hinges instead of
-    composing them returns 0.352 m -- fails tightness.
-    """
+    """One-hinge formula this replaced returned 0.153m vs real 0.250m (fails bound);
+    adding hinges instead of composing returns 0.352m (fails tightness)."""
     scene = geometry(payload_shape)
     swing = measured_swing(
         scene.model, np.abs(scene.config.q_sway_max), scene._carried_reach()
@@ -122,12 +110,8 @@ def test_envelope_bounds_both_hinges(payload_shape):
 
 
 def test_upper_hinge_carries_the_longer_lever():
-    """
-    Why the omission was unsafe, not conservative.
-
-    `theta6_tip` pivots further from tool than `theta7_tilt`, so dropping it from
-    the envelope drops the larger of the two terms.
-    """
+    """theta6_tip pivots further from tool than theta7_tilt, so dropping it drops
+    the larger term -- the omission was unsafe, not conservative."""
     scene = geometry(None)
     q = np.zeros(GENERALIZED_DOF)
     q[TOOL_INDEX] = Q_TOOL
@@ -170,17 +154,13 @@ def _tcp(scene: Geometry) -> np.ndarray:
 
 
 def test_inside_the_envelope_only_the_swinging_half_owes_it():
-    """
-    Envelope is owed by what hangs on the hinges. One wall distance, inside
-    `required` and outside both margins: accepted with base near it, refused with
-    tool near it.
-    """
+    """One wall distance, inside required and outside both margins: accepted near
+    base, refused near tool -- envelope is owed only by what hangs on the hinges."""
     scene = geometry(None)
     target = 0.5 * (scene.required + scene.required_rigid)
     tcp = _tcp(scene)
 
-    # beside base: outriggers reach 2.62 m in y, tool 2.9 m out in x and 0.9 m
-    # wide, so a wall over the base is the base's alone
+    # beside base: outriggers reach 2.62m in y, tool 2.9m out in x -- wall over base is base's alone
     near_base = CollisionPrimitive(
         id="near_base",
         shape="box",
@@ -201,8 +181,6 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
         dimensions_m=np.array([3.0, 0.1, 3.0]),
     )
     _shifted(scene, near_tool, np.array([0.0, -1.0, 0.0]), target)
-    # Swinging half decides here, so the name comes from that query too -- one
-    # read off the unsplit query is a different measurement.
     clearance, required, body = scene.margin(np.zeros(PLANNED_DOF))
     assert required == pytest.approx(scene.required)
     assert clearance < required
@@ -221,12 +199,8 @@ class _Line:
 
 
 def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
-    """
-    Body measured at `d` cannot come nearer than `d - motion` over a step, so two
-    far bodies are queried together once at start, then one at a time as bounds are
-    spent. Second half shows the bound *is* spent: a body the path walks into gets
-    re-measured and refuses, not skipped.
-    """
+    """Body at distance d cannot come nearer than d - motion per step, so far bodies
+    get queried once then ride their bound -- second half shows bound is spent."""
     scene = geometry(None)
     tcp = _tcp(scene)
     far = CollisionPrimitive(
@@ -235,8 +209,7 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
         pose_in_mounting_base=pin.SE3(np.eye(3), tcp + np.array([0.0, 4.0, 0.0])),
         dimensions_m=np.array([10.0, 0.1, 3.0]),
     )
-    # one body staying close: wall 0.6 m behind base, so the far one is skipped
-    # on its bound while something is still queried each step
+    # wall 0.6m behind base stays close so far one is skipped while it's still queried
     near = CollisionPrimitive(
         id="near",
         shape="box",
@@ -256,8 +229,7 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
     # slew away from the wall: 0.3 rad on the slewing axis
     scene.check_path(_Line(np.zeros(PLANNED_DOF), [-0.3, 0.0, 0.0, 0.0, 0.0]))
     assert queried[0] == ["near", "far"]
-    # one body per step after: self row needs a query anyway and carries the body
-    # with the smallest bound, the other rides its bound
+    # one body per step after: self row carries the smallest bound, other rides its bound
     assert all(len(bodies) == 1 for bodies in queried[1:])
     assert len(queried) > 5
 

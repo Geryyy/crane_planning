@@ -1,29 +1,22 @@
 """
 Trajectory OCP cost weights, and the row layout they sit on.
 
-One place, because three things must agree: `export_timing_ocp.py` bakes these as
-solver defaults, node writes its own ROS parameters onto that solver at
-construction, and anything reading a residual back needs to know which row is which.
+Shared by `export_timing_ocp.py` (solver defaults), the node (ROS parameters), and
+residual readers. `W` is a runtime cost field, not an acados parameter: parameters
+get copied onto every stage before every solve, `W` is set once at build, so
+per-stage copies would be wasted on weights that don't change within a run.
 
-`W` is a runtime cost field, not an acados parameter. Parameters carry values
-entering model *expressions*, copied onto every stage before every solve; `W` is set
-once at build, so weights in `p` would pay per-stage copies for numbers that never
-change within a run.
-
-Every residual row is dimensionless -- exporter divides each by the limit it is
-measured against, so 1.0 is the bound. Weight is preference, nothing else. 1.0
-everywhere is the honest default: one bound violated costs the same wherever it
-happens.
+Every residual row is dimensionless (exporter divides by the limit it's measured
+against, so 1.0 is the bound); weight is preference only, 1.0 everywhere means one
+bound violated costs the same wherever it happens.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-#: Stage residual, row order:
-#: `y = [dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]`. `ddq_a` was `u` while
-#: acceleration was the input; state expression now, input is snap, so old name
-#: would be actively wrong.
+#: Stage residual order: y=[dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]; ddq_a was
+#: `u` when acceleration was the input, now a state since input is snap.
 STAGE_BLOCKS = (
     ("dq_a", 5),
     ("sway", 2),
@@ -40,8 +33,7 @@ NY_E = sum(width for _, width in TERMINAL_BLOCKS)
 
 
 #: What shipped `config/crane_planner.yaml` carries, and what a node falls back to.
-#: Preferences 1.0 because rows are dimensionless. `time` is the measured ceiling
-#: above which solve asks for more pump than exists.
+#: `time` is the measured ceiling above which solve asks for more pump than exists.
 DEFAULTS = {
     "dq_a": 1.0,
     "sway": 1.0,
@@ -74,13 +66,7 @@ def stage_diagonal(weights: dict) -> np.ndarray:
 
 
 def terminal_diagonal(weights: dict) -> np.ndarray:
-    """
-    Return `W_e`'s diagonal.
-
-    Blocks shared with a stage node are the same weights scaled by
-    `terminal_scale`, so a preference is expressed once. `time` is the terminal
-    stage's own and is the whole minimum-time objective.
-    """
+    """`W_e`'s diagonal: blocks shared with a stage node are the same weights scaled by `terminal_scale`; `time` is the terminal stage's own minimum-time objective."""
     scale = float(weights["terminal_scale"])
     shared = np.concatenate(
         [_block(weights, n, w) for n, w in TERMINAL_BLOCKS if n != "time"]

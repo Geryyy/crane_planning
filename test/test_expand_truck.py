@@ -8,19 +8,16 @@ import yaml
 from crane_model.collision import CollisionPrimitive
 from crane_planning.planner import PlannerConfig, expand_truck
 
-# Truck, measured in `world` off the description expanded with `post_setup:=134`
-# -- what sim bringup launches, superset of the `13` hardware bringup uses. Box is
-# the shipped vehicle box, agreement with these numbers asserted where it ships;
-# here it is input, and what matters is the output.
+# measured in world off description expanded with post_setup:=134 (sim bringup,
+# superset of hardware's 13); shipped vehicle box, here as input not asserted
 DECK_CENTRE = np.array([-3.332, 0.0, 0.932575])
 DECK_EXTENT = np.array([5.554, 2.518, 0.662850])
 DECK_SURFACE_Z = 1.264
-# Posts: 0.080 x 0.108 x 1.750, standing on the cross struts at z 1.332.
+# posts: 0.080 x 0.108 x 1.750, standing on the cross struts at z 1.332
 POST_X = (-5.593, -4.381, -1.397)
 POST_HALF_EXTENT = np.array([0.040, 0.054])
 POST_CENTRE_Y = 1.2025
 POST_Z = (1.332, 3.082)
-# Headboard closing the cab end.
 HEADBOARD_MIN = np.array([-1.005, -1.254, DECK_SURFACE_Z])
 HEADBOARD_MAX = np.array([-0.555, 1.259, 3.186])
 

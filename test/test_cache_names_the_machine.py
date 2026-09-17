@@ -1,10 +1,4 @@
-"""Two machines must not share one compiled solver.
-
-Node builds planner from `/robot_description`; exporter bakes from a file. Cached
-`.so` is loaded, not compared -- while the cache name ignored the description, a
-solver compiled for the fixture answered every request planned for sim's machine,
-a different xacro at `sim_hydraulics:=false`. Costs no build: name is a hash.
-"""
+"""Cached .so is loaded, not compared -- name hashes description or two machines share one."""
 
 import pytest
 from crane_planning.config import PlannerConfig
@@ -31,6 +25,6 @@ def test_the_same_machine_is_the_same_tree():
 
 
 def test_a_machine_nobody_exported_for_is_refused():
-    """What the node does: refuse, before paying for a model build."""
+    """Refuses before paying for a model build."""
     with pytest.raises(SolverNotExported):
         TrajectoryOcp("<robot name='nobody'/>", None, PlannerConfig(), {}, False)

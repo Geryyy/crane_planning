@@ -2,15 +2,13 @@
 """
 Where a `Planner.plan` call spends its time. No ROS, no graph, no clock.
 
-Stage 0 of C4 continuity work: baseline to attribute against, taken before the
-spline degree or OCP state vector move. Answers what the service-level benchmark
-(`bench_calc_movement.py`) cannot: which stage costs what, and how much of OCP
-wall time is acados not Python.
+Answers what bench_calc_movement.py can't -- which stage costs what, how much
+OCP time is acados vs Python.
 
     ./scripts/bench_plan.py --repeats 5
 
-Wall clock is load-bound (`ocp.py`: 0.53 s idle vs 4.97 s under running Gazebo):
-run idle, read regressions off `sqp_iter` and acados time, not totals.
+Wall clock is load-bound (ocp.py: 0.53 s idle vs 4.97 s under running Gazebo):
+run idle, read regressions off sqp_iter and acados time, not totals.
 """
 
 from __future__ import annotations
@@ -42,29 +40,21 @@ from crane_planning.planner import (  # noqa: E402
 
 DESCRIPTION = "pzs100.urdf"
 
-# Servers disagree on what a joint may do, so a request set both answer lives in
-# the **intersection** of their boxes, much smaller than either. Measured, per
-# planned axis (slew, boom, arm, telescope, rotator):
-#
-#     crane_planning, off PZS100 description it reads:
-#         [-3.71, 3.71] [-1.20, 1.563] [-0.91, 4.60] [0.00, 2.236]  unbounded
-#     a2b_ilqr_server, `qMinCtrl`/`qMaxCtrl` in `mp_parameter_pzs100.yaml`,
-#     less its 0.087 rad `qLimSafetyBuffer`:
-#         [-3.71, 3.71] [ 0.00, 1.562] [-0.91, 1.325] [0.00, 2.236] [-12.6, 12.6]
-#
-# Boom binds: `a2b_ilqr_server` refuses negative boom angle ("q0[1] is not
-# feasible: 0.00 < -0.30 < 1.56"), where `plan_example`'s shipped -0.2 sits. So
-# these moves keep boom positive; not `plan_example`'s moves, not comparable.
+# Servers disagree on joint limits; a request both answer lives in their
+# intersection, smaller than either. Per planned axis (slew,boom,arm,tele,rot):
+#     crane_planning (PZS100 description):
+#         [-3.71,3.71] [-1.20,1.563] [-0.91,4.60] [0.00,2.236]  unbounded
+#     a2b_ilqr_server qMinCtrl/qMaxCtrl minus 0.087 rad qLimSafetyBuffer:
+#         [-3.71,3.71] [0.00,1.562] [-0.91,1.325] [0.00,2.236] [-12.6,12.6]
+# Boom binds (a2b_ilqr_server refuses negative boom), so these moves keep boom
+# positive -- not plan_example's moves, not comparable.
 
-#: Tool coordinate q8. `crane_planning` description bounds it [0.20, 0.70],
-#: `mp_parameter_pzs100.yaml` [0.00, 0.538]; 0.45 inside both, room for safety
-#: buffer.
+#: Tool coordinate q8. crane_planning bounds it [0.20,0.70], mp_parameter_pzs100
+#: [0.00,0.538]; 0.45 inside both, room for safety buffer.
 TOOL_POSITION = 0.45
 
-#: `(name, start, goal)` in planned joint coords, all inside intersection above.
-#: Spread over axes a duration is decided by: slew alone, telescope alone, three
-#: moving everything. Reachability not assumed -- goal is joint config pushed
-#: through FK, so IK stage has an answer.
+#: (name, start, goal) in planned joint coords, inside the intersection above.
+#: Goal is joint config pushed through FK, so the IK stage always has an answer.
 MOVES = (
     ("slew", (0.0, 0.4, 0.6, 1.0, 0.0), (0.9, 0.4, 0.6, 1.0, 0.0)),
     ("telescope", (0.0, 0.4, 0.6, 0.8, 0.0), (0.0, 0.4, 0.6, 1.6, 0.0)),
@@ -73,21 +63,15 @@ MOVES = (
     ("across", (-0.7, 0.3, 0.4, 0.9, -0.3), (0.8, 0.8, 1.0, 1.5, 0.5)),
 )
 
-#: One pose every `wide` move leaves from or arrives at, well interior to the
-#: intersection, so a move off it is about its named axis, not a limit.
+#: Pose every wide move leaves from/arrives at, interior to the intersection,
+#: so a move off it is about its named axis, not a limit.
 BASE = (0.0, 0.5, 0.6, 1.0, 0.0)
 
-#: Spread `MOVES` is not. Those five are long multi-axis moves, the regime a
-#: continuity constraint costs least in: measured, C4 jerk bound reaches only
-#: 0.75 of itself on the worst. Four regimes, why each is in:
-#:
-#: - **single axis** -- which axis decides a duration, one at a time.
-#: - **short** -- 0.05-0.3 rad. Short move accelerates and stops inside a
-#:   fraction of a sway period, so a third-derivative bound actually binds and
-#:   inversion-driven feedforward most likely asks for command it lacks.
-#: - **near limit** -- against shared box, boom especially, whose floor is
-#:   `a2b_ilqr_server`'s, not the description's.
-#: - **long** -- `MOVES` itself, anchor between the two sets.
+#: Spread MOVES lacks: those are long multi-axis moves where a C4 jerk bound
+#: costs least (measured: reaches only 0.75 of itself on the worst). Regimes:
+#: single axis (one axis decides duration); short 0.05-0.3 rad (jerk bound
+#: actually binds, feedforward may ask for command it lacks); near limit
+#: (shared box, boom floor is a2b_ilqr_server's); long (MOVES itself, anchor).
 WIDE_MOVES = (
     # single axis, from one pose
     ("ax_slew", BASE, (2.5, 0.5, 0.6, 1.0, 0.0)),
@@ -111,9 +95,8 @@ WIDE_MOVES = (
     ("pair_tuck", (1.0, 1.2, 1.0, 2.0, 0.5), (0.0, 0.2, 0.1, 0.2, 0.0)),
 )
 
-#: Timed separately, in call order. `plan` runs them as module-level functions
-#: and two methods, so wrapping names suffices -- no production edit, the point
-#: of a baseline.
+#: Timed separately, in call order; plan runs them as module functions/methods
+#: so wrapping names suffices -- no production edit, the point of a baseline.
 PHASES = ("prepare_scene", "geometry", "ik", "path", "coefficients", "ocp", "resample")
 
 
@@ -181,12 +164,11 @@ def goal_pose(planner: Planner, coordinates, frame=Frame.TCP) -> tuple:
 
 def emit_requests(planner: Planner, path: Path, moves) -> None:
     """
-    Write the same moves as `CalcMovement` fields, for the service benchmark.
+    Write moves as CalcMovement fields for the service benchmark.
 
-    Here rather than in the ROS client so both servers get byte-identical
-    requests off one description: client replays a file, computes no goal.
-    `y_n` is the **tip pivot K5** -- what the `.srv` names, what
-    `a2b.translate_request` converts from -- not the TCP.
+    Client replays this file, computes no goal, so both servers see
+    byte-identical requests. y_n is the tip pivot K5 (what
+    a2b.translate_request converts from), not the TCP.
     """
     import json
 

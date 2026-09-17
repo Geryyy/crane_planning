@@ -88,10 +88,8 @@ def certify(geometry, start, goal):
 
 
 def test_joint_line_answers_when_the_tool_chord_does_not(identity_ik):
-    """Blocked tool chord with a clear joint line is answered without a corridor."""
     geometry = FakeGeometry()
-    # identity arm's joint line is the tool chord, so give goal a configuration
-    # whose line passes above the block
+    # identity arm's joint line is the tool chord: goal config passes above the block
     start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
     goal_q_a = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
     geometry.is_valid = lambda q_a: (
@@ -135,8 +133,7 @@ def test_unreachable_corner_refuses_its_corridors_without_lifting(monkeypatch):
             np.zeros(5),
         )
     assert lifts == ["direct tool line"]
-    # two planes, two corners each; second corner never asked once the first
-    # refused
+    # two planes, two corners each; second corner never asked once the first refused
     assert sum(point[2] > 0.3 for point in solves) == 2
 
 

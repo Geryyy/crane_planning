@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 r"""
-Write what `/robot_description` carries, byte for byte, for the exporter to bake.
+Write what /robot_description carries, byte for byte, for the exporter to bake.
 
     ./scripts/dump_robot_description.py live.urdf
     ./scripts/export_timing_ocp.py --description live.urdf --compile-only
 
-Bytes are the point. `crane_planning.ocp.cache_key` hashes the description
-string, the node hashes the one the topic handed it; same string, or the
-prebaked solver is missed and the node quits rather than plan for another
-machine. `ros2 topic echo --field data` is unusable: it appends its own
-`\\n---\\n` record separator.
+Bytes matter: cache_key hashes the description string, the node hashes what
+the topic handed it -- same string or the prebaked solver is missed. `ros2
+topic echo --field data` is unusable: it appends its own \\n---\\n separator.
 
-Which description a deployment publishes there is a launch decision -- a sim may
-publish the `rviz` one -- so dumping is also how you find what you plan for.
+Which description a deployment publishes is a launch decision (a sim may
+publish the rviz one), so dumping is also how you find what you plan for.
 """
 
 from __future__ import annotations
@@ -35,7 +33,7 @@ def dump(output: Path, topic: str, timeout: float) -> int:
     rclpy.init()
     node = Node("dump_robot_description")
     received = []
-    # Transient-local: publisher latched it once at start-up, a volatile
+    # Transient-local: publisher latched once at start-up, so a volatile
     # subscription joining later hears nothing.
     node.create_subscription(
         String,
@@ -52,8 +50,8 @@ def dump(output: Path, topic: str, timeout: float) -> int:
         print(f"nothing published on {topic} within {timeout} s", file=sys.stderr)
         return 1
     output.write_text(received[0])
-    # sha1 is what `cache_key` hashes and what the node reports, so this matches
-    # a dump against the solver a run actually loaded.
+    # sha1 is what cache_key hashes and the node reports -- matches a dump
+    # against the solver actually loaded.
     digest = hashlib.sha1(received[0].encode()).hexdigest()
     print(f"wrote {output}: {len(received[0])} bytes, sha1 {digest[:10]}")
     return 0

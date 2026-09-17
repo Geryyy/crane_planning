@@ -1,20 +1,10 @@
 """
 Draw a plan, so an operator sees what the planner decided.
 
-Four things, each answering a question the numbers do not:
-
-* **path** the tool takes, as one line;
-* **tool itself**, swept along it -- segment from tip pivot to tool centre at
-  samples down the trajectory. That segment is the pendulum, its lean is the
-  sway the OCP *planned*, so a plan that swings looks like it swings;
-* **goal**, where the request asked for the tool and which way round;
-* **scene the planner actually checked against**, which is not the scene anyone
-  published: `truck` has become a bed, six runges and a headboard, and what is
-  in the gripper is a body of its own. A refusal is hard to read without them,
-  obvious with them.
-
-Markers are cheap and this is a plan, not a stream: whole set rebuilt per
-request, led by a `DELETEALL` so nothing from the previous plan survives.
+Path, tool swept along it (pivot-to-centre segment, so a swinging plan visibly
+swings), goal, and the scene actually checked (expanded truck bodies, payload)
+rather than what was published. Whole set rebuilt per request behind a
+`DELETEALL` -- markers are cheap, this is a plan not a stream.
 """
 
 from __future__ import annotations
@@ -26,16 +16,14 @@ from geometry_msgs.msg import Point
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
-#: Where the tool is drawn along the trajectory. Enough to read the swing, few
-#: enough that the machine is not hidden behind its own preview.
+#: How many samples of the tool are drawn along the trajectory.
 SWEEP_SAMPLES = 12
 
 PATH_COLOR = ColorRGBA(r=1.0, g=0.67, b=0.0, a=1.0)
 TOOL_COLOR = ColorRGBA(r=0.0, g=0.9, b=0.9, a=0.65)
 GOAL_COLOR = ColorRGBA(r=1.0, g=0.0, b=0.8, a=0.9)
-#: Structural bodies are the vehicle, cannot move; perceived ones came from the
-#: world model; payload is what the gripper holds. Three colours, because "why
-#: was this refused" is usually answered by which kind it hit.
+#: Structural = vehicle (fixed), perceived = world model, payload = gripper contents --
+#: three colours so a refusal shows which kind was hit.
 STRUCTURAL_COLOR = ColorRGBA(r=0.55, g=0.55, b=0.6, a=0.45)
 PERCEIVED_COLOR = ColorRGBA(r=1.0, g=0.35, b=0.1, a=0.45)
 PAYLOAD_COLOR = ColorRGBA(r=0.2, g=0.4, b=1.0, a=0.6)
@@ -66,7 +54,7 @@ def _quaternion(rotation: np.ndarray) -> tuple:
 
 
 def clear(frame: str, stamp) -> MarkerArray:
-    """Return a `DELETEALL`, so the previous plan does not linger under this."""
+    """Build a `DELETEALL`, so the previous plan doesn't linger."""
     marker = Marker()
     marker.header.frame_id = frame
     marker.header.stamp = stamp
@@ -126,8 +114,8 @@ def plan(model, plan_, frame: str, stamp, payload_shape=None) -> list:
     path.color = PATH_COLOR
     path.points = [_point(position) for position in plan_.tcp]
 
-    # Pendulum, sampled. `Frame.TILT` is the hinge the tool hangs from, so this
-    # segment leans by exactly the sway the timing OCP solved for.
+    # Pendulum, sampled: Frame.TILT is the hinge the tool hangs from, so this segment
+    # leans by exactly the sway the OCP solved for.
     tool = _marker(frame, stamp, "tool", 0, Marker.LINE_LIST)
     tool.scale.x = 0.03
     tool.color = TOOL_COLOR
@@ -138,9 +126,8 @@ def plan(model, plan_, frame: str, stamp, payload_shape=None) -> list:
         tool.points.append(_point(hinge.position_m))
         tool.points.append(_point(tip.position_m))
 
-    # And what it carries, drawn where it will be. Payload travels with the
-    # tool, so a body drawn only at the start says nothing about the half of the
-    # path where it might hit something.
+    # What it carries, drawn along the path -- a body drawn only at the start says
+    # nothing about where it might hit something later.
     load = []
     if payload_shape is not None:
         from .planner import payload_primitive

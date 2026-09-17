@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
-Code-generate the trajectory OCP that `crane_planning.ocp` defines.
+Code-generate the trajectory OCP that `crane_planning.ocp.build_ocp` defines.
 
-Problem is *not* here: it is `crane_planning/ocp.py`'s `build_ocp` -- this
-package solves it from Python, a definition beside the exporter would be a
-second copy. Here: command line and the tree it writes.
+Definition lives in crane_planning/ocp.py; this is only the command line and
+the tree it writes -- a second copy here would drift.
 
-    ./scripts/export_timing_ocp.py            # rewrite `generated/`
-    ./scripts/export_timing_ocp.py --check    # regenerate into a scratch tree and diff
+    ./scripts/export_timing_ocp.py            # rewrite generated/
+    ./scripts/export_timing_ocp.py --check    # regenerate into scratch, diff
     ./scripts/export_timing_ocp.py --description live.urdf --compile-only
 
-Third is prep for a run: compiles a solver for the machine the node gets on
-`/robot_description`, leaves `generated/` alone. Without it the node quits on
-the description it is handed -- only loadable solver would be one baked for some
-*other* description.
-
-Dump the description off a running deployment, then compile against it:
+Third compiles a solver for the machine on /robot_description, leaves
+generated/ alone; without it the node refuses a description it wasn't baked
+for. Dump that description first:
 
     ./scripts/dump_robot_description.py live.urdf
     ./scripts/export_timing_ocp.py --description live.urdf --compile-only
@@ -55,7 +51,7 @@ from crane_planning.ocp import (  # noqa: E402
     write_manifest,
 )
 
-# ------------------------------------------------------------------ generation
+# -- generation --
 
 
 README = """\
@@ -125,24 +121,17 @@ def compile_solver(description: str, parameters: dict, hydraulics: dict) -> None
     """
     Compile the solver into the cache the planner loads from.
 
-    Export without this leaves the node nothing to load: it refuses the
-    description rather than pay code generation plus a C build -- 13 s warm
-    toolchain, minutes cold -- inside whatever asked for the plan. Here means
-    node ready at start.
-
-    Second `build_ocp`, second code generation, on purpose: `output` gets the
-    pruned, normalised tree `--check` reviews, and `crane_ocp`'s `finalise` reads
-    every shipped file as text, so a compiled `.so` cannot live there. Same
-    problem, two artifacts.
+    Without this the node refuses the description rather than pay code-gen +
+    a C build (13 s warm, minutes cold) inside whatever asked for the plan.
+    Second build_ocp/code-gen on purpose: output holds the text tree --check
+    reviews; a compiled .so can't live there, so it's two artifacts.
     """
     ocp, _, _ = build_ocp(description, parameters, hydraulics)
     CACHE.mkdir(parents=True, exist_ok=True)
-    # Named by what is baked, not by tool alone: cached `.so` is loaded, not
-    # compared, so changed `path_segments`, integrator or *description* must land
-    # in a different directory or the node answers with the previous build. Node
-    # hashes description handed on `/robot_description` and says which it missed
-    # on, so compiling for the wrong machine warns at run time instead of
-    # answering silently wrong.
+    # Cache key covers path_segments, integrator and description hash: cached
+    # .so is loaded not compared, so any change must land in a new directory
+    # or the node silently reuses the old build. Node hashes /robot_description
+    # and reports a mismatch instead of answering silently wrong.
     key = cache_key(parameters, hydraulics, description)
     tree = tree_of(key)
     ocp.code_export_directory = str(tree)
@@ -184,9 +173,8 @@ def main() -> int:
     )
     source = arguments.description or arguments.descriptions / DESCRIPTION
     description = source.read_text()
-    # `generated/` is the shipped tree `--check` and CI diff against, regenerated
-    # from the fixture. Writing another machine into it makes every later
-    # `--check` report a diff nobody asked for.
+    # generated/ is the shipped tree --check and CI diff against; writing
+    # another machine into it makes every later --check report a spurious diff.
     if arguments.description and not arguments.compile_only:
         parser.error("--description writes only into the cache: add --compile-only")
     if arguments.compile_only:
@@ -198,8 +186,8 @@ def main() -> int:
         lambda output: generate(output, description, parameters, parameters),
         "export_timing_ocp.py",
     )
-    # `--check` compares two trees, must not touch the cache; a real export
-    # leaves a compiled solver so the node does not build one on demand.
+    # --check compares two trees and must not touch the cache; a real export
+    # leaves a compiled solver so the node doesn't build one on demand.
     if status == 0 and not arguments.check and not arguments.no_compile:
         compile_solver(description, parameters, parameters)
     return status

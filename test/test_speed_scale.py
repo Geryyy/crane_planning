@@ -1,16 +1,5 @@
-"""`slow_down` divides rate, acceleration and jerk alike -- not a time scaling.
-
-`CalcMovement.slow_down` is documented "divider to reduce max speed/acceleration";
-the reference server divides `qDotMax`, `qDDotMax`, `qDDDotMax` by it each. Scaling
-the k-th derivative by `speed_scale**k` fits a uniform time reparametrisation, no
-symmetry here: pendulum period is fixed, so an `s**2` acceleration ceiling takes
-the authority needed to cancel sway at the swing frequency and refuses where it
-should have slowed. Measured on the 21 bench moves at `s = 0.5`: 1 of 5 core moves
-answered under `s**k`, 3 of 5 under the linear rule.
-
-Rules coincide at `s = 1`, so ceilings are asserted at `s = 0.5` against both -- an
-answer inside the linear ceilings but past the old ones says which rule shipped.
-"""
+"""`slow_down` divides rate/accel/jerk linearly, not by `s**k`: at s=0.5 on 21 bench
+moves, linear answered 3/5 core moves vs 1/5 under `s**k` (rules coincide at s=1)."""
 
 import numpy as np
 import pinocchio as pin
@@ -21,8 +10,7 @@ from crane_planning.geometry import yaw_of
 from crane_planning.planner import Planner, Start
 from test_jerk_bound import GOAL, START, TOOL_POSITION, description
 
-#: Half speed. `stow` answers here; at 0.25 it refuses in the QP at the first
-#: iteration -- a start-guess failure, not a ceiling.
+#: at 0.25 refuses in the QP first iteration (start-guess failure, not a ceiling)
 SPEED_SCALE = 0.5
 
 
@@ -66,7 +54,6 @@ def test_slow_down_divides_every_ceiling_once():
         f"{config.ddq_a_max.tolist()}"
     )
 
-    # Discriminating half: under `s**k` this answer was not available --
-    # acceleration alone reaches 1.03 and 1.48 of what `s**2` would have allowed.
-    # No jerk assertion: `dddq_a_max` is a cost scale now and bounds nothing.
+    # discriminating: under s**k unavailable (accel reaches 1.03-1.48x of s**2's allowance)
+    # no jerk assertion: dddq_a_max is a cost scale now, bounds nothing
     assert np.any(peak_accel > config.kappa * SPEED_SCALE**2 * config.ddq_a_max)

@@ -1,16 +1,6 @@
-"""Weights a caller passes must reach the *built* solver, not just the export.
-
-`W` enters generated code at export time and `TrajectoryOcp` loads a cached `.so`
-rather than regenerating: a weight written only into the `AcadosOcp` object is inert
-on every run but the one that built the tree. `BAKED` excludes weights on purpose,
-so a changed weight does not invalidate the cache either, and the whole `weights`
-block of `config/crane_planner.yaml` goes quietly dead. Measured before the fix:
-`weights.time` swept 0.3 to 10 gave durations equal to the centisecond, identical
-iteration counts.
-
-Costs one solver build on a cold cache -- price of covering a silently failing
-knob.
-"""
+"""Weights must reach the *built* solver, not just the export -- W enters generated
+code at export time, cached `.so` is loaded not regenerated, so an unbuilt weight is
+inert. Before the fix: weights.time swept 0.3-10 gave identical durations/iterations."""
 
 from pathlib import Path
 
@@ -20,13 +10,11 @@ from crane_planning import weights as crane_weights
 from crane_planning.config import PlannerConfig, read_limits
 from crane_planning.ocp import TrajectoryOcp
 
-#: Terminal residual's last row is `theta`, so `weights.time` is `W_e`'s corner --
-#: one number saying whether the block arrived.
+#: terminal residual's last row is theta -- weights.time is W_e's corner
 TIME_ROW = -1
 
 
 def description() -> str:
-    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"

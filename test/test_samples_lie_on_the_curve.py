@@ -1,14 +1,4 @@
-"""Emitted reference must lie on the certified curve, not on its chords.
-
-`q_a = c(sigma)` is an identity the timing solve never leaves, so `q_a` is no
-independent row. Resampling with `np.interp` over the OCP nodes -- what `_resample`
-did -- reports the straight line between two on-curve points, off the certified
-curve. Sample *values* wrong, not only derivatives.
-
-Oracle is independent of how the fix rebuilds `sigma`: recover `sigma` from one
-coordinate of an emitted row, check the other four agree with the curve there.
-Chord point fails; curve point passes, whatever produced it.
-"""
+"""Emitted reference must lie on the certified curve, not the chord np.interp over nodes gives."""
 
 from types import SimpleNamespace
 
@@ -18,8 +8,7 @@ from crane_planning.config import PLANNED_DOF
 from crane_planning.ocp import ORDER, evaluate
 from crane_planning.planner import actuated_samples
 
-#: One segment, so `evaluate`'s segment lookup is not under test. Cubic term makes
-#: the chord miss -- a straight curve would pass the broken implementation too.
+#: one segment (evaluate's lookup not under test); cubic term makes the chord miss
 COEFFICIENTS = np.zeros((1, ORDER, PLANNED_DOF))
 COEFFICIENTS[0, 0] = [0.0, 0.10, -0.20, 0.30, 0.05]
 COEFFICIENTS[0, 1] = [1.20, -0.60, 0.90, 0.40, -0.30]

@@ -1,17 +1,4 @@
-"""Command the C3 feedforward issues is a row in the OCP, and a hard one.
-
-Reference the command cannot afford saturates the valve, at which point the
-feedforward is no longer one. Bound belongs to the planner, not a post-hoc check.
-
-Row is the command itself -- `u_d = dq_a + tau_dot_a / k`, what `AddC3Feedforward`
-computes -- not the `dddq_a` proxy first shipped. Proxy priced a sum of worst cases
-(reserve rate, reserve acceleration, jerk gets the rest) where the valve pays the
-sum at each instant, and froze `M_ii` at the fitted pose.
-
-Two properties, failing differently. Row missing: solve answers with a reference
-the machine cannot track. Row soft: priced violation, same failure wearing a price
-tag. So hardness is asserted, not just presence.
-"""
+"""C3 feedforward command (u_d = dq_a + tau_dot_a/k) is a hard OCP row, not the old dddq_a proxy."""
 
 from pathlib import Path
 
@@ -29,15 +16,13 @@ from crane_planning.geometry import yaw_of
 from crane_planning.ocp import H_COMMAND, NH, baked_parameters, build_ocp
 from crane_planning.planner import Planner, Start
 
-#: `stow`, the `bench_plan.py` move closest to the bound -- 0.75 of it on the
-#: boom, measured before the row existed.
+#: stow, bench_plan.py's move closest to the bound (0.75 of it on the boom)
 START = (0.6, 0.7, 0.9, 1.4, 0.4)
 GOAL = (0.0, 0.25, 0.35, 0.7, 0.0)
 TOOL_POSITION = 0.45
 
 
 def description() -> str:
-    """Expanded PZS100 description crane_model keeps as a fixture."""
     path = (
         Path(__file__).parents[2]
         / "crane_model"
@@ -59,8 +44,7 @@ def test_the_command_rows_are_present_and_hard():
 
     assert ocp.model.con_h_expr.shape[0] == NH
     command_rows = set(range(H_COMMAND, NH))
-    # Soft rows are ones a caller would rather have late than refused. A command
-    # the valve cannot deliver is not a slower plan, it is an untrackable one.
+    # a command the valve cannot deliver is not a slower plan, it's an untrackable one
     assert command_rows.isdisjoint(set(np.atleast_1d(ocp.constraints.idxsh).tolist()))
 
 

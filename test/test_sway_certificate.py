@@ -1,19 +1,4 @@
-"""A plan that bought the sway box with slack must be refused, not published.
-
-`Geometry` builds the clearance envelope from `q_sway_max`; geometric stage
-certifies the corridor against it. In the OCP that box is *soft*, priced at
-`ocp_slack_price`: on a request it cannot otherwise meet, the solve converges with
-every KKT residual clean, having paid past the bound, and the plan swings outside
-the certified envelope. Nothing downstream re-checks: silent breach.
-
-Gate asserted on a doctored `Trajectory`, not a request that provokes one: on the
-shipped fixture every over-constrained request tried -- duration box cut to 4-6 s,
-start swinging at 0.95 of box with and without rate -- fails to *converge* rather
-than buy slack. Conditioning, not formulation; row stays soft and purchasable.
-
-`slack_spent` gets its own test: breach hid there, it read lower slacks only, so a
-swing past the upper bound reported zero.
-"""
+"""Sway box is soft slack in the OCP -- paying past it converges clean but breaches the envelope."""
 
 import dataclasses
 
@@ -95,21 +80,18 @@ def test_a_bought_sway_box_is_refused_and_a_met_one_is_not():
     planner, start, position, yaw = planner_and_goal()
     request = dict(scene=[], avoid_collisions=True)
 
-    # Clean solve first: gate must not fire on the answer the shipped config
-    # returns -- a refusal on every plan is the same defect, opposite sign.
+    # clean solve first: gate must not fire on the shipped config's own answer
     plan = planner.plan(start, position, yaw, **request)
     assert plan.timing.sway_slack <= SLACK_SPENT
 
-    # `slack_spent` slices `[:NH_SWAY]` -- sway pair only while `h` is the *only*
-    # softened constraint. acados orders slacks `[sbu, sbx, sg, sh]`: softening any
-    # box (`dq_sway_max`, what a stubborn solve wants) prepends entries and the
-    # slice silently reads the box. Asserted against the built solver, not a
-    # fixture -- a fixture gets updated by the same edit that breaks the gate.
+    # slack_spent slices [:NH_SWAY] -- valid only while h is the sole softened
+    # constraint; acados orders slacks [sbu,sbx,sg,sh] so softening dq_sway_max
+    # would prepend and break the slice. Asserted on the built solver, not a fixture.
     solver = planner.ocp.solver
     assert len(solver.get(0, "sl")) == NH_SWAY + 1, "a stage node is sway, sway, flow"
     assert len(solver.get(len(plan.timing.time) - 1, "sl")) == NH_E
 
-    # Same answer, with the solve having paid 5% of `q_sway_max` to get it.
+    # same answer, having paid 5% of q_sway_max to get it
     bought = dataclasses.replace(plan.timing, slack=0.05, sway_slack=0.05)
     planner.ocp.solve = lambda **_: bought
 
@@ -121,13 +103,8 @@ def test_a_bought_sway_box_is_refused_and_a_met_one_is_not():
 
 
 def test_a_settled_box_looser_than_the_envelope_is_refused():
-    """Node N is skipped because its box is tighter -- so it has to stay tighter.
-
-    Both declared parameters, and relaxing `terminal_q_sway_max` is the natural
-    move when a goal will not settle. Past `q_sway_max` it puts the goal pose
-    outside the clearance envelope, unwatched: `sway_slack` skips node N by
-    construction, terminal check passes it.
-    """
+    """Relaxing terminal_q_sway_max past q_sway_max puts the goal pose outside the
+    clearance envelope unwatched: sway_slack skips node N, terminal check passes it."""
     planner, start, position, yaw = planner_and_goal()
     planner.ocp.config.terminal_q_sway_max = planner.config.q_sway_max * 1.5
 

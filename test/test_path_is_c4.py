@@ -1,14 +1,5 @@
-"""Certified path must be `C4` in sigma, and both readers must agree on it.
-
-C3's flat inversion needs `qdddot_d`, command PT1 inversion one derivative beyond:
-reference must be `C4`. Cubic B-spline with simple interior knots is `C2` and no
-constraint recovers the missing levels; a quintic is `C4` by construction.
-
-Second test catches a half-done degree change. `evaluate` and `path_expression` are
-the same power basis twice, numeric and symbolic -- `evaluate`'s docstring says why:
-what is reported back must be what was constrained. Nothing else checks they still
-agree once a derivative level is added.
-"""
+"""Path must be C4 in sigma (PT1 inversion needs one derivative beyond qdddot_d);
+quintic gives that by construction where a C2 cubic B-spline would not."""
 
 import casadi as ca
 import numpy as np
@@ -24,8 +15,7 @@ from crane_planning.ocp import (
     power_coefficients,
 )
 
-#: Polyline curving in every coordinate, so a straight-line fit would not pass
-#: by accident.
+#: curves in every coordinate so a straight-line fit would not pass by accident
 WAYPOINTS = np.column_stack(
     [
         np.linspace(0.0, 0.9, 40) + 0.15 * np.sin(np.linspace(0.0, 3.0, 40)),
@@ -68,15 +58,8 @@ def piece(coefficients: np.ndarray, segment: int, local: float, order: int):
 
 
 def test_the_fitted_path_is_c4_at_every_interior_breakpoint():
-    """
-    Read the two polynomials, not a finite difference across the join.
-
-    One-sided difference at a breakpoint measures the next derivative times the
-    step plus any genuine jump -- at the fourth level of a quintic it cannot
-    separate them. The power basis carries each segment's polynomial explicitly, so
-    limits are exact: segment `k` at its right edge, `k+1` at its left -- they
-    agree, or it is not `C4`.
-    """
+    """Reads the two polynomials, not a finite difference across the join -- a
+    one-sided difference can't separate a genuine jump from the next derivative."""
     coefficients = power_coefficients(fitted(), PlannerConfig().path_segments)
     segments = coefficients.shape[0]
     width = 1.0 / segments
@@ -105,8 +88,7 @@ def test_evaluate_and_path_expression_agree_at_every_level():
     )
 
     flat = coefficients.reshape(-1)
-    # Breakpoints included: where a disagreeing segment lookup would show, and
-    # the curve is C4 across them so both readers must answer alike.
+    # breakpoints included: where a disagreeing segment lookup would show
     query = np.unique(
         np.concatenate([np.linspace(0.0, 1.0, 97), np.linspace(0.0, 1.0, segments + 1)])
     )

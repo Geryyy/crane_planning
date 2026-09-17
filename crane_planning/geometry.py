@@ -1,9 +1,4 @@
-"""
-Where machine may go, and curve fitted through it.
-
-Scene, IK, bounded candidate paths, fit. Clearance *proved*, not sampled: margin
-plus bound on machine motion between two checked configs. No time here.
-"""
+"""Where machine may go, and the curve fitted through it: scene, IK, candidate paths, fit."""
 
 from __future__ import annotations
 
@@ -42,8 +37,7 @@ from .config import (
 TRUCK_ID = "truck"
 PAYLOAD_ID = "payload"
 
-#: Two passive hinges tool hangs on, in `q_sway_max` / `PASSIVE_INDICES` order.
-#: Orthogonal axes 0.223 m apart, so swings do not add -- see `Geometry._envelope`.
+#: Two passive hinges tool hangs on, in `q_sway_max`/`PASSIVE_INDICES` order, 0.223 m apart.
 PASSIVE_PIVOTS = (Frame.TIP, Frame.TILT)
 
 
@@ -52,15 +46,10 @@ PASSIVE_PIVOTS = (Frame.TIP, Frame.TILT)
 
 def expand_truck(scene: list, config: PlannerConfig) -> list:
     """
-    Turn reserved `truck` primitive into bed, runges and headboard.
+    Turn `truck` primitive into bed, runges, headboard.
 
-    Crane bolted to vehicle, so box is no obstacle; tool can hit bed top face,
-    runges on it, headboard at cab end. Dimensions configured, position measured
-    (arrives with primitive).
-
-    Runge flush against bed edge, not centred: real post's outer face sits there,
-    and the configured section inflates it inboard. Headboard flush against box
-    +x face likewise -- end the outermost runge station is at.
+    Bolted to vehicle, so the box itself is no obstacle; dims configured, position
+    measured. Runge/headboard flush to real edge/face, not centred.
     """
     expanded = []
     for primitive in scene:
@@ -115,14 +104,11 @@ def payload_primitive(
     model: CraneModel, q: np.ndarray, payload_shape
 ) -> CollisionPrimitive | None:
     """
-    Return what is in gripper, as body at K8 pose of `q`.
+    Payload as a scene body at the tool pose for `q`.
 
-    Model collision API takes no payload, so carried block goes in as scene body
-    -- else plan certifies clear of all but what crane holds. `attached_to_tool`
-    stops grip reading as collision, gets body checked vs obstacles.
-
-    Placed per config, not once: payload pinned at start pose is a ghost there
-    while real one rides tool through scene unchecked.
+    Collision API can't see it, so it's added per config (not once -- pinned at
+    start pose it's a ghost, real one rides unchecked). `attached_to_tool` keeps
+    the grip from reading as self-collision.
     """
     if payload_shape is None:
         return None
@@ -146,25 +132,19 @@ def payload_primitive(
 
 class Geometry:
     """
-    Whether config is clear, at pose tool hangs at.
+    Whether config is clear, at the pose the tool hangs at.
 
-    Every distance is a `crane_model` query -- no second collision model here.
-
-    Certificate: sampling alone proves nothing; margin plus Lipschitz bound does.
-    `radii[j]*|dq_j|` bounds how far joint j's rotation moves anything below it,
-    summed into `step_bound`. So: every checked config clearing more than
-    `required`, plus `step_bound <= margin_interp` on every consecutive pair =>
-    nothing touches in between. Both halves load-bearing; README "The collision
-    certificate" has the argument.
+    Every distance is a `crane_model` query. Certificate: margin plus Lipschitz
+    bound, not sampling, proves clearance between checked configs. `radii[j]*|dq_j|`
+    bounds how far joint j moves anything below it, summed into `step_bound`: every
+    checked config clears `required`, and `step_bound <= margin_interp` between
+    consecutive pairs => nothing touches in between.
 
         required = margin_safety + margin_interp + envelope   (each spent once)
 
-    Envelope owed by what hangs on hinges, nothing else. One hanging-pose query
-    settles a config clearing `required` whole-machine; one inside it splits at
-    upper hinge, only swinging half owes envelope -- `margin`.
-
-    Self-collision tested at zero, not `required`: links near each other by
-    design.
+    Envelope is owed only by what hangs on hinges (one hanging-pose query settles
+    whole-machine; splitting at the upper hinge only charges the swinging half).
+    Self-collision tested at zero, not `required`: links are near each other by design.
     """
 
     def __init__(
@@ -207,27 +187,19 @@ class Geometry:
 
     def _envelope(self) -> float:
         """
-        Return how far farthest carried point can swing, in metres.
+        Farthest carried point can swing, in metres.
 
-        Two hinges, not one: `theta6_tip` at `Frame.TIP`, `theta7_tilt` 0.223 m
-        below at `Frame.TILT`. Orthogonal axes (Cardan joint,
-        `K6_double_joint_link`), `q_sway_max` bounds each separately, uncoupled
-        => both at bound at once. Each swings carried point about its own pivot,
-        displacements perpendicular => hypotenuse. Dropping upper hinge (longer
-        lever) understates swing instead of erring safe: PZS100 0.153 m one
-        hinge, 0.251 m two.
+        Two hinges: `theta6_tip` at `Frame.TIP`, `theta7_tilt` 0.223 m below at
+        `Frame.TILT`, orthogonal (Cardan joint), each bounded by `q_sway_max`,
+        uncoupled -- both at bound at once, perpendicular so hypotenuse. Dropping
+        the upper (longer) hinge understates swing: PZS100 0.153 m one hinge vs
+        0.251 m two. Chord `2 L sin(theta/2)`, not `L sin theta` (~0.5% apart,
+        undershoots by microns) -- estimate not bound.
 
-        Chord `2 L sin(theta/2)` per hinge, not `L sin theta`: 0.5% apart, and
-        `sin` undershoots swept sway box by tens of microns -- estimate, not
-        bound.
-
-        Levers at hanging equilibrium, where sway box is centred. `|TILT -> TCP|`
-        rigid; `|TIP -> TCP|` bends with tilt: 0.802 m vs 0.994 m at raw zero.
-        None depend on boom/arm/telescope, so one config suffices. Gripped block
-        hangs below TCP, lengthens both levers alike.
-
-        Sway box shared with controller -- machine may reach it, not a
-        conservative allowance.
+        Levers at hanging equilibrium: `|TILT -> TCP|` rigid, `|TIP -> TCP|` bends
+        with tilt (0.802 m vs 0.994 m at raw zero); independent of boom/arm/telescope
+        so one config suffices, gripped block lengthens both. Sway box is shared with
+        the controller -- machine may actually reach it, not a conservative allowance.
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
@@ -245,13 +217,12 @@ class Geometry:
 
     def _radii(self) -> np.ndarray:
         """
-        How far a body can move per unit of each planned coordinate.
+        Distance a body can move per unit of each planned coordinate.
 
-        At full telescope extension, where radii are largest. Outermost point =
-        TCP + `tool_radius` + carried reach; distance from each joint's *origin*,
-        not its axis. Both over-estimate -- safe direction for a bound.
-        Prismatic telescope displaces what it carries by
-        `TELESCOPE_TRAVEL_PER_UNIT` -- two metres per metre of q4, not one.
+        At full telescope extension (radii largest there): outermost point = TCP +
+        `tool_radius` + carried reach, from each joint's *origin* not its axis --
+        both over-estimate, safe direction. Telescope is prismatic: displaces what
+        it carries by `TELESCOPE_TRAVEL_PER_UNIT`, two metres per metre of q4.
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
@@ -292,19 +263,16 @@ class Geometry:
 
     def _distances(self, q: np.ndarray, swinging=None, scene=None) -> dict | None:
         """
-        Return distance per scene id at `q`.
+        Distance per scene id at `q`, over `scene` (default all) plus what tool carries.
 
-        Over `scene` (default: all) plus what tool carries. `None` when query
-        cannot be evaluated or machine touches itself.
+        `None` if unevaluable or machine touches itself.
         """
         try:
             bodies = self.bodies(q, scene)
             results = self.model.collision_queries(q, bodies, swinging)
         except (CraneModelError, PlanningError):
             return None
-        # queries(): one row per scene primitive in scene order, then -- if
-        # description has self-pairs and machine not split -- one machine vs
-        # itself.
+        # queries(): one row per scene primitive, then a self-pair row if there is one
         scene_rows = results[: len(bodies)]
         if any(row.minimum_distance_m <= 0.0 for row in results[len(bodies) :]):
             return None
@@ -321,38 +289,31 @@ class Geometry:
 
     def clearance(self, q_a: np.ndarray) -> float:
         """
-        Scene clearance at `q_a` in metres, `-inf` where not evaluable.
+        Scene clearance at `q_a` in metres, `-inf` if unevaluable.
 
-        Self-collision split out, tested at zero; returned value is distance to
-        scene, which margin is against.
+        Self-collision is tested separately at zero.
         """
         return self._scene_distance(self.configuration(q_a))
 
     def margin(self, q_a: np.ndarray, scene=None) -> tuple[float, float, str | None]:
         """
-        Return `(clearance, required, body)` as what decides `q_a`.
+        `(clearance, required, body)` deciding `q_a`.
 
-        `body` = scene id clearance was measured against -- refusal must name it
-        to be worth reading -- `None` when no query possible.
-
-        Whole machine clearing `required` at hanging pose is sufficient: no sway
-        state reaches anything. Not necessary: column, boom, arm do not swing, so
-        a config inside `required` because of one of them is not refused on it --
-        split at upper hinge, swinging half owes envelope, rigid half only the
-        two margins, binding one reported.
-
-        `scene` restricts query; `check_path` passes bodies its bounds cannot
-        vouch for.
+        `body` is the scene id measured against (`None` if no query possible) --
+        refusals must name it. Clearing `required` whole-machine is sufficient but
+        not necessary: rigid axes don't swing, so a config only inside `required`
+        because of one of them isn't refused -- split at the upper hinge, swinging
+        half owes envelope, rigid half just the two margins. `scene` restricts the
+        query; `check_path` passes bodies its bounds can't vouch for.
         """
         q = self.configuration(q_a)
         return self._decide(q, self._distances(q, scene=scene), scene)
 
     def _decide(self, q: np.ndarray, distances: dict | None, scene) -> tuple:
         """
-        Return `(clearance, required, body)` for one set of measured distances.
+        `(clearance, required, body)` for one set of measured distances.
 
-        Id comes from whichever query produced the number, so name and number
-        never disagree.
+        Id comes from whichever query produced the number.
         """
         if distances is None:
             return -np.inf, self.required, None
@@ -362,9 +323,8 @@ class Geometry:
         if hanging <= self.required_rigid:
             # inside both margins with something: no split can pass it
             return hanging, self.required_rigid, body
-        # One more query, not two: `hanging` is smaller of the two halves, so a
-        # swinging half clear of `required` leaves rigid half at `hanging` --
-        # inside band, so clear of its own.
+        # one more query not two: hanging is the smaller half, swinging clear of required leaves
+        # rigid clear at hanging
         swinging_body, swinging = self._nearest(
             self._distances(q, swinging=True, scene=scene)
         )
@@ -399,20 +359,15 @@ class Geometry:
 
     def check_path(self, path) -> None:
         """
-        Run certificate on fitted curve. Only place it runs.
+        Run the certificate on the fitted curve -- the only place it runs.
 
-        Lifted polyline is not checked -- it only fixes IK branch and
-        interpolation bound. Spline through it is a different curve and it is
-        what executes, so both tests: clearance at every sample, step bound
-        between consecutive ones. Same adaptive step -- sample count off tool
-        travel says nothing about how far arm moved.
-
-        Step bound doubles as broad phase: body measured at `d` cannot come
-        nearer than `d - motion` over a step moving machine by at most `motion`,
-        so one whose bound still exceeds `required` is not re-queried, just
-        decremented. Re-measured once bound is spent -- every step for truck
-        under crane, never for container across yard. Carried body rides tool,
-        always queried.
+        The lifted polyline isn't checked (only fixes IK branch/interpolation
+        bound); the spline is what executes, so both are tested: clearance at every
+        sample, step bound between consecutive ones. Step bound doubles as broad
+        phase: a body measured at `d` can't be nearer than `d - motion` after a step
+        moving the machine by at most `motion`, so a body whose bound still exceeds
+        `required` is just decremented, not re-queried -- every step for truck under
+        crane, never for container across yard. Carried body always queried.
         """
         previous = path.position(0.0)
         q = self.configuration(previous)
@@ -464,12 +419,10 @@ class Geometry:
 
 def yaw_of(rotation: np.ndarray) -> float:
     """
-    Return `phi_tool`: world yaw of TCP local y, about K0 z.
+    `phi_tool`: world yaw of TCP local y (not x) about K0 z.
 
-    Not x. `phi_tool_n` is jaw-opening heading, on PZS100 TCP y -- rails stroke
-    along -+y. Legacy planner spelled it in joint space as `theta1 - theta8`;
-    both agree exactly at every config. Reading x gives perpendicular: gripper
-    90 deg off requested angle.
+    `phi_tool_n` is the jaw-opening heading, on PZS100 TCP y, rails stroke along ±y -- x gives the
+    gripper 90 deg off.
     """
     return float(np.arctan2(rotation[1, 1], rotation[0, 1]))
 
@@ -489,18 +442,13 @@ def solve_ik(
     restarts: int = 1,
 ) -> np.ndarray:
     """
-    Solve for planned five putting tool at `(position_m, yaw)`, hanging.
+    Solve for the planned five putting tool at `(position_m, yaw)`, hanging.
 
-    Least squares, not closed form: passive pair re-settles at every config
-    tested, so solve lands where tool really ends up. Telescope redundancy taken
-    up by weak pull to seed.
-
-    `restarts` splits the two callers. Cold goal spreads restarts over telescope
-    range -- coordinate residual is flat in. Corridor samples take one restart
-    from predecessor: right seed for neighbouring poses, and what keeps lift on
-    one IK branch.
-
-    Reachability only. Clearance is caller's question.
+    Least squares, not closed form: passive pair re-settles per config tested,
+    telescope redundancy taken up by a weak pull to seed. `restarts`: cold goal
+    spreads restarts over telescope range (residual flat there); corridor samples
+    take one restart from predecessor, keeping lift on one IK branch. Reachability
+    only -- clearance is the caller's question.
     """
     lower = np.where(limits.bounded, limits.lower, seed - 2.0 * np.pi)
     upper = np.where(limits.bounded, limits.upper, seed + 2.0 * np.pi)
@@ -526,18 +474,13 @@ def solve_ik(
         """
         Analytic derivative of residual, not finite difference.
 
-        Worth the lines: differencing five parameters costs six FK evals per
-        iteration, this one Jacobian. Why lift stopped being slowest stage.
-
-        Two corrections. Model Jacobian is LOCAL, so linear and angular blocks
-        rotate into `K0_mounting_base`. And passive pair is not independent:
-        pendulum hangs at `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, so boom and arm
-        swing tip joint back by as much -- tip column enters those two columns
-        with factor -1.
-
-        Yaw row takes angular Jacobian z entry, exact only while tool hangs
-        near-upright. Costs some convergence, nothing in correctness: residual
-        stays exact, acceptance is on residual.
+        Worth it: finite-differencing costs six FK evals/iteration vs one Jacobian
+        here. Two corrections: model Jacobian is LOCAL so linear/angular blocks
+        rotate into `K0_mounting_base`; and the passive pair isn't independent --
+        pendulum hangs at `q_eq = (pi/2 - q_boom - q_arm, pi/2)`, so boom/arm swing
+        the tip joint back by as much, entering those two columns with factor -1.
+        Yaw row uses the angular Jacobian z entry, exact only near-upright -- costs
+        convergence, not correctness (acceptance is on the exact residual).
         """
         try:
             q = geometry.configuration(q_a)
@@ -577,9 +520,8 @@ def solve_ik(
             and float(abs(values[3])) <= config.eps_yaw
         )
 
-    # Continuation queries sit close to their seed, so bounded Gauss-Newton with
-    # analytic Jacobian gets them home without a fresh scipy trust-region problem
-    # per sample. scipy below is fallback and takes cold restarted endpoint.
+    # continuation queries sit near their seed: bounded Gauss-Newton w/ analytic Jacobian is cheaper
+    # than a fresh scipy problem; scipy below is fallback, takes cold restarted endpoint
     if restarts <= 1:
         current = starts[0].copy()
         values = residual(current)
@@ -617,10 +559,8 @@ def solve_ik(
         error = float(np.linalg.norm(answer.fun[:4]))
         if error < best_error:
             best, best_error = answer.x, error
-        # Inside tolerance: not a local minimum, further restarts only re-derive
-        # it. Returned outright, not via `best`: selection above mixes metres and
-        # radians in one 4-norm while acceptance is two separate scalars, so
-        # passing restart need not hold `best`.
+        # inside tolerance: not a local minimum. Returned outright, not via `best`,
+        # which mixes metres/radians in one norm while acceptance is two scalars
         if accepted(answer.fun):
             return answer.x
 
@@ -739,11 +679,10 @@ def lift_candidate(
     candidate: CartesianCandidate,
 ) -> np.ndarray:
     """
-    Lift one TCP polyline into joint space using continuation IK.
+    Lift one TCP polyline into joint space via continuation IK.
 
-    Samples fix continuous IK branch and interpolation bound; not executed, not
-    collision-checked. Certificate runs once, on fitted C2 curve, since that
-    curve executes.
+    Samples fix IK branch/interpolation bound, not executed or collision-checked -- the certificate
+    runs once, on the fitted C2 curve, since that curve executes.
     """
     positions = _without_repeated_positions(candidate.positions_m)
     if len(positions) < 2:
@@ -809,13 +748,11 @@ def lift_joint_line(
     goal_q_a: np.ndarray,
 ) -> np.ndarray:
     """
-    Waypoints on straight joint-space line, spaced inside step bound.
+    Waypoints on a straight joint-space line, spaced inside step bound.
 
-    Line reference iLQR planner effectively moves along. No IK: goal config is
-    cold solve's, straight line to it continuous by construction, so branch-jump
-    concern that discards that solve for Cartesian corridors does not apply.
-    Cheap, and only candidate that does not sweep tool through a chord arm must
-    fold in to follow.
+    No IK needed since the goal config is the cold solve's and the line to it is continuous by
+    construction, so the branch-jump concern for Cartesian corridors doesn't apply. Only candidate
+    that doesn't sweep the tool through a chord.
     """
     start = np.asarray(start_q_a, dtype=float)
     goal = np.asarray(goal_q_a, dtype=float)
@@ -832,9 +769,8 @@ class Path:
     """
     q_a(sigma) on [0, 1], twice differentiable everywhere.
 
-    Twice, because a kink is not followable: q_a'' unbounded there, so
-    certificate's step bound refuses it and any consumer differentiating path
-    reads a spike at the waypoint.
+    A kink makes q_a'' unbounded there, so the certificate's step bound refuses it and any
+    differentiating consumer sees a spike.
     """
 
     spline: BSpline
@@ -867,45 +803,34 @@ def fit(
     """
     Fit `q_a(sigma)` to the waypoints.
 
-    sigma distributed by how long each chord takes at its slowest axis's limit,
-    so a segment slow in one coordinate gets more parameter. OCP moves along this
-    curve, not beside it, so its input sees that too: on shipped defaults `|q_a'|`
-    in `dq_max` metric varies by 1.05 over path -- arclength in that metric, no
-    reparametrisation.
-
-    Approximates, does not interpolate: interpolation ties segment count to
-    sample count, but certificate wants dense samples and curve wants long end
-    intervals for clamp. Interpolating dense path spikes `q_a''` at endpoint --
-    361 against 0.4 in interior. Least-squares B-spline of `path_segments` pieces
-    breaks tie, stops fit chasing IK noise. Curve then misses checked configs --
-    fine: polyline is not what is certified.
+    Sigma is distributed by how long each chord takes at its slowest axis's limit,
+    so a segment slow in one coordinate gets more parameter -- arclength in
+    `dq_max` metric (varies 1.05 over path on shipped defaults, not
+    reparametrised). Approximates, not interpolates: interpolation ties segment
+    count to sample count, but the certificate wants dense samples and the curve
+    wants long end intervals for clamp; interpolating a dense path spikes `q_a''`
+    at the endpoint (361 vs 0.4 interior). Least-squares B-spline of
+    `path_segments` pieces breaks that tie -- curve then misses checked configs,
+    fine since the polyline isn't what's certified.
     """
     if len(waypoints) < 2:
         raise PlanningError("the lifted path carries fewer than two configurations")
 
-    # Degree 5, not 3. Simple interior knots make degree-`d` B-spline `C(d-1)`,
-    # so quintic is `C4` in sigma -- derivative count C3's flat inversion needs,
-    # from parameterization rather than enforced. Must match `ocp.ORDER` =
-    # `degree + 1`.
+    # degree 5: simple interior knots make degree-d B-spline C(d-1), quintic is C4 in
+    # sigma -- must match ocp.ORDER = degree + 1
     degree = 5
-    # Exactly `path_segments`, never fewer: OCP is code-generated against a
-    # parameter vector that many polynomials wide, so a short lift answered with
-    # fewer pieces is a different problem, not a smaller one. Resampling polyline
-    # along its own chords is free -- not certified, only what fit is pulled
-    # towards.
+    # exactly path_segments, never fewer: OCP is code-generated for that many
+    # polynomials, so fewer pieces is a different problem. Resampling along own
+    # chords is free -- not certified, only what fit targets
     segments = int(config.path_segments)
-    # `segments + degree` coefficients, and least-squares needs data in every
-    # knot interval (Schoenberg-Whitney), not just as many points as
-    # coefficients: at degree 5 that count is exactly determined and
-    # `make_lsq_spline` refuses with "Need more x points". Four per segment is
-    # spacing degree 5 asks for, costs nothing -- added points lie on polyline
-    # already: same shape, sampled better.
+    # Schoenberg-Whitney: least-squares needs data in every knot interval, not just
+    # enough points for the segments+degree coefficients, or make_lsq_spline refuses.
+    # 4/segment is what degree 5 needs, free -- points already lie on the polyline
     minimum = 4 * segments + degree
     if len(waypoints) < minimum:
         waypoints = _densify(waypoints, minimum)
 
-    # After densifying, never before: `nodes` indexes the waypoints, both must
-    # be the same length.
+    # after densifying, never before: nodes indexes waypoints, lengths must match
     spans = np.max(np.abs(np.diff(waypoints, axis=0)) / limits.dq_max, axis=1)
     spans = np.maximum(spans, 1.0e-9)
     total = float(np.sum(spans))
@@ -921,19 +846,15 @@ def fit(
             f"the lifted path cannot be fitted with {segments} segments: {failure}"
         ) from None
 
-    # Endpoints are boundary conditions, not things to fit: on a clamped
-    # B-spline outer coefficients *are* endpoint values -- two writes impose them
-    # exactly.
+    # endpoints are boundary conditions not fit targets: on a clamped B-spline the
+    # outer coefficients *are* endpoint values
     coefficients = np.array(spline.c, dtype=float)
     coefficients[0] = waypoints[0]
     coefficients[-1] = waypoints[-1]
-    # Start slope is a boundary condition only while machine moves. OCP follows
-    # this curve, so `dq_a = q_a'(sigma) * v` leaves along tangent, which must be
-    # measured direction; `q_a'(0) = dq_a * L` is that motion in sigma. From rest
-    # no direction to honour: writing one sets `q_a'(0) = 0`, and
-    # `ddq_a = q_a'' v^2 + q_a' a` then has no `a` -- singular input, not slow.
-    # Goal end never clamped, same reason: arriving stopped is `v = 0`, a timing
-    # condition, paid twice if geometry asks too.
+    # start slope is a boundary condition only while moving (dq_a = q_a'(sigma)*v,
+    # q_a'(0) = dq_a*L); from rest no direction to honour, writing one would make
+    # ddq_a singular. Goal end never clamped: arriving stopped is v=0, a timing
+    # condition, not geometry's
     if np.any(np.asarray(dq_start, dtype=float) != 0.0):
         start_rate = np.asarray(dq_start, dtype=float) * total
         coefficients[1] = (
@@ -941,10 +862,8 @@ def fit(
         )
     spline = BSpline(knots, coefficients, degree)
 
-    # Load-bearing, and a scan not a certificate: OCP has no `q_a` to box, so
-    # nothing downstream would see an overshoot between two samples.
-    # `check_path` carries the Lipschitz bound that would close that; range has
-    # none.
+    # load-bearing scan not a certificate: OCP has no q_a to box, so nothing else
+    # catches an overshoot between samples; check_path's Lipschitz bound would
     dense = np.linspace(0.0, 1.0, max(129, len(waypoints)))
     sampled = spline(dense)
     slack = 1.0e-6
@@ -974,13 +893,11 @@ def plan_fitted_path(
     goal_q_a: np.ndarray | None = None,
 ) -> tuple[Path, int, str]:
     """
-    Lift, fit and certify candidates until executable curve is clear.
+    Lift, fit and certify candidates until one executable curve is found.
 
-    Direct tool line, then joint-space line when a goal config is given, then
-    transfer corridors. A corner tool cannot be placed at refuses every corridor
-    through it before any is lifted: transfer height comes from tallest scene
-    body, which need not be near the move, and lifting towards an unreachable
-    corner costs hundreds of IK solves per corridor before failing.
+    Direct tool line, then joint-space line (if goal config given), then transfer corridors. An
+    unreachable corner refuses every corridor through it before any is lifted -- lifting towards one
+    otherwise costs hundreds of IK solves per corridor first.
     """
     start_position, start_yaw = geometry.tcp_pose(start_q_a)
     candidates = cartesian_candidates(
@@ -1022,8 +939,8 @@ def plan_fitted_path(
                     geometry, limits, config, start_q_a, goal_yaw, candidate
                 )
             path = fit(limits, config, waypoints, dq_start)
-            # Spline is a different curve from its lifted polyline. Only a
-            # passing certificate makes it executable.
+            # spline differs from its lifted polyline; only a passing certificate makes it
+            # executable
             geometry.check_path(path)
             return path, len(waypoints), candidate.name
         except PlanningError as failure:

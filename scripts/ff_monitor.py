@@ -2,35 +2,25 @@
 """
 Republish the feedforward as a live time series, beside what the crane did.
 
-C3 feedforward is not observable from `/trajectory_controllers/
-controller_state`: `publish_state` fills `reference.positions`, `velocities` and
-`accelerations`, never `reference.effort`. So the one signal the ablation is
-about is the one PlotJuggler cannot see.
+C3 feedforward isn't observable from /trajectory_controllers/controller_state
+(publish_state never fills reference.effort). Reconstructed by interpolating
+JTC's reference.time_from_start against /crane/reference, which is latched
+and carries effort.
 
-Reconstructable exactly, no clock guessed: JTC publishes
-`reference.time_from_start` -- sample time *inside the running trajectory* -- and
-`/crane/reference` is latched and carries effort. Interpolating one at the other
-is the whole node.
-
-Two `JointState` topics, because PlotJuggler expands `JointState` **by joint
-name**, not by array index, and index orders of `/joint_states` and
-`controller_state` disagree:
+Two JointState topics (PlotJuggler expands by joint name, and index orders of
+/joint_states and controller_state disagree):
 
 | topic | position | velocity | effort |
 |---|---|---|---|
-| `/crane/debug/feedforward` | reference | `qdot_d + effort`, whole ff branch | `effort` alone, the C3 correction |
-| `/crane/debug/achieved` | feedback | feedback | the command actually written |
+| /crane/debug/feedforward | reference | qdot_d + effort, whole ff branch | effort alone, the C3 correction |
+| /crane/debug/achieved | feedback | feedback | the command actually written |
 
-So `.../feedforward/<joint>/velocity` vs `.../achieved/<joint>/velocity` is
-feedforward vs what the machine did, by name, one plot. Should differ by the
-plant's answer: ff branch is previewed by the dead time, so achieved rate lags
-commanded by `n_d` on an axis the inversion is right about.
+.../feedforward/<joint>/velocity vs .../achieved/<joint>/velocity is
+feedforward vs what the machine did. Should differ by n_d: ff branch is
+previewed by dead time, so achieved rate lags commanded on an axis the
+inversion is right about.
 
-`effort` on the first topic vs the difference of the two velocities is the other
-useful pair: how much command the C3 correction carries vs how much the loop had
-to make up.
-
-Read-only. Subscribes, publishes, commands nothing.
+Read-only: subscribes, publishes, commands nothing.
 
     ./scripts/ff_monitor.py
     plotjuggler   # Start -> ROS2 Topic Subscriber -> both /crane/debug topics
@@ -110,8 +100,7 @@ class Monitor(Node):
         names = list(message.joint_names)
 
         def ff(name: str) -> float:
-            # Zero past end of plan, where the reference holds it too; zero for
-            # a joint the plan does not command.
+            # Zero past end of plan, or for a joint the plan doesn't command.
             if self.stamps.size == 0 or name not in self.effort:
                 return 0.0
             return float(np.interp(when, self.stamps, self.effort[name], right=0.0))
@@ -130,8 +119,7 @@ class Monitor(Node):
         emit(
             self.feedforward,
             message.reference.positions,
-            # Whole feedforward branch, what the plugin adds up:
-            # `ff_velocity_scale * qdot_d + effort`, scale 1.0.
+            # Whole ff branch: ff_velocity_scale * qdot_d + effort, scale 1.0.
             [r + c for r, c in zip(reference, correction)],
             correction,
         )

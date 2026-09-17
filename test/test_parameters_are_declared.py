@@ -1,11 +1,5 @@
-"""
-An override for a name nobody declared is dropped in silence.
-
-`rclpy` does not warn, raise or log: yaml key read, matched against nothing,
-discarded; dataclass default runs. `command_k`, `command_u_min`, `command_u_max`
-sat in `crane_planner.yaml` that way while the node read `PlannerConfig`'s copy.
-They matched, so nothing moved and nothing said so.
-"""
+"""An override for an undeclared name is dropped by rclpy in silence: happened to
+`command_k`/`command_u_min`/`command_u_max` in crane_planner.yaml, unnoticed."""
 
 from dataclasses import fields
 from pathlib import Path
@@ -55,12 +49,8 @@ def test_every_typed_parameter_is_a_config_field():
     assert set(TYPED) - {field.name for field in fields(PlannerConfig)} == set()
 
 
-# --- the pump is one number ---------------------------------------------------
-#
-# `pump_flow_max` and `pump_flow_planning_factor` are also `crane_mpc`'s, and
-# both packages turn them into an actuator limit. They had been typed into each
-# separately -- 1.4e-3 here, 0.0014 there -- with nothing comparing them.
-# `crane_model/config/hydraulics.yaml` is the source; this pins the copy.
+# pump_flow_max/pump_flow_planning_factor are also crane_mpc's; had been typed
+# separately (1.4e-3 here, 0.0014 there). crane_model/config/hydraulics.yaml is source.
 def test_the_pump_is_the_one_in_crane_model():
     from crane_model.conventions import default_hydraulics_path
 
