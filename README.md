@@ -210,8 +210,8 @@ development image, one run:
 | | |
 |---|---|
 | lifted configurations | 177 |
-| OCP solve | 75 SQP iterations, 0.64 s |
-| planner call | 0.86 s |
+| OCP solve | 75 SQP iterations, 0.60 s |
+| planner call | 0.72 s, so 0.12 s of geometry |
 | trajectory duration | 6.46 s |
 | terminal sway | 0.40 deg, 0.000 rad/s |
 | peak pump draw | 0.75 of the limit at kappa = 0.8 |
@@ -220,11 +220,17 @@ Near-worst case for the shipped settings: 75 iterations against 26 under the one
 they replaced, on an answer 0.01 s longer. Kept anyway -- the corpus says the trade
 is worth it, and quoting only a best case is not worth reading.
 
-The solve is now most of it. Two more integrator states and the C3 command row
-cost roughly an order of magnitude over the acceleration-input stage these
-numbers replaced. `margin_interp` is the knob on the geometric half -- one IK
-solve plus one collision query per lifted configuration, and halving it roughly
-doubles the configurations.
+The solve is most of it, and more so since `crane_model` began bounding its self
+pairs before asking Coal for them -- that halved the geometric half (0.23 to 0.12 s
+here, 1.45x on a whole call over the bench corpus) and left the OCP the thing to
+beat. Two more integrator states and the C3 command row cost roughly an order of
+magnitude over the acceleration-input stage these numbers replaced. `margin_interp`
+is the knob still on the geometry -- one IK solve plus one collision query per
+lifted configuration, and halving it roughly doubles the configurations.
+
+Read wall clock here as an upper bound and nothing finer: the same solve measured
+0.60 and 2.65 s in three consecutive runs on a loaded box. Iteration counts are the
+comparable numbers; these are best of three.
 
 ## Tuning
 
