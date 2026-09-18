@@ -210,11 +210,17 @@ development image, one run:
 | | |
 |---|---|
 | lifted configurations | 177 |
-| OCP solve | 1.95 s, 20 SQP iterations |
-| planner call | 2.32 s |
-| trajectory duration | 6.43 s |
-| terminal sway | 0.39 deg, 0.000 rad/s |
-| peak pump draw | 0.76 of the limit at kappa = 0.8 |
+| OCP solve | 75 SQP iterations, 0.64 s |
+| planner call | 0.86 s |
+| trajectory duration | 6.46 s |
+| terminal sway | 0.40 deg, 0.000 rad/s |
+| peak pump draw | 0.75 of the limit at kappa = 0.8 |
+
+This move is a **near-worst case for the shipped settings**: 75 iterations against
+26 under the settings they replaced, on an answer 0.01 s longer. It is kept as the
+example anyway, because the corpus says the trade is worth it and a page that
+quotes only its best case is not worth reading. See "What chose the solver
+settings".
 
 The solve is now most of it. Two more integrator states and the C3 command row
 cost roughly an order of magnitude over the acceleration-input stage these
@@ -260,13 +266,141 @@ every knob that matters (`ocp_intervals`, `ocp_horizon`, `ocp_integrator`,
 it moves the solver tree. The log records those, so a run cannot be attributed
 to the wrong solver. Read the cost block (SQP and QP iterations) against the
 quality block below it: iterations fall for free if the answers may get worse.
-On the shipped OCP, 63 of 100 paths solve at 28 SQP iterations median, 97 worst
-against a cap of 100; 11 are refused by the solver and 26 by geometry before it.
+On the shipped OCP, 71 of 100 paths solve at 19 SQP iterations median, 76 worst
+against a cap of 100; 3 are refused by the solver and 26 by geometry before it.
+Those 26 are the corpus artefact and are the same every run -- a refusal carrying
+solver stats is counted against the solver, including one that converged onto an
+inadmissible answer rather than failing to converge.
+
+`sweep_ocp.py` runs `bench_ocp.py` once per acados setting variant and tables the
+results, baseline first, one subprocess per variant because the setting is
+compiled into the `.so`:
+
+```bash
+./scripts/sweep_ocp.py --variants variants.json --paths 100
+```
 
 Its summary puts the OCP's own peak sway beside MuJoCo's for the same motion:
 an independent integrator on the same URDF, so a shaping change that only the
 OCP believes shows up as the two columns parting. `tune_planner.py` is one goal
 of this in detail, with the sway traces plotted; both share the rollout.
+
+## What chose the solver settings
+
+`SOLVER_TUNING` in `ocp.py` is not acados' defaults and not taste. Every entry was
+measured on `bench_ocp.py`, 100 paths, seed 0, three rounds and 33 variants --
+15 single knobs, then combinations of whatever the single knobs rewarded.
+
+**Read this before adding a knob**: the settings are generated into the C and
+compiled into the `.so`, so they go through `cache_key`. Without that a variant
+loads its predecessor's solver and reads as a null result -- the same failure the
+file warns about for `weights` and `SIGMA_INPUT_MAX`. Sweep with
+`CRANE_PLANNING_OCP_OPTIONS`, which moves the tree; an unknown key is an error,
+because a misspelled knob would otherwise quietly re-measure the baseline.
+
+| | shipped before | now |
+|---|---|---|
+| paths solved | 63 | 71 |
+| refused by the solver | 11 | 3 |
+| SQP iterations, median | 26 | 19 |
+| SQP iterations, p90 / max | 52 / 97 | 37 / 76 |
+| QP iterations, median | 466 | 390 |
+| acados `time_tot`, median | 0.30 s | 0.15 s |
+| planner call, median | 0.99 s | 0.64 s |
+| worst slack spent | 1.1e-07 | 0 |
+
+### The refusals were two problems, not one
+
+Splitting the 11 is what made the rest of it tractable:
+
+| | n | signature |
+|---|---|---|
+| the first QP dies | 8 | status 4 at **SQP iteration 1**, 10-30 ms, stationarity still at its initial 1e3 |
+| stall next to the answer | 3 | status 2 at the 100 cap, ~1.1 s, stat 2e-4..3e-2 with eq/ineq/comp already met |
+
+The first is conditioning -- the solver never started, and `ACADOS_MINSTEP` is what
+HPIPM says about it. The second is a line search taking vanishing steps beside a
+solution it has found. Nothing fixes both, and a knob that helps one usually costs
+the other.
+
+### What worked, and what it was worth
+
+`SQP_WITH_FEASIBLE_QP` with `BYRD_OMOJOKUN` answers the first mode directly: where
+the QP handed to it is infeasible it solves a relaxed feasibility QP instead of
+giving up. 11 refusals to 3 on its own, and faster than the solver it replaced.
+
+`with_adaptive_levenberg_marquardt` answers the conditioning underneath it. Plain
+`levenberg_marquardt` is 1e-6, which is none; this starts at 1e-3 and relaxes, so
+the first QP is regularised where it needs to be and later ones do not pay. A third
+off the iterations by itself. Together with the feasibility QP: **3 refusals, 19
+iterations median**.
+
+Two more that work but were not taken. `qpscaling_scale_constraints=INF_NORM` with
+`OBJECTIVE_GERSHGORIN` is worth a third of the iterations and costs one refusal;
+`FULL_CONDENSING_HPIPM` gives the lowest SQP count of anything measured (15) but
+pays for it in the QP -- 743 QP iterations against 466, and more wall time than it
+saves. Both are left off because refusals are the scarcer currency.
+
+### What did not work, including what should have
+
+Worth recording, because three of these are what a textbook recommends for the
+symptom and the bench says no:
+
+| variant | solved | why it was tried |
+|---|---|---|
+| `globalization_use_SOC` | 44 | second-order correction is *the* answer to a Maratos stall |
+| `regularize_method=PROJECT` | 56 | mode A looks like an indefinite Hessian |
+| `hpipm_mode=ROBUST` | 63 | its name |
+| `nlp_qp_tol_strategy=ADAPTIVE_CURRENT_RES_JOINT` | 63 | 17 QP iterations per SQP step looked like over-solving early QPs |
+| `hpipm_mode=SPEED_ABS` | **0** | speed |
+| `qp_solver_warm_start=2` | **0** | speed |
+
+The last two solve **nothing at all**, and both are instructive. `SPEED_ABS` drops
+the relative termination test, and these residuals span decades. Warm starting the
+first QP assumes the previous solve is about the same problem; consecutive requests
+are different moves, so the factorisation it inherits is noise. Neither is safe to
+turn on generically, and a future slice that wants warm starts across a *replan of
+the same move* has to say which state carries over.
+
+`FUNNEL_L1PEN_LINESEARCH` is its own case: 10 iterations median, 0.089 s, and 19
+refusals. It converges hard when it converges. That is a first attempt in a
+two-stage scheme, not a default.
+
+### It is not free
+
+Across the 63 paths both settings solve, 41 take fewer iterations, 18 take more and
+4 are unchanged. The median moves by -4 and the tail is where the win is (p90 52 to
+37), but about a quarter of moves cost more than they did, and `plan_example`'s own
+move is near the bad end of that -- 26 iterations to 75. The trade taken here is
+**tail and refusal rate over median**, on the argument that a planner that refuses
+8% of reachable goals is a worse planner than a slow one. If the real workload is
+mostly short direct moves rather than the long random ones the corpus samples, that
+argument is worth re-running before it is believed.
+
+### The initial guess
+
+`path_profile` is TOPP's forward-backward pass in `s = v^2` over the fitted curve:
+the fastest profile the rate and acceleration rows alone allow, sway and pump and
+the command row not in it, so its duration is a floor and its shape is somewhere to
+start. It exists because the shipped guess is `ocp_horizon / speed_scale` -- the
+same 7 s whatever was asked, while answers land between 5.8 and 15.6 s -- and is
+uniform in `sigma` where the solver's grid is uniform in time.
+
+It is worth 11 refusals to 5 on its own and 3 with adaptive LM, which is real. It
+is **off** (`CRANE_PLANNING_OCP_INIT=PATH_PROFILE`) because it does not stack with
+the feasibility QP: 68 solved together against 72 for the feasibility QP and
+adaptive LM without it. Both fix the same first-QP failure, and the cheaper fix is
+the one that is only solver settings.
+
+### One thing the sweep found that was not about tuning
+
+Making the solver converge on paths it used to refuse surfaced a converged answer
+drawing **1.18 of the physical pump** on 0.419 of slack. The flow row is soft, and
+`plan` refused a *sway* box bought with slack while letting a *pump* limit bought
+with slack through. It is refused now, by the same argument and next to the same
+test. It is not a tuning artefact -- the shipped solver would have produced it too
+on any path where it converged, and it only stayed hidden because it refused those
+paths for a different reason.
 
 ## The node
 
