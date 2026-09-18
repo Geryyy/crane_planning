@@ -83,9 +83,11 @@ def solve(planner: Planner, pair) -> dict:
     try:
         plan = planner.plan(start, position, yaw, scene=[], avoid_collisions=True)
     except PlanningError as refusal:
-        # `TrajectoryOcp.solve` is the only stage that reports non-convergence;
-        # everything else refused on geometry before the solver was reached.
-        kind = "ocp" if "converge" in str(refusal) else "geometry"
+        # A refusal carrying solver stats is one the solve reached -- it did not
+        # converge, or it converged onto something inadmissible. Everything else
+        # was refused on geometry before the solver was reached, and only those
+        # are the same every run.
+        kind = "ocp" if refusal.stats else "geometry"
         return {"refused": kind, "why": str(refusal)}
     # `report()`'s own keys are left as the node publishes them; the one added
     # here is the whole `plan` call, solver and geometry together.
