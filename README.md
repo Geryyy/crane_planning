@@ -12,8 +12,8 @@ plan(goal position + yaw in K0_mounting_base)
 No stochastic sampler. Everything the machine can do -- reach, hang, collide --
 is asked of `crane_model`; nothing about the machine is written down here. The
 EOM comes from `crane_model.symbolic`, and the pump limit the description lacks
-is `crane_model`'s too, with `config/crane_planner.yaml` carrying an overridable
-copy.
+is `crane_model`'s too, read off `crane_model/config/hydraulics.yaml` and
+overridable -- not copied -- in `config/crane_planner.yaml`.
 
 Joint ranges and velocity limits come from the `robot_description` the profile
 remaps this node onto, **intersected with
@@ -236,6 +236,20 @@ duration is one glance. Read a regression off iterations and residuals, **never 
 same problem measures 0.27 s idle and 4.97 s inside a running Gazebo.
 
 It exercises every stage, so its refusal is the node's refusal.
+
+`plan_goals.py` is the same planner against a set of goals, all from
+`crane_model.presets.OUTSIDE`, each rolled on the MuJoCo plant
+(`crane_model.mujoco_plant`) with its TCP path drawn into the scene.
+
+```bash
+./scripts/plan_goals.py                    # every goal, viewer on
+./scripts/plan_goals.py --goals out across --headless
+```
+
+Its summary puts the OCP's own peak sway beside MuJoCo's for the same motion:
+an independent integrator on the same URDF, so a shaping change that only the
+OCP believes shows up as the two columns parting. `tune_planner.py` is one goal
+of this in detail, with the sway traces plotted; both share the rollout.
 
 ## The node
 

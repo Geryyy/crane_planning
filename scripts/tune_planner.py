@@ -36,6 +36,10 @@ from crane_model.mujoco_plant import MujocoPlant, leave  # noqa: E402
 from crane_planning import Planner, PlanningError, Start  # noqa: E402
 from crane_planning.planner import PLANNED_INDICES, TOOL_INDEX, yaw_of  # noqa: E402
 
+#: rad/s of the drive. The arrival sway moves with it until it converges, so a
+#: number worth quoting survives doubling this. plan_goals.py takes it as given.
+BANDWIDTH = 100.0
+
 
 def plan_arguments(parser: argparse.ArgumentParser) -> None:
     """
@@ -88,9 +92,8 @@ def arguments() -> argparse.Namespace:
     plant.add_argument(
         "--bandwidth",
         type=float,
-        default=100.0,
-        help="rad/s of the drive. The arrival sway moves with it until it "
-        "converges, so a number worth quoting survives doubling this",
+        default=BANDWIDTH,
+        help="rad/s of the drive; a sway worth quoting survives doubling it",
     )
     plant.add_argument("--viewer", action="store_true")
     plant.add_argument(
@@ -107,26 +110,31 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def start_of(planner: Planner, options) -> Start:
+def start_of(planner: Planner, resettle: bool = False) -> Start:
     """Take the preset, its passive pair either as written or re-settled."""
     q = presets.OUTSIDE.copy()
-    if options.resettle_start:
+    if resettle:
         q[list(PASSIVE_INDICES)] = planner.model.passive_equilibrium(
             q[list(ACTUATED_INDICES)]
         )
     return Start(q=q, dq_a=np.zeros(len(PLANNED_INDICES)))
 
 
-def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]:
-    """Where the tool goes and the yaw it keeps, in K0_mounting_base."""
+def start_yaw(planner: Planner, start: Start) -> float:
+    """Give the tool yaw at `start`, which every preset goal keeps."""
     import pinocchio as pin
 
     pose = planner.model.forward_kinematics(start.q, Frame.MOUNTING_BASE, Frame.TCP)
-    yaw = yaw_of(
+    return yaw_of(
         pin.XYZQUATToSE3(
             np.concatenate([pose.position_m, pose.orientation_xyzw])
         ).rotation
     )
+
+
+def goal_of(planner: Planner, start: Start, options) -> tuple[np.ndarray, float]:
+    """Where the tool goes and the yaw it keeps, in K0_mounting_base."""
+    yaw = start_yaw(planner, start)
     if options.goal_pose is not None:
         return np.array(options.goal_pose[:3]), options.goal_pose[3]
     if options.goal == "out":
@@ -143,7 +151,7 @@ def plan_for(options) -> tuple[str, Planner, Start, object]:
     """
     description = plan_example.description()
     planner = Planner(description, plan_example.configure(options))
-    start = start_of(planner, options)
+    start = start_of(planner, options.resettle_start)
     offset = start.q[list(PASSIVE_INDICES)] - planner.model.passive_equilibrium(
         start.q[list(ACTUATED_INDICES)]
     )
@@ -168,9 +176,21 @@ def plan_for(options) -> tuple[str, Planner, Start, object]:
     return description, planner, start, plan
 
 
-def roll(planner: Planner, description: str, plan, start: Start, options):
-    """Drive the plan on MuJoCo, record what the load did, return both."""
-    plant = MujocoPlant(description, timestep=options.timestep)
+def roll(
+    planner: Planner,
+    plant: MujocoPlant,
+    plan,
+    start: Start,
+    settle: float,
+    bandwidth: float = BANDWIDTH,
+) -> dict:
+    """
+    Drive the plan on MuJoCo from `start`, record what the load did.
+
+    The plant is the caller's -- plan_goals.py rolls several plans on one, and
+    a viewer already open keeps rendering through this. Opening it here would
+    give each plan its own window.
+    """
     plant.set_state(start.q)
     q_tool = float(start.q[TOOL_INDEX])
     sample = float(plan.time[1] - plan.time[0])
@@ -180,13 +200,11 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
     times, states, tracking = [0.0], [plant.state], [still]
 
     def advance(q_ref, dq_ref, ddq_ref, duration, stamp) -> None:
-        plant.follow(q_ref, dq_ref, ddq_ref, duration, options.bandwidth)
+        plant.follow(q_ref, dq_ref, ddq_ref, duration, bandwidth)
         times.append(stamp)
         states.append(plant.state)
         tracking.append(plant.q[rows] - q_ref)
 
-    if options.viewer:
-        plant.open_viewer(options.realtime)
     for index in range(1, plan.time.size):
         advance(
             plan.q[index, rows],
@@ -196,7 +214,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
             float(plan.time[index]),
         )
     # A plan that merely arrives quiet separates here from one that leaves the load quiet.
-    for step in range(int(round(options.settle / sample))):
+    for step in range(int(round(settle / sample))):
         advance(
             plan.q[-1, rows],
             still,
@@ -218,7 +236,7 @@ def roll(planner: Planner, description: str, plan, start: Start, options):
         "dq_u": state[:, 12:14],
         "q_u_eq": np.array(equilibrium),
         "tracking": np.array(tracking),
-    }, plant
+    }
 
 
 def report(plan, rolled: dict) -> list[str]:
@@ -298,7 +316,10 @@ def figure(plan, rolled: dict):
 def main() -> int:
     options = arguments()
     description, planner, start, plan = plan_for(options)
-    rolled, plant = roll(planner, description, plan, start, options)
+    plant = MujocoPlant(description, timestep=options.timestep)
+    if options.viewer:
+        plant.open_viewer(options.realtime)
+    rolled = roll(planner, plant, plan, start, options.settle, options.bandwidth)
     for line in report(plan, rolled):
         print(line)
 
