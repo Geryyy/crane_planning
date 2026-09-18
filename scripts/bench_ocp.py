@@ -121,7 +121,14 @@ def summary(records: list) -> dict:
         return out
     # A solve acados calls successful can still carry a QP that merely ran out of
     # iterations, so the status is counted apart from the iteration spread.
-    out["qp_status_nonzero"] = sum(row["qp_status_worst"] != 0 for row in solved)
+    # `nan` is "this solver does not report it"; counting it as nonzero would read as a fault.
+    out["qp_status_nonzero"] = sum(
+        np.isfinite(row["qp_status_worst"]) and row["qp_status_worst"] != 0
+        for row in solved
+    )
+    out["qp_status_unreported"] = sum(
+        not np.isfinite(row["qp_status_worst"]) for row in solved
+    )
     out["acados_status_nonzero"] = sum(row["acados_status"] != 0 for row in solved)
     for name, key in {**COST, **QUALITY}.items():
         values = np.array([row[key] for row in solved], dtype=float)
@@ -149,9 +156,15 @@ def main() -> int:
         if "refused" in row:
             print(f"{index:4d}  refused ({row['refused']})  {row['why'][:70]}")
         else:
+            # A solver that does not report one of these leaves `nan`; that is a missing
+            # measurement, not a zero, and it must not end the run.
+            def count(key: str) -> str:
+                value = row[key]
+                return "  -" if not np.isfinite(value) else f"{int(value):3d}"
+
             print(
                 f"{index:4d}  {int(row['sqp_iterations']):5d} {int(row['qp_iterations']):8d}"
-                f" {int(row['qp_status_worst']):3d}"
+                f" {count('qp_status_worst')}"
                 f"  {row['planning_time_s']:7.2f} s  {row['duration_s']:9.2f} s"
             )
 
