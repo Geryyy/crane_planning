@@ -100,6 +100,44 @@ BAKED = (
     "path_segments",
 )
 
+#: acados settings being tuned. Every one is compiled into the `.so`, so they go through
+#: `cache_key` -- without that a variant loads its predecessor's solver and reads as a null result.
+#: Separate from `BAKED` (config keys, the problem) because these are the solver, not the problem:
+#: none of them changes what an answer means, only whether it is found and how fast.
+#: Sweep without editing this file:
+#:     CRANE_PLANNING_OCP_OPTIONS='{"hpipm_mode": "SPEED"}' ./scripts/bench_ocp.py
+SOLVER_TUNING = {
+    "nlp_solver_type": "SQP",
+    "qp_solver": "PARTIAL_CONDENSING_HPIPM",
+    "hpipm_mode": "BALANCE",
+    "qp_solver_cond_N": None,  # acados' own default is `N_horizon`, i.e. no partial condensing
+    "qp_solver_iter_max": 50,
+    "qp_solver_warm_start": 0,
+    "qp_solver_ric_alg": 1,
+    "globalization": "MERIT_BACKTRACKING",
+    "globalization_use_SOC": 0,
+    "regularize_method": "NO_REGULARIZE",
+    "with_adaptive_levenberg_marquardt": False,
+    "nlp_solver_warm_start_first_qp": False,
+    "search_direction_mode": "NOMINAL_QP",
+    "qpscaling_scale_constraints": "NO_CONSTRAINT_SCALING",
+    "qpscaling_scale_objective": "NO_OBJECTIVE_SCALING",
+    "nlp_qp_tol_strategy": "FIXED_QP_TOL",
+}
+
+
+def solver_tuning() -> dict:
+    """`SOLVER_TUNING` with `CRANE_PLANNING_OCP_OPTIONS` applied. Unknown key is an error, not a typo silently ignored -- a sweep that misspells a knob would otherwise re-measure the baseline."""
+    override = json.loads(os.environ.get("CRANE_PLANNING_OCP_OPTIONS") or "{}")
+    unknown = set(override) - set(SOLVER_TUNING)
+    if unknown:
+        raise ValueError(
+            f"CRANE_PLANNING_OCP_OPTIONS names {sorted(unknown)}, which "
+            f"`SOLVER_TUNING` does not carry; known keys are {sorted(SOLVER_TUNING)}"
+        )
+    return {**SOLVER_TUNING, **override}
+
+
 #: ERK order 4, Gauss-Legendre IRK order 2. ERK4 cheaper but finite stability region, and `theta`
 # scales the step: at `ocp_duration_max` pendulum (w=3.6 rad/s) sits at w*dt=1.8, RK4 amplifies
 # 0.854/step -- 500x fabricated damping over 40 intervals. Gauss-Legendre symplectic, cannot invent
@@ -149,6 +187,8 @@ def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     # `INTEGRATORS` decides the order; editing the map alone would load the old one.
     baked["sim_stages"] = INTEGRATORS[parameters["ocp_integrator"]]
     baked["path_derivatives"] = PATH_DERIVATIVES
+    # Solver settings are generated into the C, so a tuning change must move the tree too.
+    baked["tuning"] = solver_tuning()
     baked["description"] = hashlib.sha1(description.encode()).hexdigest()
     return baked
 
@@ -279,6 +319,102 @@ def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
         scale = float(np.prod([m - k for k in range(order)])) if order else 1.0
         out += scale * (local[:, None] ** (m - order)) * coefficients[index, m, :]
     return out
+
+
+#: Initial guess for the `sigma` chain. "CONSTANT" is the shipped one: uniform progress at
+#: `ocp_horizon / speed_scale`, i.e. the same 7 s whatever was asked. "PATH_PROFILE" guesses the
+#: fastest profile the rate and acceleration rows alone allow. Read here, not compiled in, so it
+#: stays out of `cache_key` -- a variant of it reuses the solver.
+INITIAL_GUESS = os.environ.get("CRANE_PLANNING_OCP_INIT", "CONSTANT")
+
+#: Tangent below which a row constrains `s = v^2` directly instead of its slope (units of the
+#: normalised curve, so this is "that joint does not move here").
+TANGENT_EPS = 1.0e-9
+
+
+def path_profile(coefficients, dq_max, ddq_a_max, speed_start, samples: int):
+    """Fastest `(sigma, v)` the rate and acceleration rows alone allow on this curve: TOPP's velocity limit curve, then a forward and a backward pass in `s = v^2`. Sway, pump and the command row are not in it, so the duration this implies is a floor and the profile is a shape to start from -- never an answer."""
+    sigma = np.linspace(0.0, 1.0, samples)
+    step = 1.0 / (samples - 1)
+    tangent = evaluate(coefficients, sigma, order=1)
+    curvature = evaluate(coefficients, sigma, order=2)
+    moving = np.abs(tangent) > TANGENT_EPS
+
+    # Rate rows cap `v` outright. Where a joint is still, its acceleration row caps `s` instead --
+    # `ddq_a = c'' v^2 + c' a` has no `a` in it there.
+    ceiling = np.where(
+        moving, dq_max / np.maximum(np.abs(tangent), TANGENT_EPS), np.inf
+    )
+    still = ~moving & (np.abs(curvature) > TANGENT_EPS)
+    s_cap = np.where(
+        still, ddq_a_max / np.maximum(np.abs(curvature), TANGENT_EPS), np.inf
+    )
+    limit = np.minimum(np.min(ceiling, axis=1) ** 2, np.min(s_cap, axis=1))
+
+    def slopes(node: int, s: float) -> tuple:
+        """Admissible `ds/dsigma` at `node`, from the acceleration rows at speed `s`."""
+        rows = moving[node]
+        if not rows.any():
+            return -np.inf, np.inf
+        c1, c2 = tangent[node][rows], curvature[node][rows]
+        edge = 2.0 * (np.stack([-ddq_a_max[rows], ddq_a_max[rows]]) - c2 * s) / c1
+        return float(np.max(np.min(edge, axis=0))), float(np.min(np.max(edge, axis=0)))
+
+    s = np.minimum(limit, np.inf)
+    s[0] = min(limit[0], speed_start**2)
+    for node in range(samples - 1):  # forward: accelerate as hard as the rows allow
+        s[node + 1] = min(s[node + 1], s[node] + step * slopes(node, s[node])[1])
+    s[-1] = 0.0  # arrives stopped, which is what the terminal box asks for
+    for node in range(samples - 2, -1, -1):  # backward: and brake in time
+        s[node] = min(s[node], s[node + 1] - step * slopes(node + 1, s[node + 1])[0])
+    s = np.maximum(s, 0.0)
+
+    speed = np.sqrt(s)
+    pair = speed[:-1] + speed[1:]
+    duration = float(
+        np.sum(
+            np.where(
+                pair > TANGENT_EPS, 2.0 * step / np.maximum(pair, TANGENT_EPS), 0.0
+            )
+        )
+    )
+    return sigma, speed, duration
+
+
+#: What the profile's duration is multiplied by to guess the answer's. The profile prices rate and
+#: acceleration and nothing else, so the answer is always slower; set from the measured ratio.
+PROFILE_SLACK = float(os.environ.get("CRANE_PLANNING_OCP_INIT_SLACK", "1.0"))
+
+
+def profile_guess(
+    coefficients, dq_max, ddq_a_max, speed_start, nodes: int, samples: int = 201
+):
+    """`(sigma, v, a, duration)` on the solver's grid, which is uniform in *time*, not in `sigma`. The shipped guess is uniform in `sigma`, which on a curve that accelerates and brakes is wrong at both ends. `None` when the profile says the curve cannot be traversed at all."""
+    sigma_of, speed, duration = path_profile(
+        coefficients, dq_max, ddq_a_max, speed_start, samples
+    )
+    if not np.isfinite(duration) or duration <= 0.0:
+        return None
+    step = 1.0 / (samples - 1)
+    pair = speed[:-1] + speed[1:]
+    elapsed = np.concatenate(
+        [
+            [0.0],
+            np.cumsum(
+                np.where(
+                    pair > TANGENT_EPS, 2.0 * step / np.maximum(pair, TANGENT_EPS), 0.0
+                )
+            ),
+        ]
+    )
+    # Stretching time by `PROFILE_SLACK` leaves the shape alone: `v` scales by its inverse, `a` by
+    # its square, and the normalised grid does not move.
+    duration = duration * PROFILE_SLACK
+    times = np.linspace(0.0, elapsed[-1], nodes)
+    sigma = np.interp(times, elapsed, sigma_of)
+    v = np.interp(times, elapsed, speed) / PROFILE_SLACK
+    a = np.gradient(v, times / PROFILE_SLACK, edge_order=1)
+    return sigma, v, a, duration
 
 
 def path_expression(sigma, coefficients, segments: int) -> list:
@@ -479,9 +615,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # Normalised time: grid is [0, 1], horizon is `theta * T_nominal`.
     ocp.solver_options.N_horizon = int(parameters["ocp_intervals"])
     ocp.solver_options.tf = 1.0
-    ocp.solver_options.nlp_solver_type = "SQP"
     ocp.solver_options.nlp_solver_max_iter = int(parameters["ocp_max_iterations"])
-    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"
     ocp.solver_options.integrator_type = integrator
     # Radau IIA (IRK-only default) is L-stable, damps the swing harder than ERK4 -- wrong direction
@@ -489,9 +623,12 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp.solver_options.collocation_type = "GAUSS_LEGENDRE"
     ocp.solver_options.sim_method_num_stages = INTEGRATORS[integrator]
     ocp.solver_options.sim_method_num_steps = SIM_SUBSTEPS
-    ocp.solver_options.globalization = "MERIT_BACKTRACKING"
-    ocp.solver_options.regularize_method = "NO_REGULARIZE"
     ocp.solver_options.levenberg_marquardt = float(parameters["levenberg_marquardt"])
+    # Last, so a tuning key beats anything set above it and the tree hash tells the whole story.
+    # `None` is "leave acados' own default", which some keys (`qp_solver_cond_N`) refuse to be set to.
+    for name, value in solver_tuning().items():
+        if value is not None:
+            setattr(ocp.solver_options, name, value)
     # Not acados' 1e-6 default: plan is resampled onto a 25 Hz reference and tracked closed-loop, so
     # last two decades buy nothing -- a solve at 1.69e-6 spent 60 iter/11s failing to halve it, one
     # at 5.39e-7 finished in six.
@@ -770,9 +907,27 @@ class TrajectoryOcp:
                 self.nominal / speed_scale, cfg.ocp_duration_min, cfg.ocp_duration_max
             )
         )
+        chain = None
+        if INITIAL_GUESS == "PATH_PROFILE":
+            chain = profile_guess(
+                coefficients,
+                rate_hi * lim.dq_max,
+                accel_hi * np.asarray(cfg.ddq_a_max, dtype=float),
+                speed_start,
+                N + 1,
+            )
+        if chain is not None:
+            sigma_guess, speed_guess, accel_guess, duration_guess = chain
+            duration_guess = float(
+                np.clip(duration_guess, cfg.ocp_duration_min, cfg.ocp_duration_max)
+            )
+        else:
+            sigma_guess = np.linspace(0.0, 1.0, N + 1)
+            speed_guess = np.full(N + 1, 1.0 / duration_guess)
+            accel_guess = np.zeros(N + 1)
         solver.reset()
         for node in range(N + 1):
-            sigma = node / N
+            sigma = float(sigma_guess[node])
             guess = evaluate(coefficients, sigma)[0]
             solver.set(node, "p", parameters)
             solver.set(
@@ -780,7 +935,7 @@ class TrajectoryOcp:
                 "x",
                 np.concatenate(
                     [
-                        [sigma, 1.0 / duration_guess, 0.0, 0.0],
+                        [sigma, speed_guess[node], accel_guess[node], 0.0],
                         passive_equilibrium(guess),
                         np.zeros(cs.K_PASSIVE_DOF),
                         [duration_guess / self.nominal],
