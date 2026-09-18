@@ -107,7 +107,10 @@ BAKED = (
 #: Sweep without editing this file:
 #:     CRANE_PLANNING_OCP_OPTIONS='{"hpipm_mode": "SPEED"}' ./scripts/bench_ocp.py
 SOLVER_TUNING = {
-    "nlp_solver_type": "SQP",
+    # Not plain SQP: 8 of the shipped solver's 11 bench refusals died in the *first* QP, 10 ms in,
+    # stationarity still at its initial 1e3 -- an infeasible QP, not a hard problem. Byrd-Omojokun
+    # solves a relaxed feasibility QP there instead of giving up. 11 refusals -> 3 on its own.
+    "nlp_solver_type": "SQP_WITH_FEASIBLE_QP",
     "qp_solver": "PARTIAL_CONDENSING_HPIPM",
     "hpipm_mode": "BALANCE",
     "qp_solver_cond_N": None,  # acados' own default is `N_horizon`, i.e. no partial condensing
@@ -117,9 +120,12 @@ SOLVER_TUNING = {
     "globalization": "MERIT_BACKTRACKING",
     "globalization_use_SOC": 0,
     "regularize_method": "NO_REGULARIZE",
-    "with_adaptive_levenberg_marquardt": False,
+    # `levenberg_marquardt` alone is 1e-6, i.e. none; this starts at 1e-3 and relaxes, so the first
+    # QP is regularised where it needs to be and later ones do not pay for it. Worth a third of the
+    # iterations by itself, and the last refusal the feasibility QP does not reach.
+    "with_adaptive_levenberg_marquardt": True,
     "nlp_solver_warm_start_first_qp": False,
-    "search_direction_mode": "NOMINAL_QP",
+    "search_direction_mode": "BYRD_OMOJOKUN",
     "qpscaling_scale_constraints": "NO_CONSTRAINT_SCALING",
     "qpscaling_scale_objective": "NO_OBJECTIVE_SCALING",
     "nlp_qp_tol_strategy": "FIXED_QP_TOL",
@@ -662,6 +668,9 @@ class Trajectory:
     dq_u: np.ndarray
     q_u_eq: np.ndarray
     pump_flow: np.ndarray  # (N+1,) as a fraction of the physical pump
+    #: What the flow row was actually bounded by, same units. Carried rather than re-derived: the
+    #: caller refuses a plan that bought this row, and two derivations would be two answers.
+    pump_flow_bound: float
     slack: float
     #: Slack on the sway box alone (units of `q_sway_max`): sway bought with slack leaves the
     # envelope `Geometry` builds from this bound.
@@ -1061,6 +1070,7 @@ class TrajectoryOcp:
             dq_u=dq_u,
             q_u_eq=np.array([passive_equilibrium(row) for row in q_a]),
             pump_flow=flow,
+            pump_flow_bound=flow_hi,
             slack=slack,
             sway_slack=sway_slack,
             iterations=int(solver.get_stats("sqp_iter")),

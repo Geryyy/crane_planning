@@ -281,6 +281,17 @@ class Planner:
                 "envelope the corridor was certified against",
                 stats=timing.report(),
             )
+        # Flow row is soft for the same reason and refused for the same reason: a converged
+        # solve that bought it draws more than the pump delivers, and the answer reads as valid.
+        # Surfaced by the tuning sweep -- baseline refused these paths before reaching here.
+        pump_peak = float(np.max(timing.pump_flow))
+        if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
+            raise PlanningError(
+                "the timing solve bought the pump limit instead of meeting it: peak "
+                f"draw {pump_peak:.3g} of the pump against the {timing.pump_flow_bound:.3g} "
+                f"reserved, out of {timing.slack:.3g} total slack",
+                stats=timing.report(),
+            )
         terminal_offset = np.abs(timing.q_u[-1] - timing.q_u_eq[-1])
         terminal_rate = np.abs(timing.dq_u[-1])
         if np.any(terminal_offset > self.config.terminal_q_sway_max) or np.any(
