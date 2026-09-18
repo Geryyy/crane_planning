@@ -49,19 +49,46 @@ def test_every_typed_parameter_is_a_config_field():
     assert set(TYPED) - {field.name for field in fields(PlannerConfig)} == set()
 
 
-# pump_flow_max/pump_flow_planning_factor are also crane_mpc's; had been typed
-# separately (1.4e-3 here, 0.0014 there). crane_model/config/hydraulics.yaml is source.
+# --- the pump is one number ---------------------------------------------------
+# It lives in crane_model/config/hydraulics.yaml. `PlannerConfig` reads it there,
+# the node declares that as the parameter default, and this yaml repeats neither.
 def test_the_pump_is_the_one_in_crane_model():
-    from crane_model.conventions import default_hydraulics_path
+    from crane_model import hydraulic_limits
 
-    with open(default_hydraulics_path(), encoding="utf-8") as handle:
-        pump = yaml.safe_load(handle)["pump"]
+    machine = hydraulic_limits()
     declared = PlannerConfig()
-    deployed = yaml.safe_load(CONFIG.read_text())["crane_planner"]["ros__parameters"]
+    assert declared.pump_flow_max == machine["pump_flow_max"]
+    assert declared.pump_flow_planning_factor == machine["pump_flow_planning_factor"]
 
-    for here, there in (
-        ("pump_flow_max", "flow_max"),
-        ("pump_flow_planning_factor", "planning_factor"),
-    ):
-        assert getattr(declared, here) == pump[there], here
-        assert deployed[here] == pump[there], here
+    deployed = yaml.safe_load(CONFIG.read_text())["crane_planner"]["ros__parameters"]
+    assert "pump_flow_max" not in deployed
+    assert "pump_flow_planning_factor" not in deployed
+
+
+def test_the_actuator_and_its_domain_are_the_ones_in_crane_model():
+    """The same discipline for C3: the planner refuses what the feedforward
+    cannot deliver, so its `k` and its domain have to be the deliverer's."""
+    import numpy as np
+    from crane_model.symbolic import K_ACTUATOR_FIT
+    from crane_model.velocity_loop import load_velocity_loop
+
+    declared = PlannerConfig()
+    assert np.array_equal(declared.command_k, np.asarray(K_ACTUATOR_FIT.k))
+    assert declared.command_dead_time_s == K_ACTUATOR_FIT.dead_time_s
+
+    # Psi's domain is the inner loop's clamp -- one number, not two that drift.
+    from crane_model.conventions import ACTUATED_INDICES, canonical_joints
+
+    gains, _ = load_velocity_loop()
+    names = canonical_joints()
+    joints = [names[index] for index in ACTUATED_INDICES[:5]]
+    assert np.array_equal(
+        declared.command_u_min, [gains[joint].u_clamp_min for joint in joints]
+    )
+    assert np.array_equal(
+        declared.command_u_max, [gains[joint].u_clamp_max for joint in joints]
+    )
+
+    deployed = yaml.safe_load(CONFIG.read_text())["crane_planner"]["ros__parameters"]
+    for name in ("command_k", "command_u_min", "command_u_max", "command_dead_time_s"):
+        assert name not in deployed

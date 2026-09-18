@@ -108,32 +108,24 @@ crane_planner:
     # --- what the C3 feedforward will command --------------------------------
     # `u_d = qdot_d + tau_dot_d / k_i`, the inversion `AddC3Feedforward` writes into
     # the effort field, bounded by the domain the compensator was identified over.
-    # Must stay the same lists as `bt_server_override.yaml`'s
-    # `c3_feedforward.{k,u_min,u_max}`: the planner exists to refuse what the
-    # feedforward cannot deliver, and a second derivation is a second answer.
+    # The planner exists to refuse what the feedforward cannot deliver, so a second
+    # derivation here would be a second answer.
     #
-    # `k` is N m/rad, N/m on the telescope, from
-    # `crane_model/config/c3_full_model.json`; the telescope's is a geometry prior
-    # not a fit and the rotator's rests on four bags -- indicative, not measured.
-    # `u_min`/`u_max` are Psi's identified domain, min_x/max_x of
-    # `velocity_characteristic.yaml`; outside it the compensator extrapolates a
-    # monotone spline past its data.
-    command_k: [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
-    command_u_min: [-0.9635, -0.3134, -0.3342, -0.5551, -2.3969]
-    command_u_max: [0.9357, 0.2977, 0.3059, 0.5849, 2.4636]
-    # s. Effort field advanced by this much: the feedforward branch is open loop
-    # against a plant that answers late, and inversion plus preview measure x25-x52
-    # together against a fraction of that for either alone. Common to every axis --
-    # the fit pinned the dead time common.
-    command_dead_time_s: 0.06
+    # Not set below. `command_k` and `command_dead_time_s` are declared off
+    # `crane_model/config/c3_full_model.json` (the C3 fit), `command_u_min` and
+    # `command_u_max` off `crane_model/config/velocity_loop.yaml`'s `u_clamp_*` --
+    # Psi's identified domain, which is also the clamp the deployed JTC runs.
+    # Writing any of them here overrides it, because a deployment may have to, not
+    # because the number is decided here.
+    #
     # s per axis, the fitted command PT1 (block 2 of C3). **Zero is the shipped
     # law**, so the emitted feedforward carries blocks 3 and the rigid body by
-    # RNEA, block 1 by the preview above, block 2 not at all.
+    # RNEA, block 1 by the dead-time preview, block 2 not at all.
     #
-    # The arm that turns it on: [0.100, 0.025, 0.000, 0.075, 0.125] (sw, ha, ka,
-    # sa, ro), the same numbers the Gazebo URDF carries as `tau_v`. Only the
-    # lag/dead-time *sum* is identified, so these are a choice, not a measurement.
-    # Live: read per request, so an ablation flips arms without a relaunch.
+    # The arm that turns it on is the fit's `tau_v` (sw, ha, ka, sa, ro), the same
+    # numbers the Gazebo URDF carries. Only the lag/dead-time *sum* is identified,
+    # so this is a choice, not a measurement, and it stays a deployment key. Live:
+    # read per request, so an ablation flips arms without a relaunch.
     command_lag_s: [0.0, 0.0, 0.0, 0.0, 0.0]
     # Visualization is not the control reference: bound the authoritative FK calls
     # while the full JointTrajectory stays at 25 Hz.
@@ -218,12 +210,9 @@ crane_planner:
     payload_estimate_deadline: 1.0
 
     # --- the one hydraulic number the description does not carry -------------
-    # Source is `crane_model/config/hydraulics.yaml`'s `pump` block, which carries
-    # the provenance; `crane_mpc` declares the same pair and
-    # test_parameters_are_declared pins this copy to it. Overridable here because a
-    # deployment may have to, not because the number is decided here.
-    #
-    # The **only** actuator limit the planner enforces, measured 2023,
-    # pre-retrofit, not re-verified.
-    pump_flow_max: 1.4e-3
-    pump_flow_planning_factor: 0.95
+    # Not set here. `pump_flow_max` and `pump_flow_planning_factor` are declared
+    # off `crane_model/config/hydraulics.yaml`'s `pump` block, which carries the
+    # provenance (measured 2023, pre-retrofit, not re-verified) -- the **only**
+    # actuator limit the planner enforces.
+    # Writing either key here overrides it, because a deployment may have to,
+    # not because the number is decided here.

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 
 import numpy as np
-from crane_model import ACTUATED_INDICES, Frame, Tool, parse
+from crane_model import ACTUATED_INDICES, Frame, Tool, hydraulic_limits, parse
 from crane_model.conventions import (
     CONTROL_SAFE_AXES,
     canonical_joints,
     control_safe_limits,
 )
+from crane_model.symbolic import K_ACTUATOR_FIT
+from crane_model.velocity_loop import load_velocity_loop
 
 #: Five planned coordinates; tool axis (q8) held constant by the low-level controller.
 PLANNED_INDICES = ACTUATED_INDICES[:5]
@@ -37,6 +40,18 @@ MIN_LIFT_STEP = 1.0e-6
 
 BOOM_AXIS = 1
 ARM_AXIS = 2
+
+
+@lru_cache(maxsize=1)
+def _command_domain() -> tuple[np.ndarray, np.ndarray]:
+    """Psi's identified domain per planned axis, off `crane_model`'s velocity loop."""
+    gains, _rate_hz = load_velocity_loop()
+    joints = canonical_joints()
+    axes = [gains[joints[index]] for index in PLANNED_INDICES]
+    return (
+        np.array([axis.u_clamp_min for axis in axes], dtype=float),
+        np.array([axis.u_clamp_max for axis in axes], dtype=float),
+    )
 
 
 class PlanningError(RuntimeError):
@@ -91,6 +106,9 @@ def read_limits(
     rail). No cylinder-force constraint (unmeasured relief pressure);
     `tau_max` is the description's per-joint effort, the scale `tau_weight`
     divides by.
+
+    The two pump numbers come from the caller's `PlannerConfig`, which reads
+    them off `crane_model`; they are never defaulted here.
     """
     description = parse(description_xml, Tool.PZS100)
     inner = description.model
@@ -216,28 +234,47 @@ class PlannerConfig:
     dddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([21.2, 2.72, 12.5, 236.0, 44.4])
     )
-    #: C3 stiffness per axis (identified domain); same lists AddC3Feedforward reads, single source.
+    #: C3 stiffness per axis, N m/rad (N/m on the telescope); the same constant
+    #: AddC3Feedforward inverts with. Value lives in
+    #: `crane_model/config/c3_full_model.json`, which carries the provenance
+    #: (telescope a geometry prior, rotator four bags -- indicative, not
+    #: measured); read here, never repeated.
     command_k: np.ndarray = field(
-        default_factory=lambda: np.array(
-            [319074.23, 1834000.0, 578000.0, 3500000.0, 7296.0]
-        )
+        default_factory=lambda: np.array(K_ACTUATOR_FIT.k, dtype=float)
     )
+    #: Psi's identified domain; outside it the compensator extrapolates a monotone
+    #: spline past its data. Value lives in `crane_model/config/velocity_loop.yaml`
+    #: (`u_clamp_min`/`u_clamp_max`), which carries the provenance; read here,
+    #: never repeated.
     command_u_min: np.ndarray = field(
-        default_factory=lambda: np.array([-0.9635, -0.3134, -0.3342, -0.5551, -2.3969])
+        default_factory=lambda: _command_domain()[0].copy()
     )
     command_u_max: np.ndarray = field(
-        default_factory=lambda: np.array([0.9357, 0.2977, 0.3059, 0.5849, 2.4636])
+        default_factory=lambda: _command_domain()[1].copy()
     )
     #: s; feedforward advanced by this much (open loop, late plant): inversion+preview worth
-    # x25-x52.
-    command_dead_time_s: float = 0.06
+    #: x25-x52. Common to every axis -- the fit pinned the dead time common. Value lives in
+    #: `crane_model/config/c3_full_model.json`; read here, never repeated.
+    command_dead_time_s: float = field(
+        default_factory=lambda: float(K_ACTUATOR_FIT.dead_time_s)
+    )
     #: s/axis, C3 block 2 PT1. Zero is shipped: feedforward inverts block3/RNEA/block1, not block2.
-    #: Non-zero adds tau_v du/dt (path C4). Fitted: sw.100 ha.025 ka0 sa.075 ro.125 (Gazebo tau_v).
+    #: Non-zero adds tau_v du/dt (path C4); the arm that turns it on is
+    #: `crane_model.symbolic.K_ACTUATOR_FIT.tau_v`, not restated here -- only the
+    #: lag/dead-time sum is identified, so it is a choice, not a measurement.
     command_lag_s: np.ndarray = field(default_factory=lambda: np.zeros(5))
     visualization_samples: int = 25
 
-    pump_flow_max: float = 1.4e-3
-    pump_flow_planning_factor: float = 0.95
+    #: The only actuator limit the planner enforces. Value lives in
+    #: `crane_model/config/hydraulics.yaml`, which carries the provenance; read
+    #: here, never repeated. A deployment overrides it through the node's
+    #: parameters, not by typing the number in again.
+    pump_flow_max: float = field(
+        default_factory=lambda: hydraulic_limits()["pump_flow_max"]
+    )
+    pump_flow_planning_factor: float = field(
+        default_factory=lambda: hydraulic_limits()["pump_flow_planning_factor"]
+    )
 
     Ts: float = 0.04
 
