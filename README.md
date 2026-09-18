@@ -246,6 +246,23 @@ It exercises every stage, so its refusal is the node's refusal.
 ./scripts/plan_goals.py --goals out across --headless
 ```
 
+`bench_ocp.py` is the OCP's own bench: 100 paths sampled inside the
+control-safe box, start and goal both, each planned and logged.
+
+```bash
+./scripts/bench_ocp.py                          # baseline -> build/bench_ocp.json
+./scripts/bench_ocp.py --out build/after.json   # then diff the two logs
+```
+
+It sweeps nothing -- changing the OCP means editing it and re-exporting, and
+every knob that matters (`ocp_intervals`, `ocp_horizon`, `ocp_integrator`,
+`ocp_max_iterations`, `ocp_tolerance`, `levenberg_marquardt`) is in `BAKED`, so
+it moves the solver tree. The log records those, so a run cannot be attributed
+to the wrong solver. Read the cost block (SQP and QP iterations) against the
+quality block below it: iterations fall for free if the answers may get worse.
+On the shipped OCP, 63 of 100 paths solve at 28 SQP iterations median, 97 worst
+against a cap of 100; 11 are refused by the solver and 26 by geometry before it.
+
 Its summary puts the OCP's own peak sway beside MuJoCo's for the same motion:
 an independent integrator on the same URDF, so a shaping change that only the
 OCP believes shows up as the two columns parting. `tune_planner.py` is one goal
