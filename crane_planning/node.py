@@ -490,9 +490,12 @@ class CranePlanner(Node):
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
         # WARN not OK when slack bought the answer: priced violation executes silently otherwise.
+        # Same for an answer admitted at the iteration cap -- every row is met, but the duration
+        # is not proven minimal and the cycle behind it is worth seeing from outside.
         level = (
             DiagnosticStatus.WARN
             if plan.timing.slack > SLACK_SPENT
+            or plan.timing.stats["acados_status"] != 0
             else DiagnosticStatus.OK
         )
         self._report(level, plan.message, plan.timing.report())

@@ -548,6 +548,14 @@ class Planner:
                 if np.any(lag != 0.0)
                 else ""
             )
+            # Named, not just carried in `stats`: every row is met but the duration is not
+            # proven minimal, and an operator reading the log cannot tell that from the rest.
+            + (
+                "; admitted at the iteration cap on stationarity "
+                f"{timing.residuals[0]:.1e} -- every row met, duration not proven minimal"
+                if timing.stats["acados_status"] != 0
+                else ""
+            )
         )
         return Plan(
             time=stamps,

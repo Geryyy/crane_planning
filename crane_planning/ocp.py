@@ -236,8 +236,47 @@ PLAN_ROWS = (
 )
 
 
-def solver_stats(solver, status: int, elapsed: float) -> dict:
-    """One solve as flat named numbers for `~/solver_stats`, built once before the outcome branches (regress on iteration counts/residuals, never time -- load-bound); QP status is its own key since acados reports a QP that merely hit HPIPM's limit as success."""
+def residuals_at(solver, status: int) -> np.ndarray:
+    """
+    Return the four KKT residuals of the iterate actually returned.
+
+    acados evaluates them at `max_iter` only when `eval_residual_at_max_iter` is set, which
+    it derives from the globalization and leaves false for this one (funnel/DDP-merit only).
+    So on a stop at the cap `get_stats("residuals")` describes the step *before* the one
+    handed back. Measured on `goal_here`: reported 9.2e-3, actual 5.0e-4, and the two
+    alternate -- the cap lands on whichever half of an active-set cycle it stops in, then
+    reports the other half.
+
+    Only off the converged path, where it is the one place the number can be wrong. A
+    converged solve had its residuals evaluated at the accepted iterate on the way to
+    deciding it had converged, so recomputing there is a second evaluation for the same
+    answer -- and `ocp_nlp_eval_residuals` overwrites linearisation memory for it. Not
+    measurable either way on `bench_ocp`: that bench does not repeat per path (two runs of
+    one build differ by up to 56 SQP iterations and 2.8e-3 s on a path), so this is an
+    argument from what the call does, not from a number.
+    """
+    if status == 0:
+        return np.asarray(solver.get_stats("residuals"), dtype=float)
+    return np.asarray(solver.get_residuals(recompute=True), dtype=float)
+
+
+def row_excess(rows, lh, uh, sigma, speed) -> float:
+    """
+    Worst violation over the solver's own `h` rows and the `sigma`/`v` box, on the returned states.
+
+    Same rows `res_ineq` covers, measured rather than read off bookkeeping that can belong to
+    another iterate. Every row is already divided by its own limit, so the answer is a fraction
+    of a bound and compares directly against `ocp_tolerance`.
+    """
+    return max(
+        float(np.max(np.maximum(rows - uh, lh - rows))),
+        float(np.max(np.maximum(sigma - 1.0, -sigma))),
+        float(np.max(-speed)),
+    )
+
+
+def solver_stats(solver, status: int, elapsed: float, residuals=None) -> dict:
+    """One solve as flat named numbers for `~/solver_stats`, built once before the outcome branches (regress on iteration counts/residuals, never time -- load-bound); QP status is its own key since acados reports a QP that merely hit HPIPM's limit as success. `residuals` is passed in by `solve` so the recomputed ones reach the report; the stale `get_stats` pair is the fallback."""
     qp_iterations = np.asarray(solver.get_stats("qp_iter"), dtype=float)
     qp_status = np.asarray(solver.get_stats("qp_stat"), dtype=float)
     stats = {
@@ -249,11 +288,10 @@ def solver_stats(solver, status: int, elapsed: float) -> dict:
         "acados_time_s": float(solver.get_stats("time_tot")),
         "qp_time_s": float(solver.get_stats("time_qp")),
     }
+    if residuals is None:
+        residuals = solver.get_stats("residuals")
     stats.update(
-        {
-            f"residual_{name}": float(value)
-            for name, value in zip(RESIDUALS, solver.get_stats("residuals"))
-        }
+        {f"residual_{name}": float(value) for name, value in zip(RESIDUALS, residuals)}
     )
     stats.update({name: float("nan") for name in PLAN_ROWS})
     return stats
@@ -1012,7 +1050,7 @@ class TrajectoryOcp:
         q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
         dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
         slack, sway_slack = slack_spent(solver, N)
-        flow = np.array(
+        raw_flow = np.array(
             [
                 float(
                     self._flow(
@@ -1021,29 +1059,53 @@ class TrajectoryOcp:
                         parameters[: cs.NP],
                     )
                 )
-                / cfg.pump_flow_max
                 for node in range(N + 1)
             ]
         )
+        flow = raw_flow / cfg.pump_flow_max
         command = np.array(
             [
                 np.asarray(self._command(state[node], parameters)).ravel()
                 for node in range(N + 1)
             ]
         )
-        stats = solver_stats(solver, status, elapsed)
+        q_u_eq = np.array([passive_equilibrium(row) for row in q_a])
+        # `con_h` rebuilt from the states acados handed back, in `lh`/`uh` order and divided by
+        # `self.scale`, which is what the solver divides them by -- the same row, not a second
+        # opinion on it. Node `N` carries `h_e` instead (the settled box, which `plan` gates), so
+        # only the stage rows are compared here.
+        rows = (
+            np.hstack([q_u - q_u_eq, raw_flow[:, None], dq_a, ddq_a, command])
+            / self.scale[:NH]
+        )
+        residuals = residuals_at(solver, status)
+        stats = solver_stats(solver, status, elapsed, residuals)
         # Status read before guard: a diverged iterate is likelier to saturate the snap chain, so
         # guard-first would misreport a non-convergence.
-        if status != 0:
+        #
+        # Status 2 is the iteration cap, and on `bench_ocp` every non-convergence is the same
+        # thing: a feasible iterate with stationarity alone unmet, the SQP cycling between two
+        # active sets. That answer may not be time-optimal; it does not break a row. Optimality is
+        # a claim about duration, so what is required here is the rows, measured on the states --
+        # `res_ineq` is one scalar from bookkeeping and `sway_slack` is a slack variable, neither
+        # of which is a statement about what was returned. Raising `ocp_max_iterations` instead
+        # buys the same answer later and hides the cycle, so it is not the lever.
+        excess = row_excess(rows[:N], lh, uh, sigma, speed)
+        admissible = (
+            status == 2
+            and float(np.max(residuals[1:])) <= cfg.ocp_tolerance
+            and excess <= cfg.ocp_tolerance
+        )
+        if status != 0 and not admissible:
             # Which of the four residuals stalled says dynamics vs goal box vs soft row; no
-            # `Trajectory` carries them, so they ride the message.
-            stat, eq, ineq, comp = np.asarray(
-                solver.get_stats("residuals"), dtype=float
-            )
+            # `Trajectory` carries them, so they ride the message. `excess` separates "did not
+            # finish" from "finished somewhere it may not be".
+            stat, eq, ineq, comp = residuals
             raise PlanningError(
                 f"the trajectory OCP did not converge: acados status {status} after "
                 f"{int(stats['sqp_iterations'])} iterations, {elapsed:.2f} s, on "
-                f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}",
+                f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}, "
+                f"worst row {excess:+.1e} of its bound",
                 stats=stats,
             )
         if guard > 0.99:
@@ -1068,7 +1130,7 @@ class TrajectoryOcp:
             coefficients=coefficients,
             q_u=q_u,
             dq_u=dq_u,
-            q_u_eq=np.array([passive_equilibrium(row) for row in q_a]),
+            q_u_eq=q_u_eq,
             pump_flow=flow,
             pump_flow_bound=flow_hi,
             slack=slack,
@@ -1076,6 +1138,6 @@ class TrajectoryOcp:
             iterations=int(solver.get_stats("sqp_iter")),
             solve_time_s=elapsed,
             acados_time_s=float(solver.get_stats("time_tot")),
-            residuals=np.asarray(solver.get_stats("residuals"), dtype=float),
+            residuals=residuals,
             stats=stats,
         )

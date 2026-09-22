@@ -202,6 +202,49 @@ sway offset and rate are checked after the solve against
 `terminal_q_sway_max`/`terminal_dq_sway_max`; a near miss is refused, not
 published.
 
+### Stopping at the cap is not failing
+
+acados status 2 is the iteration cap, and on this formulation it is the only
+non-convergence there is: across `bench_ocp.py` every one is the same shape, a
+feasible iterate with **stationarity alone** unmet while `eq`, `ineq` and `comp`
+sit decades under `ocp_tolerance`. The SQP is not diverging, it is cycling
+between two active sets -- step length alternating 1.0 and 0.058 for eighty
+iterations.
+
+That happens where the *pendulum*, not the path, sets the duration. On a short
+move the rate and acceleration rows never bind (`goal_here`: a TOPP floor of
+1.04 s against an answer of 6.80 s), so minimum time is opposed only by the sway
+rows, and sway damping authority changes usefully only in whole pendulum
+half-periods. `theta` then sits in a flat valley and there is no descent
+direction to find.
+
+So a status-2 iterate is admitted when it earns it: `eq`/`ineq`/`comp` within
+`ocp_tolerance`, and **every `h` row plus the `sigma`/`v` box re-measured on the
+states acados handed back** (`row_excess`). That last part is the one that
+matters. `res_ineq` is a single scalar out of solver bookkeeping, and acados
+leaves the residuals unevaluated at the cap unless `eval_residual_at_max_iter`
+is set -- which it derives from the globalization and leaves false here -- so
+what `get_stats` holds describes the step *before* the one returned. On
+`goal_here` that is 9.2e-3 reported against 5.0e-4 actual. `sway_slack` is no
+better: it is a slack variable, exact only where the solve converged. Neither is
+a statement about what executes, so neither is what the gate reads. `residuals_at`
+recomputes, off the converged path only -- a converged solve already evaluated
+them at the accepted iterate on the way to saying so, and `ocp_nlp_eval_residuals`
+overwrites linearisation memory to do it again.
+
+What is given up is the time-optimality claim, and nothing else: 73 of 100 bench
+paths against 71, the two newly admitted at terminal sway 0.0110 and 0.0157 rad
+against the 0.02 box and 4e-8 of slack. Raising `ocp_max_iterations` is *not*
+the lever -- it buys the same answer later and hides the cycle. The plan message
+and `~/solver_stats` say when an answer came in this way, and the node reports it
+`WARN`, because "feasible" and "time-optimal" must not read alike in a log.
+
+**`bench_ocp.py` does not repeat per path.** Two runs of one build: 35 of 73
+durations bit-identical, the rest inside 2.8e-3 s, and 4 paths moving on SQP
+count -- one of them by 56. Aggregates are stable (solved/refused, medians, the
+quality block), individual rows are not, so a single path's iteration count is
+not evidence of anything. Diff the summary, never a row.
+
 ## Cost
 
 PZS100, `scripts/plan_example.py` in a clear scene at shipped defaults, on this
@@ -308,6 +351,13 @@ unknown key is an error, since a misspelled knob would re-measure the baseline.
 stationarity still at its initial 1e3 -- an infeasible QP, not a hard one. 3
 stalled at the cap beside a solution they had found (stat 2e-4..3e-2, everything
 else met). No knob helps both.
+
+Those stationarity figures, and the `71 / 3` above, were read off
+`get_stats("residuals")`, which at the cap describes the previous step -- see
+*Stopping at the cap is not failing*. Measured at the iterate actually returned,
+the second problem is 2 paths, not 3 (the third is a converged solve that bought
+the pump), and they now solve: **73 / 1**. The table is left as the record of
+what the *settings* bought, which is what this section is about.
 
 `SQP_WITH_FEASIBLE_QP` + `BYRD_OMOJOKUN` answers the first, solving a relaxed
 feasibility QP where the given one is infeasible: 11 refusals to 3 alone.

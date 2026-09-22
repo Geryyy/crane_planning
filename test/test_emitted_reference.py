@@ -42,6 +42,9 @@ def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
         iterations=3,
         solve_time_s=0.1,
         report=dict,  # stand-in; _resample's drift refusal reads solve numbers off it
+        # converged, so the message's "admitted at the cap" clause stays off
+        stats={"acados_status": 0.0},
+        residuals=np.zeros(4),
         slack=0.0,
         terminal_sway=0.0,
         terminal_sway_rate=0.0,
