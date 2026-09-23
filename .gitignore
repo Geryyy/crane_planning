@@ -6,8 +6,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# acados compiles the solver here at construction; the shippable tree that
-# `scripts/export_timing_ocp.py` writes is not committed for now.
-generated/
+# generated/: only the reviewable files are committed (REVIEWED in
+# scripts/export_timing_ocp.py). The CasADi bodies are digested into the header.
+generated/*
+!generated/README.md
+!generated/crane_planning_ocp_generated.h
+!generated/crane_planning_ocp_pzs100/
+generated/crane_planning_ocp_pzs100/*
+!generated/crane_planning_ocp_pzs100/acados_solver_crane_planning_ocp_pzs100.h
 # MuJoCo appends its warnings here, in whatever directory a run started in.
 MUJOCO_LOG.TXT

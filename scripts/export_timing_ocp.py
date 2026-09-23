@@ -20,6 +20,7 @@ for. Dump that description first:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ sys.path.insert(0, str(PACKAGE))
 
 import crane_ocp_export as ox  # noqa: E402
 from acados_template import AcadosOcpSolver  # noqa: E402
+from crane_planning.config import PlannerConfig  # noqa: E402
 from crane_planning.ocp import (  # noqa: E402
     CACHE,
     DESCRIPTION,
@@ -44,11 +46,22 @@ from crane_planning.ocp import (  # noqa: E402
     HE_SWAY_RATE,
     NH,
     NH_E,
+    SOLVER_NAME,
     X_HORIZON,
     build_ocp,
     cache_key,
     tree_of,
     write_manifest,
+)
+
+# What is committed, and so what `--check` compares file by file. The whole tree
+# is written either way; everything outside this is gitignored and reaches the
+# comparison through `CRANE_PLANNING_OCP_GENERATED_DIGEST`. The CasADi bodies are
+# most of the tree and no review reads one.
+REVIEWED = (
+    "README.md",
+    GENERATED_HEADER,
+    f"{SOLVER_NAME}/acados_solver_{SOLVER_NAME}.h",
 )
 
 # -- generation --
@@ -58,8 +71,15 @@ README = """\
 # generated
 
 `scripts/export_timing_ocp.py` writes this tree. Do not edit it; re-run the
-script. `--check` regenerates into a scratch tree and diffs, which is what CI
-runs.
+script. `--check` regenerates into a scratch tree and diffs;
+`test/test_generated_is_current.py` runs it.
+
+Three files are committed -- this README, `crane_planning_ocp_generated.h` and
+`crane_planning_ocp_pzs100/acados_solver_crane_planning_ocp_pzs100.h`. The rest
+is gitignored and reaches `--check` through
+`CRANE_PLANNING_OCP_GENERATED_DIGEST` in the header: sha256 over every
+uncommitted generated file, so a description edit that only moves the CasADi
+bodies still fails.
 
 The horizon, the weights `W`, every box and every `L1` slack price are set on the
 generated solver at run time, so moving any of them needs no re-export. What is
@@ -68,7 +88,9 @@ baked is the **structure**: the residual rows and their scaling, the row order o
 """
 
 
-def write_header(output: Path, parameters: dict, scale: np.ndarray) -> Path:
+def write_header(
+    output: Path, parameters: dict, scale: np.ndarray, tree_digest: str
+) -> Path:
     """Write the row offsets and divisors the caller must agree with, not invent."""
     path = output / GENERATED_HEADER
     guard = "CRANE_PLANNING_OCP_GENERATED_H_"
@@ -97,6 +119,12 @@ def write_header(output: Path, parameters: dict, scale: np.ndarray) -> Path:
                 "",
                 f"#define CRANE_PLANNING_OCP_SCALE {{{divisors}}}",
                 "",
+                "// The rest of the tree, uncommitted: sha256 over every generated",
+                "// file outside `REVIEWED`, on normalised content. A description or",
+                "// hydraulics edit lands in the CasADi bodies and nothing else here,",
+                "// so this is what `--check` gates them on.",
+                f'#define CRANE_PLANNING_OCP_GENERATED_DIGEST "{tree_digest}"',
+                "",
                 f"#endif  // {guard}",
                 "",
             ]
@@ -113,7 +141,7 @@ def generate(
     ocp, scale, model = build_ocp(description, parameters, hydraulics)
     tree = ox.generate_solver(ocp, output)
     ox.write_output_map(model, ocp.model.name, tree)
-    write_header(output, parameters, scale)
+    write_header(output, parameters, scale, ox.tree_digest(output, REVIEWED))
     ox.finalise(output, README)
 
 
@@ -168,13 +196,20 @@ def main() -> int:
     )
     arguments = parser.parse_args()
 
-    parameters = ox.read_ros_parameters(
-        PACKAGE / "config" / "crane_planner.yaml", "crane_planner"
-    )
+    # yaml over the declared defaults, which is what the node's declaration does.
+    # Not the yaml alone: `command_k`, `command_u_*` and `pump_flow_max` were moved
+    # out of it into crane_model and are only reachable through `PlannerConfig`.
+    parameters = {
+        **dataclasses.asdict(PlannerConfig()),
+        **ox.read_ros_parameters(
+            PACKAGE / "config" / "crane_planner.yaml", "crane_planner"
+        ),
+    }
     source = arguments.description or arguments.descriptions / DESCRIPTION
     description = source.read_text()
-    # generated/ is the shipped tree --check and CI diff against; writing
-    # another machine into it makes every later --check report a spurious diff.
+    # generated/ is the shipped tree --check (and test_generated_is_current)
+    # diffs against; writing another machine into it makes every later --check
+    # report a spurious diff.
     if arguments.description and not arguments.compile_only:
         parser.error("--description writes only into the cache: add --compile-only")
     if arguments.compile_only:
@@ -185,6 +220,7 @@ def main() -> int:
         arguments.check,
         lambda output: generate(output, description, parameters, parameters),
         "export_timing_ocp.py",
+        reviewed=REVIEWED,
     )
     # --check compares two trees and must not touch the cache; a real export
     # leaves a compiled solver so the node doesn't build one on demand.
