@@ -14,7 +14,7 @@ from crane_model import (
     Tool,
     canonical_joints,
 )
-from crane_msgs.msg import CollisionScene, PayloadEstimate
+from crane_msgs.msg import CollisionScene, JointPath, PayloadEstimate
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -35,7 +35,7 @@ from .a2b import (
     translate_request,
     translate_start,
 )
-from .ocp import SLACK_SPENT, SolverNotExported
+from .ocp import SLACK_SPENT, SolverNotExported, evaluate
 from .planner import (
     PASSIVE_INDICES,
     PLANNED_INDICES,
@@ -49,6 +49,8 @@ from .planner import (
 )
 
 REFERENCE_TOPIC = "/crane/reference"
+#: The same plan as geometry, for a path-following cost; paired to the reference by stamp.
+JOINT_PATH_TOPIC = "/crane/joint_path"
 PLANNED_PATH_TOPIC = "/crane_planner/planned_path"
 #: Legacy A2B's Cartesian path, old name kept for RViz; unused `joint_trajectory` latch dropped.
 LEGACY_TCP_PATH_TOPIC = "tcp_path"
@@ -62,6 +64,12 @@ SOLVER_STATS_TOPIC = "~/solver_stats"
 
 #: Planning frame; assembly planner converts `world` to this, nothing downstream converts.
 PLANNING_FRAME = "K0_mounting_base"
+
+#: Samples of the planner's curve on `/crane/joint_path`. 30 clamped-cubic B-spline control
+#: points fitted to 120 uniform samples reproduce the curved candidate to 1.3 mm at the tool
+#: (measured, docs/features/path-following-mpc/brief.md), and the consumer refits anyway -- so
+#: this only has to not be the limiting error.
+PATH_SAMPLES = 120
 
 SHAPES = {1: "box", 2: "cylinder", 3: "sphere"}
 
@@ -172,6 +180,7 @@ class CranePlanner(Node):
         self.reference = self.create_publisher(
             JointTrajectory, REFERENCE_TOPIC, latched()
         )
+        self.joint_path = self.create_publisher(JointPath, JOINT_PATH_TOPIC, latched())
         self.planned_path = self.create_publisher(Path, PLANNED_PATH_TOPIC, latched())
         self.legacy_tcp_path = self.create_publisher(Path, LEGACY_TCP_PATH_TOPIC, 10)
         self.markers = self.create_publisher(MarkerArray, MARKERS_TOPIC, latched())
@@ -487,6 +496,8 @@ class CranePlanner(Node):
         trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
         path = self._path(plan)
         self.reference.publish(trajectory)
+        # Same stamp as the reference: that is what pairs the two forms of one plan.
+        self.joint_path.publish(self._joint_path(plan, self.start_stamp))
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
         # WARN not OK when slack bought the answer: priced violation executes silently otherwise.
@@ -538,6 +549,19 @@ class CranePlanner(Node):
             point.time_from_start.nanosec = int((when - int(when)) * 1e9)
             trajectory.points.append(point)
         return trajectory
+
+    def _joint_path(self, plan, stamp) -> JointPath:
+        """Geometry off the planner's own curve, not the resample: no timing law in the path."""
+        places = np.linspace(0.0, 1.0, PATH_SAMPLES)
+        message = JointPath()
+        message.header.stamp = stamp
+        message.joint_names = [self.joint_names[index] for index in PLANNED_INDICES]
+        # Row-major, one row per place: `evaluate` already returns (places, planned).
+        message.q_path = evaluate(plan.timing.coefficients, places).reshape(-1).tolist()
+        total = float(plan.timing.time[-1])
+        message.duration.sec = int(total)
+        message.duration.nanosec = int((total - int(total)) * 1e9)
+        return message
 
     def _draw(self, markers: list) -> None:
         self.markers.publish(viz.clear(PLANNING_FRAME, self.get_clock().now().to_msg()))

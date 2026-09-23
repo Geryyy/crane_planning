@@ -397,12 +397,17 @@ bought pump limit through. Refused now, beside the same test. Not a tuning artef
 |---|---|
 | services | `/a2b_movement` (`timber_crane_planning_interfaces/CalcMovement`) |
 | publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
+| | `/crane/joint_path` (`crane_msgs/JointPath`, transient-local) -- `q_a(sigma)`, stamped like the reference |
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's name, for RViz |
 | | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |
 | | `~/solver_stats` (`diagnostic_msgs/DiagnosticArray`, transient-local) |
 | subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
 | frame | `K0_mounting_base` throughout; nothing is converted |
+
+One plan in two forms, published together and stamped alike: `/crane/joint_path` is the
+geometry a path-following cost is written against, `/crane/reference` the same plan resampled
+in time for a trajectory follower.
 
 **Not a second writer of the machine**: `/crane/reference` is a reference, not a
 command; `crane_velocity_controller` stays sole claimant of the six velocity
