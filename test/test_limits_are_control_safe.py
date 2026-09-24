@@ -3,13 +3,21 @@ crane_model/config/control_safe_limits.yaml now, this pins them in sync."""
 
 import os
 
+import pytest
 from ament_index_python.packages import get_package_share_directory
 from crane_model.conventions import (
     CONTROL_SAFE_AXES,
     canonical_joints,
     control_safe_limits,
 )
-from crane_planning.config import PLANNED_INDICES, PlannerConfig, read_limits
+from crane_planning import weights as crane_weights
+from crane_planning.config import (
+    PLANNED_DOF,
+    PLANNED_INDICES,
+    PlannerConfig,
+    read_limits,
+)
+from crane_planning.ocp import H_RATE, baked_parameters, build_ocp
 
 DESCRIPTION = os.path.join(
     get_package_share_directory("crane_model"), "description", "pzs100.urdf"
@@ -22,6 +30,31 @@ def limits():
         return read_limits(
             handle.read(), config.pump_flow_max, config.pump_flow_planning_factor
         )
+
+
+def test_the_rate_rows_ceiling_is_the_control_safe_one():
+    """
+    The rate row is bounded at `kappa * speed_scale`, so its ceiling is that times
+    the divisor the solver was built with. Read off the built solver's `scale` --
+    the same array `row_excess` mirrors and the exporter writes into the header --
+    not off `read_limits`: the two used to disagree, the solver dividing by the
+    description instead, which put the boom's ceiling 1.76x over the box
+    `crane_mpc` enforces and made this planner's certificate false.
+    """
+    config = PlannerConfig()
+    read = limits()
+    with open(DESCRIPTION, encoding="utf-8") as handle:
+        _ocp, scale, _model = build_ocp(
+            handle.read(),
+            {**baked_parameters(config, read), "weights": crane_weights.DEFAULTS},
+            {"pump_flow_max": config.pump_flow_max},
+        )
+
+    for speed_scale in (1.0, 0.5):
+        ceiling = config.kappa * speed_scale * scale[H_RATE : H_RATE + PLANNED_DOF]
+        assert ceiling == pytest.approx(config.kappa * speed_scale * read.dq_max)
+    # discriminating: the boom's description row is 0.5257, which is what it read before
+    assert scale[H_RATE + 1] == pytest.approx(0.239067)
 
 
 def test_no_planned_axis_leaves_constraint_ones_box():

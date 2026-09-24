@@ -33,10 +33,7 @@ from crane_model import symbolic as cs
 from . import weights as w
 from .config import PlanningError, passive_equilibrium
 
-#: What `scripts/export_timing_ocp.py` writes and `--check` reviews.
-GENERATED = Path(__file__).resolve().parent.parent / "generated"
-
-#: Build dir, outside source tree: stops a run overwriting the artifact under review.
+#: Where `scripts/export_timing_ocp.py` compiles to and this module loads from.
 CACHE = (
     Path(os.environ.get("CRANE_PLANNING_OCP_CACHE", tempfile.gettempdir()))
     / "crane_planning_ocp"
@@ -45,7 +42,6 @@ CACHE = (
 TOOL = "pzs100"
 DESCRIPTION = "pzs100.urdf"
 SOLVER_NAME = f"crane_planning_ocp_{TOOL}"
-GENERATED_HEADER = "crane_planning_ocp_generated.h"
 
 #: Built solver's `cache_key`, written beside it; names what diverged on a miss.
 MANIFEST = "cache_key.json"
@@ -81,6 +77,14 @@ PATH_DERIVATIVES = 5
 # 24.5/131.8/51.3/41.2, demand ~132). `H_COMMAND` carries the physical row, this bounds only snap,
 # loosely.
 SIGMA_INPUT_MAX = 2000.0
+
+#: Row scales the caller reads off `Limits`, not off the description: `dq_max` is the
+#: description intersected with `crane_model/config/control_safe_limits.yaml`, so the
+#: description hash alone no longer determines it and it must enter `cache_key` on its own
+#: -- otherwise a limits edit silently loads a solver built for the old ceiling. `tau_max`
+#: is the description's effort either way (the box has no effort row), but it arrives the
+#: same way, so it is keyed the same way rather than trusted to stay derived.
+BAKED_LIMITS = ("dq_max", "tau_max")
 
 #: What the compiled solver's structure depends on; `weights` absent (runtime field).
 BAKED = (
@@ -166,24 +170,18 @@ def equilibrium(q_a):
     return ca.vertcat(0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi)
 
 
-def description_limits(model) -> tuple:
-    """`(dq_max, tau_max)`."""
-    inner = model.description.model
-    rows = [model.description.joints[row].velocity_index for row in cs.K_PLANNED_ROWS]
-    return (
-        np.array([float(inner.velocityLimit[row]) for row in rows]),
-        np.array([float(inner.effortLimit[row]) for row in rows]),
-    )
-
-
-def baked_parameters(config) -> dict:
-    return {name: getattr(config, name) for name in BAKED}
+def baked_parameters(config, limits) -> dict:
+    """Config keys the solver is compiled from, plus the row scales off `Limits`."""
+    baked = {name: getattr(config, name) for name in BAKED}
+    for name in BAKED_LIMITS:
+        baked[name] = np.asarray(getattr(limits, name), dtype=float)
+    return baked
 
 
 def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     """Solver validity key, tree named after it; `.so` loaded not compared, so anything entering expressions/dimensions must move the directory (sim uses a different xacro at `sim_hydraulics:=false`, so description is hashed here, not assumed)."""
     baked = {}
-    for key in BAKED:
+    for key in (*BAKED, *BAKED_LIMITS):
         value = parameters[key]
         baked[key] = value.tolist() if hasattr(value, "tolist") else value
     baked["pump_flow_max"] = float(hydraulics["pump_flow_max"])
@@ -485,7 +483,13 @@ def path_expression(sigma, coefficients, segments: int) -> list:
 def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     """Return `(ocp, scale, model)`, as the sibling exporter does."""
     model = cs.CraneSymbolicModel(description_xml, TOOL)
-    dq_max, tau_max = description_limits(model)
+    # Off the caller's `Limits`, not the description: the rate row is bounded at
+    # `kappa * speed_scale`, so dividing by the description's velocity limit put the row's
+    # ceiling up to 2.1x over the control-safe box the MPC enforces, and the planner
+    # certified speeds the MPC refuses. One number, read once, serves the row and
+    # `row_excess`'s mirror of `scale`.
+    dq_max = np.asarray(parameters["dq_max"], dtype=float)
+    tau_max = np.asarray(parameters["tau_max"], dtype=float)
     q_sway_max = np.asarray(parameters["q_sway_max"], dtype=float)
     dq_sway_max = np.asarray(parameters["dq_sway_max"], dtype=float)
     ddq_a_max = np.asarray(parameters["ddq_a_max"], dtype=float)
@@ -759,7 +763,7 @@ class TrajectoryOcp:
     ):
         self.limits, self.config = limits, config
         self.segments = int(config.path_segments)
-        baked = baked_parameters(config)
+        baked = baked_parameters(config, limits)
         hydraulics = {"pump_flow_max": config.pump_flow_max}
         # Loads a built tree; builds one on first construction (minutes). Decided before `build_ocp`
         # so a refusal costs nothing.
@@ -779,8 +783,7 @@ class TrajectoryOcp:
                         f"  description sha1 {key['description'][:10]}",
                         *(divergence(key) or ["  the cache holds no other solver"]),
                         "  scripts/dump_robot_description.py live.urdf",
-                        "  scripts/export_timing_ocp.py --description live.urdf"
-                        " --compile-only",
+                        "  scripts/export_timing_ocp.py --description live.urdf",
                     ]
                 )
             )
@@ -807,7 +810,7 @@ class TrajectoryOcp:
                         f"  description sha1 {key['description'][:10]}",
                         *(divergence(key) or ["  the cache holds no other solver"]),
                         "  export one with scripts/export_timing_ocp.py"
-                        " --description <urdf> --compile-only",
+                        " --description <urdf>",
                     ]
                 ),
                 file=sys.stderr,

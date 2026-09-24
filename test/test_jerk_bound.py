@@ -11,6 +11,7 @@ from crane_planning.config import (
     PLANNED_INDICES,
     TOOL_INDEX,
     PlannerConfig,
+    read_limits,
 )
 from crane_planning.geometry import yaw_of
 from crane_planning.ocp import H_COMMAND, NH, baked_parameters, build_ocp
@@ -37,7 +38,10 @@ def description() -> str:
 
 def test_the_command_rows_are_present_and_hard():
     config = PlannerConfig()
-    baked = {**baked_parameters(config), "weights": crane_weights.DEFAULTS}
+    limits = read_limits(
+        description(), config.pump_flow_max, config.pump_flow_planning_factor
+    )
+    baked = {**baked_parameters(config, limits), "weights": crane_weights.DEFAULTS}
     ocp, _scale, _model = build_ocp(
         description(), baked, {"pump_flow_max": config.pump_flow_max}
     )

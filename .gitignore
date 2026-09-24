@@ -6,13 +6,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# generated/: only the reviewable files are committed (REVIEWED in
-# scripts/export_timing_ocp.py). The CasADi bodies are digested into the header.
-generated/*
-!generated/README.md
-!generated/crane_planning_ocp_generated.h
-!generated/crane_planning_ocp_pzs100/
-generated/crane_planning_ocp_pzs100/*
-!generated/crane_planning_ocp_pzs100/acados_solver_crane_planning_ocp_pzs100.h
+# Nothing is code-generated into the source tree any more; the exporter compiles
+# into `ocp.CACHE`. Left ignored so an old checkout's tree does not reappear.
+generated/
 # MuJoCo appends its warnings here, in whatever directory a run started in.
 MUJOCO_LOG.TXT

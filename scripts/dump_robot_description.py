@@ -3,7 +3,7 @@ r"""
 Write what /robot_description carries, byte for byte, for the exporter to bake.
 
     ./scripts/dump_robot_description.py live.urdf
-    ./scripts/export_timing_ocp.py --description live.urdf --compile-only
+    ./scripts/export_timing_ocp.py --description live.urdf
 
 Bytes matter: cache_key hashes the description string, the node hashes what
 the topic handed it -- same string or the prebaked solver is missed. `ros2

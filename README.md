@@ -26,6 +26,12 @@ machine is, exactly as the MPC's `position_box` does. The start state is still
 checked against the *description*'s stops, which is a different question -- can
 this measurement be real.
 
+`Limits.dq_max` is the one intersected number: it is also what the timing OCP's
+rate row is divided by, so that row's ceiling is `kappa * speed_scale` of the
+control-safe limit and not of the description's. It is generated into the
+solver, so it is part of `cache_key` -- a `control_safe_limits.yaml` edit moves
+the tree and needs a re-export, which is the point.
+
 ## The tool corridors
 
 Each candidate is a TCP polyline in `K0_mounting_base`; yaw follows the shortest

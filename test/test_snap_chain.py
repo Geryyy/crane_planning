@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from crane_planning import weights as crane_weights
-from crane_planning.config import PLANNED_DOF, PlannerConfig
+from crane_planning.config import PLANNED_DOF, PlannerConfig, read_limits
 from crane_planning.ocp import (
     NU,
     NX,
@@ -45,7 +45,10 @@ def description() -> str:
 
 def test_the_state_layout_is_what_the_model_carries():
     config = PlannerConfig()
-    baked = {**baked_parameters(config), "weights": crane_weights.DEFAULTS}
+    limits = read_limits(
+        description(), config.pump_flow_max, config.pump_flow_planning_factor
+    )
+    baked = {**baked_parameters(config, limits), "weights": crane_weights.DEFAULTS}
     ocp, _scale, _model = build_ocp(
         description(), baked, {"pump_flow_max": config.pump_flow_max}
     )

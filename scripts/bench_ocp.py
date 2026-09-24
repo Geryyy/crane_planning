@@ -37,7 +37,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
 import bench_plan  # noqa: E402
 import plan_example  # noqa: E402
 from crane_planning import Planner, PlannerConfig, PlanningError, Start  # noqa: E402
-from crane_planning.ocp import BAKED  # noqa: E402
+from crane_planning.ocp import baked_parameters  # noqa: E402
 
 #: Fraction of each axis' range kept clear of the box edge, both ends. Sampled
 #: onto a bound, a move is about the bound and not about the solver.
@@ -145,7 +145,9 @@ def summary(records: list) -> dict:
 def main() -> int:
     options = arguments()
     planner = Planner(plan_example.description(), PlannerConfig())
-    baked = {key: getattr(planner.config, key) for key in BAKED}
+    # Via `baked_parameters`, not `BAKED` alone: the rate row's scale comes off `Limits`,
+    # and a log missing it cannot be attributed to the solver that produced it.
+    baked = baked_parameters(planner.config, planner.limits)
 
     records = []
     print(
