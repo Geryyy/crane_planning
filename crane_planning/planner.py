@@ -249,9 +249,17 @@ class Planner:
             else np.zeros(2)
         )
         if np.any(np.abs(q_u_start - equilibrium_start) > self.config.q_sway_max):
+            # Name the numbers, as every other refusal here does: the bound is on
+            # the offset from equilibrium, and the equilibrium is the fitted
+            # path's start rather than the measured one, so a refusal that prints
+            # neither cannot be told from a machine that is genuinely swinging.
             raise PlanningError(
                 "the tool is swinging further than the admissible sway bound, so "
-                "there is no plan that keeps it inside one"
+                f"there is no plan that keeps it inside one: q_u {q_u_start} is "
+                f"{np.abs(q_u_start - equilibrium_start)} off the equilibrium "
+                f"{equilibrium_start} of the fitted path's start "
+                f"{path.position(0.0)} (measured start {start.q_a}), against a "
+                f"{self.config.q_sway_max} bound"
             )
         if np.any(np.abs(dq_u_start) > self.config.dq_sway_max):
             raise PlanningError(
