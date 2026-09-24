@@ -5,7 +5,7 @@ Compile the trajectory OCP that `crane_planning.ocp.build_ocp` defines.
 Definition lives in crane_planning/ocp.py; this is only the command line -- a
 second copy here would drift.
 
-    ./scripts/export_timing_ocp.py                        # the test fixture
+    ./scripts/export_timing_ocp.py --fixture              # the test fixture
     ./scripts/export_timing_ocp.py --description live.urdf
 
 Second compiles a solver for the machine on /robot_description; without it the
@@ -81,6 +81,15 @@ def build_parser() -> argparse.ArgumentParser:
             "`scripts/dump_robot_description.py`"
         ),
     )
+    parser.add_argument(
+        "--fixture",
+        action="store_true",
+        help=(
+            "bake the test fixture instead. Only a fixture export is useful "
+            "without a graph; it will not open in any node running the sim or "
+            "the machine"
+        ),
+    )
     return parser
 
 
@@ -120,7 +129,18 @@ def main() -> int:
             PACKAGE / "config" / "crane_planner.yaml", "crane_planner"
         ),
     }
+    # Defaulting to the fixture is what made three runs of issue 155 record a
+    # clean export for a robot no node runs: it compiles, prints success, and
+    # the node then refuses the key. Which machine is baked has to be said.
+    if arguments.description is None and not arguments.fixture:
+        raise SystemExit(
+            "refusing to guess which machine to bake. For a running graph:\n"
+            "  scripts/dump_robot_description.py live.urdf\n"
+            "  scripts/export_timing_ocp.py --description live.urdf\n"
+            "or --fixture for the test fixture, which no node can open."
+        )
     source = arguments.description or arguments.descriptions / DESCRIPTION
+    print(f"baking {source}")
     description = source.read_text()
     # `dq_max`/`tau_max` are row scales the solver is generated with, and the node reads
     # them off its `Limits`; re-deriving them here from the description alone would export
