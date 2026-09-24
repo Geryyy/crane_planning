@@ -14,8 +14,11 @@ node refuses a description it wasn't baked for. Dump that description first:
     ./scripts/dump_robot_description.py live.urdf
     ./scripts/export_timing_ocp.py --description live.urdf
 
-The solver lands in `ocp.CACHE` under `cache_key`, which is where the node
-loads it from. **There is no reviewable `generated/` tree any more.**
+The solver lands in `ocp.CACHE` under `cache_key`, which is where the node loads
+it from: `crane_ocp`'s persistent root, shared with `crane_mpc`'s export and not
+swept with `/tmp`. `--output` moves it, and the node only follows if
+`CRANE_PLANNING_OCP_CACHE` says the same. **There is no reviewable `generated/`
+tree any more.**
 `crane_ocp@1bc069d` retired the generate-into-git path for the whole stack --
 it code-generated a tree nothing compiled, beside a hashed cache that generated
 and compiled the same problem again, so the text a reviewer read was not the
@@ -48,8 +51,9 @@ from acados_template import AcadosOcpSolver  # noqa: E402
 from crane_planning.config import PlannerConfig, read_limits  # noqa: E402
 from crane_planning.ocp import (  # noqa: E402
     BAKED_LIMITS,
-    CACHE,
     DESCRIPTION,
+    EXPORT_ENV,
+    EXPORT_LEAF,
     build_ocp,
     cache_key,
     tree_of,
@@ -57,35 +61,16 @@ from crane_planning.ocp import (  # noqa: E402
 )
 
 
-def compile_solver(description: str, parameters: dict, hydraulics: dict) -> None:
+def build_parser() -> argparse.ArgumentParser:
     """
-    Compile the solver into the cache the planner loads from.
+    Build the command line, so a test can read it without running an export.
 
-    Without this the node refuses the description rather than pay code-gen +
-    a C build (13 s warm, minutes cold) inside whatever asked for the plan.
+    `--descriptions`, `--output` and `--verbose` come from `crane_ocp_export`,
+    the same call `crane_mpc/scripts/export_ocp.py` makes: its defaults are what
+    the node reads, so a signature or convention change there has to fail here.
     """
-    ocp, _, _ = build_ocp(description, parameters, hydraulics)
-    CACHE.mkdir(parents=True, exist_ok=True)
-    # Cache key covers path_segments, integrator, the row scales and the description
-    # hash: cached .so is loaded not compared, so any change must land in a new
-    # directory or the node silently reuses the old build. Node hashes
-    # /robot_description and reports a mismatch instead of answering silently wrong.
-    key = cache_key(parameters, hydraulics, description)
-    tree = tree_of(key)
-    ocp.code_export_directory = str(tree)
-    AcadosOcpSolver(ocp, json_file=str(tree.with_suffix(".json")), verbose=False)
-    write_manifest(tree, key)
-    print(f"compiled {tree} (description sha1 {key['description'][:10]})")
-
-
-def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    parser.add_argument(
-        "--descriptions",
-        type=Path,
-        default=ox.default_descriptions(PACKAGE),
-        help="where the two expanded machine descriptions are",
-    )
+    ox.add_arguments(parser, PACKAGE, EXPORT_ENV, EXPORT_LEAF)
     parser.add_argument(
         "--description",
         type=Path,
@@ -96,7 +81,35 @@ def main() -> int:
             "`scripts/dump_robot_description.py`"
         ),
     )
-    arguments = parser.parse_args()
+    return parser
+
+
+def compile_solver(
+    description: str, parameters: dict, hydraulics: dict, base: Path, verbose: bool
+) -> None:
+    """
+    Compile the solver into the cache the planner loads from.
+
+    Without this the node refuses the description rather than pay code-gen +
+    a C build (13 s warm, minutes cold) inside whatever asked for the plan.
+    """
+    ocp, _, _ = build_ocp(description, parameters, hydraulics)
+    # Cache key covers path_segments, integrator, the row scales and the description
+    # hash: cached .so is loaded not compared, so any change must land in a new
+    # directory or the node silently reuses the old build. Node hashes
+    # /robot_description and reports a mismatch instead of answering silently wrong.
+    key = cache_key(parameters, hydraulics, description)
+    # `--output` replaces the base only; the leaf is the name the node resolves.
+    tree = base / tree_of(key).name
+    tree.parent.mkdir(parents=True, exist_ok=True)
+    ocp.code_export_directory = str(tree)
+    AcadosOcpSolver(ocp, json_file=str(tree.with_suffix(".json")), verbose=verbose)
+    write_manifest(tree, key)
+    print(f"compiled {tree} (description sha1 {key['description'][:10]})")
+
+
+def main() -> int:
+    arguments = build_parser().parse_args()
 
     # yaml over the declared defaults, which is what the node's declaration does.
     # Not the yaml alone: `command_k`, `command_u_*` and `pump_flow_max` were moved
@@ -118,7 +131,9 @@ def main() -> int:
         parameters["pump_flow_planning_factor"],
     )
     parameters.update({name: getattr(limits, name) for name in BAKED_LIMITS})
-    compile_solver(description, parameters, parameters)
+    compile_solver(
+        description, parameters, parameters, arguments.output, arguments.verbose
+    )
     return 0
 
 

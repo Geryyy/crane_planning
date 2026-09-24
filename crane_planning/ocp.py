@@ -20,12 +20,12 @@ import hashlib
 import json
 import os
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import casadi as ca
+import crane_ocp_export as ox
 import numpy as np
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from crane_model import symbolic as cs
@@ -33,11 +33,16 @@ from crane_model import symbolic as cs
 from . import weights as w
 from .config import PlanningError, passive_equilibrium
 
+#: Overrides where exports are written and read; what an isolated run redirects.
+EXPORT_ENV = "CRANE_PLANNING_OCP_CACHE"
+
+#: This package's subtree of the shared export root.
+EXPORT_LEAF = "crane_planning_ocp"
+
 #: Where `scripts/export_timing_ocp.py` compiles to and this module loads from.
-CACHE = (
-    Path(os.environ.get("CRANE_PLANNING_OCP_CACHE", tempfile.gettempdir()))
-    / "crane_planning_ocp"
-)
+#: `crane_ocp`'s persistent root, not `$TMPDIR` -- a deliberate export has to
+#: survive a tmp sweep, or the next node start refuses instead of starting.
+CACHE = ox.export_base(EXPORT_ENV, EXPORT_LEAF)
 
 TOOL = "pzs100"
 DESCRIPTION = "pzs100.urdf"

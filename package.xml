@@ -17,6 +17,10 @@
        `crane_model.symbolic`'s own CasADi graph. -->
   <depend>crane_model</depend>
   <depend>crane_msgs</depend>
+  <!-- `crane_planning/ocp.py` resolves the export root through
+       `crane_ocp_export`, shared with `crane_mpc`, so it is a runtime
+       dependency and not the exporter's source-tree import it used to be. -->
+  <exec_depend>crane_ocp</exec_depend>
   <!-- CasADi vectorizes the passive-dynamics rollout and actuator checks. -->
   <depend>casadi</depend>
   <!-- `~/solver_stats`: what the OCP did, converged or not. -->
