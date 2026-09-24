@@ -352,7 +352,11 @@ def power_coefficients(path, segments: int) -> np.ndarray:
 
 def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
     """`c(sigma)` and derivatives, from the coefficients the solver holds; mirrors `path_expression` (not the spline) so reported equals constrained."""
-    sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+    # `sigma` clamped, not just the segment index: outside [0, 1] a clipped index still
+    # evaluates the end segment's quintic at a `local` past its span, i.e. extrapolates off
+    # the certified curve. Callers reach here with a reconstruction that can overshoot 1
+    # (`actuated_samples`' quartic Taylor) or with a caller-supplied grid (`node._joint_path`).
+    sigma = np.clip(np.atleast_1d(np.asarray(sigma, dtype=float)), 0.0, 1.0)
     segments = coefficients.shape[0]
     index = np.clip(np.floor(sigma * segments).astype(int), 0, segments - 1)
     local = sigma - index / segments

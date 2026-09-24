@@ -31,6 +31,15 @@ def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
     )
 
 
+def unclamped(coefficients, sigma) -> np.ndarray:
+    """`evaluate` as it was before the `sigma` clamp: segment index clipped, `sigma` not."""
+    sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+    segments = coefficients.shape[0]
+    index = np.clip(np.floor(sigma * segments).astype(int), 0, segments - 1)
+    local = sigma - index / segments
+    return sum(local[:, None] ** m * coefficients[index, m, :] for m in range(ORDER))
+
+
 def recovered_sigma(row: np.ndarray) -> float:
     """`sigma` read back off coordinate 0, monotone over `[0, 1]`."""
     dense = np.linspace(0.0, 1.0, 200001)
@@ -61,6 +70,29 @@ def test_the_chord_would_fail_this():
         for row in chord
     )
     assert worst > 1e-3
+
+
+def test_a_reconstruction_past_the_end_stops_at_the_curves_endpoint():
+    """`sigma` is reconstructed, so it overshoots 1; past the end is the end, not more curve."""
+    past = np.array([1.0, 1.0 + 1e-9, 1.01, 1.3])
+    endpoint = evaluate(COEFFICIENTS, 1.0)[0]
+    assert evaluate(COEFFICIENTS, past) == pytest.approx(
+        np.tile(endpoint, (past.size, 1))
+    )
+    assert evaluate(COEFFICIENTS, [-0.2, 0.0]) == pytest.approx(
+        np.tile(evaluate(COEFFICIENTS, 0.0)[0], (2, 1))
+    )
+    # Oracle discriminates: extrapolating the final quintic leaves the curve outright.
+    assert np.max(np.abs(unclamped(COEFFICIENTS, 1.3) - endpoint)) > 0.1
+
+
+def test_the_published_joint_path_is_unchanged_by_the_clamp():
+    """`/crane/joint_path` samples inside [0, 1], so the clamp may not move one of them."""
+    node = pytest.importorskip("crane_planning.node")
+    places = np.linspace(0.0, 1.0, node.PATH_SAMPLES)
+    assert evaluate(COEFFICIENTS, places) == pytest.approx(
+        unclamped(COEFFICIENTS, places), abs=0.0
+    )
 
 
 def test_velocities_are_the_derivative_of_the_positions_emitted():
