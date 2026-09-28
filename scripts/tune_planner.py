@@ -11,7 +11,7 @@ the two against each other.
 
 Start is crane_model.presets.OUTSIDE. Planned axes are driven onto the
 reference with resistance cancelled -- as close to ideal as the plant allows;
-the controller is crane_mpc/scripts/tune_mpc.py, hydraulics are in neither.
+the controller is crane_mpc/scripts/trials/wire_chain.py, hydraulics are in neither.
 """
 
 from __future__ import annotations
@@ -45,9 +45,8 @@ def plan_arguments(parser: argparse.ArgumentParser) -> None:
     """
     Every flag plan_for/plan_example.configure read, no other.
 
-    tune_mpc.py calls this too, so the two can't drift on what a flag means.
-    --output/--show stay out: it forwards unknown flags to mpc_a2b, which
-    owns those.
+    crane_mpc's trials/harness.py calls this too, so the two can't drift on
+    what a flag means.
     """
     parser.add_argument(
         "--goal",
@@ -146,8 +145,8 @@ def plan_for(options) -> tuple[str, Planner, Start, object]:
     """
     Build the planner, solve the preset move, say what came out.
 
-    Shared with crane_mpc/scripts/tune_mpc.py, which tunes the controller
-    against the same plan this tunes the shaping of.
+    Shared with crane_mpc/scripts/trials/wire_chain.py, which runs the
+    controller against the same plan this tunes the shaping of.
     """
     description = plan_example.description()
     planner = Planner(description, plan_example.configure(options))
