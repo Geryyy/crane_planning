@@ -40,6 +40,11 @@ PAYLOAD_ID = "payload"
 #: Two passive hinges tool hangs on, in `q_sway_max`/`PASSIVE_INDICES` order, 0.223 m apart.
 PASSIVE_PIVOTS = (Frame.TIP, Frame.TILT)
 
+#: Smallest sway cell `_swept` splits to, half-width in rad: its corners then move a
+#: swinging point at most ~0.04 m for a gripped CBS block.
+MIN_SWAY_CELL = 0.0125
+SWAY_QUADRANTS = ((-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0))
+
 
 # ------------------------------------------------------------------ the scene
 
@@ -164,7 +169,10 @@ class Geometry:
         self.q_tool = float(q_tool)
         self.payload = payload
         self.payload_shape = payload_shape
+        #: What the carried body's row was nearest, from the last distance query.
+        self.partners: dict[str, str] = {}
         self.envelope = self._envelope()
+        self.levers = self._levers()
         self.required_rigid = float(config.margin_safety) + float(config.margin_interp)
         self.required = self.required_rigid + self.envelope
         self.radii = self._radii()
@@ -291,6 +299,9 @@ class Geometry:
         scene_rows = results[: len(bodies)]
         if any(row.minimum_distance_m <= 0.0 for row in results[len(bodies) :]):
             return None
+        self.partners = {
+            body.id: row.other_id for body, row in zip(bodies, scene_rows, strict=True)
+        }
         return {
             body.id: row.minimum_distance_m
             for body, row in zip(bodies, scene_rows, strict=True)
@@ -324,6 +335,76 @@ class Geometry:
         q = self.configuration(q_a)
         return self._decide(q, self._distances(q, scene=scene), scene)
 
+    def _levers(self) -> np.ndarray:
+        """
+        Farthest a swinging point sits from each hinge, bounds not estimates.
+
+        Tilt's is rigid; tip's `|TIP -> TCP|` bends with tilt, so it is bounded by
+        `|TIP -> TILT| + |TILT -> TCP|` instead of read at one tilt. Past TCP, the
+        larger of carried reach and `tool_radius` (as `_radii`): the rails' boxes reach
+        well past TCP, which `_envelope`'s estimate leaves out.
+        """
+        q = np.zeros(GENERALIZED_DOF)
+        q[TOOL_INDEX] = self.q_tool
+        tip, tilt, tcp = (
+            self.model.forward_kinematics(q, Frame.MOUNTING_BASE, frame).position_m
+            for frame in (Frame.TIP, Frame.TILT, Frame.TCP)
+        )
+        below_tilt = float(np.linalg.norm(tcp - tilt)) + max(
+            self._carried_reach(), float(self.config.tool_radius)
+        )
+        return np.array([float(np.linalg.norm(tilt - tip)) + below_tilt, below_tilt])
+
+    def _swept(self, q: np.ndarray, scene) -> tuple[float, str | None]:
+        """
+        Swinging half's clearance over the whole sway box, certified lower bound.
+
+        Branch and bound on sway cells: a cell is cleared by its centre's distance
+        minus how far its corners move any swinging point -- lever times half-width
+        per hinge, summed, since the two rotations' displacements need not be
+        orthogonal. Only cells near a body split, down to `MIN_SWAY_CELL`. The ball
+        this replaces charged the whole box in every direction: 0.71 m for a gripped
+        CBS block that sweeping moves 0.06 m nearer the block beside it.
+        """
+        passive = list(PASSIVE_INDICES)
+        hanging = q[passive].copy()
+        cells = [(np.zeros(2), np.abs(np.asarray(self.config.q_sway_max, dtype=float)))]
+        worst, label = np.inf, None
+        while cells:
+            offset, half = cells.pop()
+            swung = q.copy()
+            swung[passive] = hanging + offset
+            body, distance = self._nearest(
+                self._distances(swung, swinging=True, scene=scene)
+            )
+            if distance == -np.inf:
+                return -np.inf, None
+            bound = distance - float(self.levers @ half)
+            if bound > self.required_rigid:
+                if bound < worst:
+                    worst, label = bound, self._label(body)
+                continue
+            if np.max(half) <= MIN_SWAY_CELL:
+                return bound, self._label(body)
+            half = 0.5 * half
+            cells += [(offset + half * np.array(sign), half) for sign in SWAY_QUADRANTS]
+        return worst, label
+
+    @staticmethod
+    def _cap_by_carried(bounds: dict, distances: dict | None, queried) -> None:
+        """Bound each queried body by the carried body's row, which was measured against it."""
+        if not distances or PAYLOAD_ID not in distances:
+            return
+        for body in queried:
+            bounds[body.id] = min(bounds[body.id], distances[PAYLOAD_ID])
+
+    def _label(self, body: str | None) -> str | None:
+        """Carried body's row names what it is nearest: another body, or the machine."""
+        if body != PAYLOAD_ID:
+            return body
+        partner = self.partners.get(PAYLOAD_ID, PAYLOAD_ID)
+        return f"{PAYLOAD_ID} against {'the machine' if partner == PAYLOAD_ID else partner}"
+
     def _decide(self, q: np.ndarray, distances: dict | None, scene) -> tuple:
         """
         `(clearance, required, body)` for one set of measured distances.
@@ -333,19 +414,17 @@ class Geometry:
         if distances is None:
             return -np.inf, self.required, None
         body, hanging = self._nearest(distances)
+        label = self._label(body)
         if hanging > self.required:
-            return hanging, self.required, body
+            return hanging, self.required, label
         if hanging <= self.required_rigid:
             # inside both margins with something: no split can pass it
-            return hanging, self.required_rigid, body
-        # one more query not two: hanging is the smaller half, swinging clear of required leaves
-        # rigid clear at hanging
-        swinging_body, swinging = self._nearest(
-            self._distances(q, swinging=True, scene=scene)
-        )
-        if swinging > self.required:
-            return hanging, self.required_rigid, body
-        return swinging, self.required, swinging_body
+            return hanging, self.required_rigid, label
+        # rigid half is clear at hanging; the swinging half owes the box it sweeps
+        swept, swept_label = self._swept(q, scene)
+        if swept > self.required_rigid:
+            return hanging, self.required_rigid, label
+        return swept, self.required_rigid, swept_label
 
     @staticmethod
     def _nearest(distances: dict | None) -> tuple[str | None, float]:
@@ -390,6 +469,10 @@ class Geometry:
         clearance, required, body = self._decide(q, bounds, None)
         if not clearance > required:
             raise PlanningError(f"the fitted path is blocked at its start by '{body}'")
+        # A body's row is the machine links' distance to it; the carried block hangs ~1 m
+        # below them, so its row bounds every body it was queried against too.
+        # Uncapped, a stack under the links' bound was pruned while the block went through it.
+        self._cap_by_carried(bounds, bounds, self.scene)
         sigma, step, count = 0.0, INITIAL_LIFT_STEP, 1
         while sigma < 1.0:
             step = min(step, 1.0 - sigma)
@@ -419,6 +502,7 @@ class Geometry:
                     f"by '{body}'"
                 )
             bounds.update(distances)
+            self._cap_by_carried(bounds, distances, near)
             previous, sigma = candidate, sigma + step
             count += 1
             if count > int(self.config.max_lift_samples):

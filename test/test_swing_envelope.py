@@ -15,6 +15,7 @@ from crane_model import (
     Frame,
     Tool,
 )
+from crane_model import PASSIVE_INDICES as SWAY
 from crane_planning.config import (
     PLANNED_DOF,
     TOOL_INDEX,
@@ -200,7 +201,8 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
     )
     _shifted(scene, near_tool, np.array([0.0, -1.0, 0.0]), target)
     clearance, required, body = scene.margin(np.zeros(PLANNED_DOF))
-    assert required == pytest.approx(scene.required)
+    # refused on the swept bound against the rigid margins: the wall is beside the tool
+    assert required == pytest.approx(scene.required_rigid)
     assert clearance < required
     assert body == "near_tool"
     assert not scene.is_valid(np.zeros(PLANNED_DOF))
@@ -256,3 +258,60 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
     with pytest.raises(Exception, match="blocked at sigma"):
         scene.check_path(_Line(np.zeros(PLANNED_DOF), [1.3, 0.0, 0.0, 0.0, 0.0]))
     assert any("far" in bodies for bodies in queried[1:])
+
+
+CBS_BLOCK = ("cylinder", np.array([0.6, 0.6, 0.9]), np.array([-0.003, 0.001, 1.048]))
+
+
+def _block_near(direction, target: float) -> Geometry:
+    """Gripped CBS block, a second one `target` from it along `direction` at hanging."""
+    scene = geometry(CBS_BLOCK)
+    carried = payload_primitive(
+        scene.model, scene.configuration(np.zeros(PLANNED_DOF)), CBS_BLOCK
+    )
+    along = np.asarray(direction, dtype=float)
+    neighbour = CollisionPrimitive(
+        id="block_1",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(
+            np.eye(3), carried.pose_in_mounting_base.translation + 3.0 * along
+        ),
+        dimensions_m=np.array([0.6, 0.6, 0.6]),
+    )
+    scene.scene = [neighbour]
+    # payload-to-machine (0.99 m) is the nearest row until the neighbour closes in
+    for _ in range(20):
+        gap = scene.clearance(np.zeros(PLANNED_DOF)) - target
+        if abs(gap) < 1e-4:
+            return scene
+        neighbour.pose_in_mounting_base.translation -= along * gap
+    raise AssertionError("neighbour never settled at the target clearance")
+
+
+@pytest.mark.parametrize(
+    ("direction", "clear"), [((0.0, 0.0, -1.0), True), ((1.0, 0.0, 0.0), False)]
+)
+def test_sway_is_charged_where_it_swings_not_as_a_ball(direction, clear):
+    """0.33 m from a neighbour: below, a swing only lifts the block (live lift refused
+    against the 0.86 m ball); beside, the box swings it 0.3 m across and must refuse."""
+    scene = _block_near(direction, 0.33)
+    assert scene.clearance(np.zeros(PLANNED_DOF)) < scene.required
+    assert scene.is_valid(np.zeros(PLANNED_DOF)) is clear
+    if not clear:
+        assert "block_1" in scene.margin(np.zeros(PLANNED_DOF))[2]
+
+
+def test_swept_bound_never_exceeds_the_swept_distance():
+    """The certificate: no sway inside the box comes nearer than `_swept` claims."""
+    scene = _block_near((0.7, 0.0, -0.7), 0.4)
+    q = scene.configuration(np.zeros(PLANNED_DOF))
+    bound, _ = scene._swept(q, scene.scene)
+    box = np.abs(scene.config.q_sway_max)
+    nearest = np.inf
+    for a in np.linspace(-box[0], box[0], 21):
+        for b in np.linspace(-box[1], box[1], 21):
+            swung = q.copy()
+            swung[list(SWAY)] += (a, b)
+            distances = scene._distances(swung, swinging=True, scene=scene.scene)
+            nearest = min(nearest, min(distances.values()))
+    assert bound <= nearest
