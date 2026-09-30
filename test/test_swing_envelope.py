@@ -260,7 +260,11 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
     assert any("far" in bodies for bodies in queried[1:])
 
 
-CBS_BLOCK = ("cylinder", np.array([0.6, 0.6, 0.9]), np.array([-0.003, 0.001, 1.048]))
+CBS_BLOCK = (
+    "cylinder",
+    np.array([1.082, 1.082, 0.6]),
+    np.array([-0.003, 0.001, 1.048]),
+)
 
 
 def _block_near(direction, target: float) -> Geometry:
