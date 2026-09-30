@@ -278,6 +278,21 @@ def row_excess(rows, lh, uh, sigma, speed) -> float:
     )
 
 
+#: `h` rows in the order `solve` stacks them; planned axes in `K_PLANNED_ROWS` order.
+ROW_NAMES = ("sway tip", "sway tilt", "pump flow") + tuple(
+    f"{kind} {axis}"
+    for kind in ("velocity", "acceleration", "command")
+    for axis in ("slew", "boom", "arm", "telescope", "rotator")
+)
+
+
+def worst_row(rows, lh, uh) -> str:
+    """Name and node of the `h` row furthest past its bound: the refusal has to say which."""
+    over = np.maximum(rows - uh, lh - rows)
+    node, column = np.unravel_index(int(np.argmax(over)), over.shape)
+    return f"{ROW_NAMES[column]} at node {node}, {float(over[node, column]):+.1e}"
+
+
 def solver_stats(solver, status: int, elapsed: float, residuals=None) -> dict:
     """One solve as flat named numbers for `~/solver_stats`, built once before the outcome branches (regress on iteration counts/residuals, never time -- load-bound); QP status is its own key since acados reports a QP that merely hit HPIPM's limit as success. `residuals` is passed in by `solve` so the recomputed ones reach the report; the stale `get_stats` pair is the fallback."""
     qp_iterations = np.asarray(solver.get_stats("qp_iter"), dtype=float)
@@ -1117,7 +1132,8 @@ class TrajectoryOcp:
                 f"the trajectory OCP did not converge: acados status {status} after "
                 f"{int(stats['sqp_iterations'])} iterations, {elapsed:.2f} s, on "
                 f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}, "
-                f"worst row {excess:+.1e} of its bound",
+                f"worst row {excess:+.1e} of its bound; worst h row "
+                f"{worst_row(rows[:N], lh, uh)}",
                 stats=stats,
             )
         if guard > 0.99:

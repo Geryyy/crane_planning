@@ -176,13 +176,28 @@ class Geometry:
         return scene if carried is None else scene + [carried]
 
     def _carried_reach(self) -> float:
-        """How far past TCP carried body reaches, in metres."""
+        """
+        How far past TCP carried body reaches, in metres.
+
+        Farthest carried point from TCP: centre (`offset` is from K8, as
+        `payload_primitive` places it) plus half the extents' diagonal. The full
+        diagonal taken from K8 asked a gripped block for 1.05 m where 0.86 is owed.
+        """
         if self.payload_shape is None:
             return 0.0
         _shape, dimensions, offset = self.payload_shape
+        q = np.zeros(GENERALIZED_DOF)
+        q[TOOL_INDEX] = self.q_tool
+        k8 = self.model.forward_kinematics(
+            q, Frame.MOUNTING_BASE, Frame.ROTATOR_LOWER_PART
+        )
+        tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
+        tcp_in_k8 = pin.XYZQUATToSE3(
+            np.concatenate([k8.position_m, k8.orientation_xyzw])
+        ).actInv(tcp.position_m)
         return float(
-            np.linalg.norm(np.asarray(offset, dtype=float))
-            + np.linalg.norm(np.asarray(dimensions, dtype=float))
+            np.linalg.norm(np.asarray(offset, dtype=float) - tcp_in_k8)
+            + 0.5 * np.linalg.norm(np.asarray(dimensions, dtype=float))
         )
 
     def _envelope(self) -> float:

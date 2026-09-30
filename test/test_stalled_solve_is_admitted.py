@@ -7,7 +7,7 @@ from crane_model import Frame, presets
 from crane_planning import weights as crane_weights
 from crane_planning.config import PLANNED_INDICES, PlannerConfig
 from crane_planning.geometry import yaw_of
-from crane_planning.ocp import SLACK_SPENT, row_excess
+from crane_planning.ocp import NH, ROW_NAMES, SLACK_SPENT, row_excess, worst_row
 from crane_planning.planner import Planner, Start
 from test_jerk_bound import description
 
@@ -35,6 +35,14 @@ def test_row_excess_refuses_what_the_bookkeeping_would_not_see():
     # v < 0 runs the machine backwards along its own curve
     back = np.array([0.0, -0.4, 0.1, 0.0])
     assert row_excess(np.zeros((4, 3)), lh, uh, sigma, back) == pytest.approx(0.4)
+
+
+def test_the_refusal_names_the_row_it_broke():
+    """A non-converged plan 27% past "its bound" left the operator guessing which one."""
+    assert len(ROW_NAMES) == NH
+    rows = np.zeros((4, NH))
+    rows[3, ROW_NAMES.index("pump flow")] = 1.27
+    assert worst_row(rows, -np.ones(NH), np.ones(NH)).startswith("pump flow at node 3")
 
 
 def test_the_here_preset_plans_and_names_how_it_was_admitted():

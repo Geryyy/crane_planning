@@ -1,5 +1,6 @@
 """`Geometry.envelope` must bound the swing of both passive hinges, not one."""
 
+from itertools import product
 from pathlib import Path
 
 import numpy as np
@@ -21,11 +22,11 @@ from crane_planning.config import (
     passive_equilibrium,
     read_limits,
 )
-from crane_planning.geometry import Geometry
+from crane_planning.geometry import Geometry, payload_primitive
 from crane_planning.planner import payload_parameters
 
 Q_TOOL = 0.35
-#: (shape, dimensions, offset), roughly CBS block size
+#: (shape, dimensions, offset from K8), small block
 PAYLOAD_SHAPE = ("box", np.array([0.40, 0.20, 0.20]), np.array([0.0, 0.0, -0.30]))
 
 
@@ -107,6 +108,23 @@ def test_envelope_bounds_both_hinges(payload_shape):
     )
     assert scene.envelope >= swing
     assert scene.envelope <= 1.05 * swing
+
+
+def test_a_gripped_block_owes_its_own_extent_not_the_k8_drop():
+    """Reach is the farthest corner from TCP, half a diagonal past the centre: the
+    full one refused a lift clearing 0.99 m against 1.05 m."""
+    shape = ("cylinder", np.array([0.6, 0.6, 0.9]), np.array([-0.003, 0.001, 1.048]))
+    scene = geometry(shape)
+    carried = payload_primitive(
+        scene.model, scene.configuration(np.zeros(PLANNED_DOF)), shape
+    )
+    corners = [
+        carried.pose_in_mounting_base.act(0.5 * np.asarray(signs) * shape[1])
+        for signs in product((-1.0, 1.0), repeat=3)
+    ]
+    farthest = max(np.linalg.norm(corner - _tcp(scene)) for corner in corners)
+    assert scene._carried_reach() >= farthest
+    assert scene.required < 0.99
 
 
 def test_upper_hinge_carries_the_longer_lever():
