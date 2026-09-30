@@ -33,7 +33,7 @@ NY_E = sum(width for _, width in TERMINAL_BLOCKS)
 
 
 #: What shipped `config/crane_planner.yaml` carries, and what a node falls back to.
-#: `time` is the measured ceiling above which solve asks for more pump than exists.
+#: `time` is bounded by terminal sway, not by the pump -- that yaml's `weights` block.
 DEFAULTS = {
     "dq_a": 1.0,
     "sway": 1.0,

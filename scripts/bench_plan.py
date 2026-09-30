@@ -189,6 +189,28 @@ def emit_requests(planner: Planner, path: Path, moves) -> None:
     print(f"wrote {len(requests)} requests to {path}")
 
 
+def utilisation(planner: Planner, timing) -> dict:
+    """
+    How close the answer came to each row, as a fraction of the row's own limit.
+
+    Fraction of the *limit*, not of the bound the solve was given: those differ
+    by `kappa` (and `speed_scale`), so 0.8 is a rate row sitting on its bound.
+    Pump is already carried as a fraction, with its bound beside it.
+    """
+    config = planner.config
+    return {
+        "dq": float(np.max(np.abs(timing.dq_a) / planner.limits.dq_max)),
+        "ddq": float(np.max(np.abs(timing.ddq_a) / np.asarray(config.ddq_a_max))),
+        "sway": float(
+            np.max(np.abs(timing.q_u - timing.q_u_eq) / np.asarray(config.q_sway_max))
+        ),
+        "pump": float(np.max(timing.pump_flow)),
+        "pump_bound": float(timing.pump_flow_bound),
+        "terminal_sway": timing.terminal_sway,
+        "status": float(timing.stats["acados_status"]),
+    }
+
+
 def run(planner: Planner, move, speed_scale: float) -> dict | None:
     """One planned move, per-phase seconds plus what the solve reported."""
     _name, start_q, goal_q = move
@@ -212,6 +234,7 @@ def run(planner: Planner, move, speed_scale: float) -> dict | None:
     record["acados"] = plan.timing.acados_time_s
     record["iterations"] = plan.timing.iterations
     record["duration"] = plan.timing.duration
+    record.update(utilisation(planner, plan.timing))
     return dict(record)
 
 
@@ -247,10 +270,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument(
-        "--time-weight",
-        type=float,
-        default=None,
-        help="override weights.time; only has effect since the W cost_set fix",
+        "--weight",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="override one cost weight, repeatable (e.g. --weight dq_a=0.3); "
+        "only has effect since the W cost_set fix",
     )
     parser.add_argument(
         "--kappa",
@@ -286,8 +311,11 @@ def main() -> int:
     if options.kappa is not None:
         config.kappa = options.kappa
     weights = dict(crane_weights.DEFAULTS)
-    if options.time_weight is not None:
-        weights["time"] = options.time_weight
+    for override in options.weight:
+        key, _, value = override.partition("=")
+        if key not in weights:
+            raise SystemExit(f"no cost weight named {key!r}")
+        weights[key] = float(value)
     built = time.perf_counter()
     planner = Planner(description(), config, weights)
     print(f"planner built in {time.perf_counter() - built:.1f} s")
@@ -301,24 +329,41 @@ def main() -> int:
     run(planner, moves[0], options.speed_scale)
 
     samples: dict = defaultdict(list)
+    # Utilisation beside duration: a move that got faster by spending a row it
+    # was nowhere near is a different answer from one that hit the row.
+    print(
+        f"\n{'move':<14} {'dur s':>6} {'iter':>5} {'st':>3} "
+        f"{'dq':>5} {'ddq':>5} {'pump':>5} {'sway':>5} {'term':>6}"
+    )
     for move in moves:
         per_move: dict = defaultdict(list)
         for _ in range(options.repeats):
             answer = run(planner, move, options.speed_scale)
             if "refused" in answer:
-                print(f"{move[0]:<12} refused: {answer['refused']}")
+                print(f"{move[0]:<14} refused: {answer['refused']}")
                 break
             for key, value in answer.items():
                 per_move[key].append(value)
                 samples[key].append(value)
         if per_move:
+
+            def median(key: str, rows=per_move) -> float:
+                return float(np.median(rows[key]))
+
             print(
-                f"{move[0]:<12} {float(np.median(per_move['total'])):6.3f} s over "
-                f"{len(per_move['total'])} runs, "
-                f"{float(np.median(per_move['duration'])):5.2f} s trajectory, "
-                f"{int(np.median(per_move['iterations']))} iterations"
+                f"{move[0]:<14} {median('duration'):6.2f} "
+                f"{int(median('iterations')):5d} {int(median('status')):3d} "
+                f"{median('dq'):5.2f} {median('ddq'):5.2f} "
+                f"{median('pump'):5.2f} {median('sway'):5.2f} "
+                f"{np.degrees(median('terminal_sway')):6.2f}"
             )
     if samples:
+        print(
+            "dq/ddq/pump/sway are fractions of the limit; the solve's own bound "
+            f"is kappa = {planner.config.kappa} on the rate rows, "
+            f"{float(np.median(samples['pump_bound'])):.2f} on the pump. "
+            "`term` is terminal sway in deg, `st` the acados status"
+        )
         report(samples)
     return 0
 
