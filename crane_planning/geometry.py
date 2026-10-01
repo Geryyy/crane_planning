@@ -365,7 +365,23 @@ class Geometry:
         orthogonal. Only cells near a body split, down to `MIN_SWAY_CELL`. The ball
         this replaces charged the whole box in every direction: 0.71 m for a gripped
         CBS block that sweeping moves 0.06 m nearer the block beside it.
+
+        One search per body: the carried row is a minimum over every partner, so a
+        shared search splits all bodies' queries down to the nearest one's cells --
+        live, 14 bodies x ~40 cells, 80% of a 11 s carry plan.
         """
+        scene = self.scene if scene is None else list(scene)
+        worst, label = np.inf, None
+        for body in scene or [None]:
+            bound, name = self._swept_one(q, [] if body is None else [body])
+            if bound <= self.required_rigid:
+                return bound, name
+            if bound < worst:
+                worst, label = bound, name
+        return worst, label
+
+    def _swept_one(self, q: np.ndarray, scene: list) -> tuple[float, str | None]:
+        """`_swept` against `scene` alone."""
         passive = list(PASSIVE_INDICES)
         hanging = q[passive].copy()
         cells = [(np.zeros(2), np.abs(np.asarray(self.config.q_sway_max, dtype=float)))]

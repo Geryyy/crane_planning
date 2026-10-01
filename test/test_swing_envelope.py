@@ -16,6 +16,7 @@ from crane_model import (
     Tool,
 )
 from crane_model import PASSIVE_INDICES as SWAY
+
 from crane_planning.config import (
     PLANNED_DOF,
     TOOL_INDEX,
@@ -320,3 +321,31 @@ def test_swept_bound_never_exceeds_the_swept_distance():
             distances = scene._distances(swung, swinging=True, scene=scene.scene)
             nearest = min(nearest, min(distances.values()))
     assert bound <= nearest
+
+
+def test_a_far_body_does_not_ride_the_near_ones_search(monkeypatch):
+    """Live: 14 bodies queried in every cell the nearest one split, 80% of a carry plan."""
+    scene = _block_near((1.0, 0.0, 0.0), 0.5)
+    q = scene.configuration(np.zeros(PLANNED_DOF))
+    far = CollisionPrimitive(
+        id="far",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), np.array([-20.0, 0.0, 0.0])),
+        dimensions_m=np.array([1.0, 1.0, 1.0]),
+    )
+    queried = []
+    real = scene.model.collision_queries
+
+    def counting(q, bodies, swinging=None):
+        queried.extend(body.id for body in bodies)
+        return real(q, bodies, swinging)
+
+    monkeypatch.setattr(scene.model, "collision_queries", counting)
+    alone = scene._swept(q, scene.scene)
+    scene._swept(q, [])
+    # Each search carries the block-against-machine row; the far body costs that, not
+    # the near body's cells.
+    machine = queried.count("payload") - queried.count("block_1")
+    scene._swept(q, scene.scene + [far])
+    assert queried.count("far") == machine
+    assert scene._swept(q, scene.scene + [far]) == alone
