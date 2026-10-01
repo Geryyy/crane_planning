@@ -125,7 +125,8 @@ def test_a_gripped_block_owes_its_own_extent_not_the_k8_drop():
     ]
     farthest = max(np.linalg.norm(corner - _tcp(scene)) for corner in corners)
     assert scene._carried_reach() >= farthest
-    assert scene.required < 0.99
+    # the old |offset| + full diagonal, whatever the sway box makes of it
+    assert scene._carried_reach() < np.linalg.norm(shape[2]) + np.linalg.norm(shape[1])
 
 
 def test_upper_hinge_carries_the_longer_lever():
