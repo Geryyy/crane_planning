@@ -39,6 +39,7 @@ from .ocp import SLACK_SPENT, SolverNotExported, evaluate
 from .planner import (
     PASSIVE_INDICES,
     PLANNED_INDICES,
+    REST_VELOCITY,
     TOOL_INDEX,
     CollisionPrimitive,
     Planner,
@@ -326,7 +327,15 @@ class CranePlanner(Node):
             # Sway without rate: zero is honest only when the array is truly absent.
             if passive.velocity:
                 dq_u[slot] = passive.velocity[where]
-        return Start(q=q, dq_a=dq_a, dq_u=dq_u)
+        # A load at rest hangs at its equilibrium; one the model puts elsewhere is held there
+        # by a force it does not have (wind, 300 N: 1.7 deg), and closing that "sway" asked
+        # 1.48 of the pump (sim wall run 93). Only a load that moves is a swing to plan for.
+        return Start(
+            q=q,
+            dq_a=dq_a,
+            dq_u=dq_u,
+            passive_measured=bool(np.max(np.abs(dq_u)) >= REST_VELOCITY),
+        )
 
     def _primitives(self, avoid_collisions: bool) -> list:
         if self.scene is None:

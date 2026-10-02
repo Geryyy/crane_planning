@@ -877,9 +877,15 @@ class TrajectoryOcp:
         payload: np.ndarray,
         q_tool: float,
         speed_scale: float,
+        duration_min: float | None = None,
     ) -> Trajectory:
-        """Solve one request, or refuse with what the solver said."""
+        """
+        Solve one request, or refuse with what the solver said.
+
+        `duration_min` raises the configured duration floor for this solve only.
+        """
         cfg, lim, N = self.config, self.limits, self.N
+        floor = cfg.ocp_duration_min if duration_min is None else duration_min
         solver, big = self.solver, 1.0e6
         # `CalcMovement.slow_down` divides qDotMax/qDDotMax/qDDDotMax alike; s**2 on acceleration
         # would remove the authority to cancel sway at the (fixed) pendulum frequency, so rate/accel
@@ -891,7 +897,7 @@ class TrajectoryOcp:
         command_lo = cfg.kappa * cfg.command_u_min / reference
         command_hi = cfg.kappa * cfg.command_u_max / reference
         flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
-        theta = np.array([cfg.ocp_duration_min, cfg.ocp_duration_max]) / self.nominal
+        theta = np.array([floor, cfg.ocp_duration_max]) / self.nominal
 
         speed_start, unrepresentable = self.start_speed(coefficients, dq_a_start)
         # 1e-6 rad/s is measurement noise; above it, projecting silently would put the solve on a
@@ -977,9 +983,7 @@ class TrajectoryOcp:
         # iter 1), since what sets 16s is sway rows, not a kinematic ceiling. `speed_scale` known:
         # half speed roughly doubles duration, so the guess carries it.
         duration_guess = float(
-            np.clip(
-                self.nominal / speed_scale, cfg.ocp_duration_min, cfg.ocp_duration_max
-            )
+            np.clip(self.nominal / speed_scale, floor, cfg.ocp_duration_max)
         )
         chain = None
         if INITIAL_GUESS == "PATH_PROFILE":
@@ -992,9 +996,7 @@ class TrajectoryOcp:
             )
         if chain is not None:
             sigma_guess, speed_guess, accel_guess, duration_guess = chain
-            duration_guess = float(
-                np.clip(duration_guess, cfg.ocp_duration_min, cfg.ocp_duration_max)
-            )
+            duration_guess = float(np.clip(duration_guess, floor, cfg.ocp_duration_max))
         else:
             sigma_guess = np.linspace(0.0, 1.0, N + 1)
             speed_guess = np.full(N + 1, 1.0 / duration_guess)

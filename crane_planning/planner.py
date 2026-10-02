@@ -55,6 +55,8 @@ from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coeffic
 #: rad/s (m/s telescope). Below = rest. Measured standing noise: rms .002-.005, max
 #: .0126 rad/s; old 1e-3 was under that floor (noise read as motion, plans died in QP1).
 REST_VELOCITY = 2e-2
+#: Duration floor of the pump retry, as a multiple of the duration that bought pump slack.
+PUMP_RETRY_STRETCH = 1.25
 
 #: m, rad. How far past a limit a start coordinate may sit and still be planned from.
 #: Telescope creeps past its stop each move; clamped (not tolerated) since IK/fit/OCP
@@ -268,7 +270,7 @@ class Planner:
             )
 
         # Solve only times the certified curve; what executes is what geometry proved clear.
-        timing = self.ocp.solve(
+        solve = dict(
             coefficients=power_coefficients(path, self.ocp.segments),
             q_u_start=q_u_start,
             dq_a_start=dq_a_start,
@@ -277,6 +279,17 @@ class Planner:
             q_tool=start.q_tool,
             speed_scale=speed_scale,
         )
+        timing = self.ocp.solve(**solve)
+        # From a swinging start the SQP can settle on a short local minimum that buys pump
+        # slack (7.7 s, peak 1.47) while a slower answer meets the pump (10.2 s): one retry
+        # with the duration floored past the bought one (wall run 96, reproduced offline).
+        if float(np.max(timing.pump_flow)) > timing.pump_flow_bound + SLACK_SPENT:
+            timing = self.ocp.solve(
+                **solve,
+                duration_min=min(
+                    PUMP_RETRY_STRETCH * timing.duration, self.config.ocp_duration_max
+                ),
+            )
         # Sway box is soft in the OCP (priced at ocp_slack_price) though geometry
         # proved the corridor clear against q_sway_max; a converged solve could buy
         # outside the certified envelope unnoticed, so refused here, not priced higher.

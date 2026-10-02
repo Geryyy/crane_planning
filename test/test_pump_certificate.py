@@ -31,3 +31,26 @@ def test_a_bought_pump_limit_is_refused_and_a_met_one_is_not():
     assert "pump" in str(refusal.value)
     # the refusal names both numbers, so "how far over" is not a second query
     assert f"{plan.timing.pump_flow_bound:.3g}" in str(refusal.value)
+
+
+def test_a_bought_pump_limit_is_solved_again_slower_once():
+    """Wall run 96: from a swinging start the SQP stopped at 7.7 s on 1.47 of the pump
+    while 10.2 s met it. The retry floors the duration past the bought one."""
+    planner, start, position, yaw = planner_and_goal()
+    request = dict(scene=[], avoid_collisions=True)
+    clean = planner.plan(start, position, yaw, **request).timing
+    over = np.full_like(clean.pump_flow, clean.pump_flow_bound)
+    over[3] = clean.pump_flow_bound * 1.5
+    bought = dataclasses.replace(clean, pump_flow=over, slack=0.419)
+
+    floors = []
+
+    def solve(duration_min=None, **_):
+        floors.append(duration_min)
+        return bought if duration_min is None else clean
+
+    planner.ocp.solve = solve
+    plan = planner.plan(start, position, yaw, **request)
+
+    assert np.max(plan.timing.pump_flow) <= plan.timing.pump_flow_bound
+    assert floors == [None, pytest.approx(1.25 * bought.duration)]
