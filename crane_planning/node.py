@@ -329,7 +329,7 @@ class CranePlanner(Node):
                 dq_u[slot] = passive.velocity[where]
         # A load at rest hangs at its equilibrium; one the model puts elsewhere is held there
         # by a force it does not have (wind, 300 N: 1.7 deg), and closing that "sway" asked
-        # 1.48 of the pump (sim wall run 93). Only a load that moves is a swing to plan for.
+        # 1.48 of the pump. Only a load that moves is a swing to plan for.
         return Start(
             q=q,
             dq_a=dq_a,

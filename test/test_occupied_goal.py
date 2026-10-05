@@ -1,4 +1,4 @@
-"""An occupied goal is refused before any corridor is certified (sim terrain run 127: 7 min)."""
+"""An occupied goal is refused before any corridor is certified (7 min under load otherwise)."""
 
 import time
 

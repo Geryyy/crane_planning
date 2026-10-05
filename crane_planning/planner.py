@@ -227,7 +227,7 @@ class Planner:
                 f"{clearance:.3f} m against the {required:.3f} m this plan requires"
             )
         # Every candidate corridor ends here: an occupied goal is refused in 0.1 s, not after
-        # certifying 17 paths (7 min under load, sim terrain run 127).
+        # certifying 17 paths (7 min under load).
         clearance, required, body = geometry.margin(goal_q_a)
         if not clearance > required:
             raise PlanningError(
@@ -290,12 +290,16 @@ class Planner:
         timing = self.ocp.solve(**solve)
         # From a swinging start the SQP can settle on a short local minimum that buys pump
         # slack (7.7 s, peak 1.47) while a slower answer meets the pump (10.2 s): one retry
-        # with the duration floored past the bought one (wall run 96, reproduced offline).
-        if float(np.max(timing.pump_flow)) > timing.pump_flow_bound + SLACK_SPENT:
+        # with the duration floored past the bought one.
+        # Flow goes as 1/T, so the floor stretches by the overshoot: a long carried reach drew
+        # 2.1x the pump and 1.25x left every retry refused.
+        pump_peak = float(np.max(timing.pump_flow))
+        if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
+            stretch = max(PUMP_RETRY_STRETCH, pump_peak / timing.pump_flow_bound)
             timing = self.ocp.solve(
                 **solve,
                 duration_min=min(
-                    PUMP_RETRY_STRETCH * timing.duration, self.config.ocp_duration_max
+                    stretch * timing.duration, self.config.ocp_duration_max
                 ),
             )
         # Sway box is soft in the OCP (priced at ocp_slack_price) though geometry

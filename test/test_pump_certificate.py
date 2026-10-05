@@ -4,8 +4,9 @@ import dataclasses
 
 import numpy as np
 import pytest
-from crane_planning.config import PlanningError
 from test_sway_certificate import planner_and_goal
+
+from crane_planning.config import PlanningError
 
 
 def test_a_bought_pump_limit_is_refused_and_a_met_one_is_not():
@@ -34,8 +35,9 @@ def test_a_bought_pump_limit_is_refused_and_a_met_one_is_not():
 
 
 def test_a_bought_pump_limit_is_solved_again_slower_once():
-    """Wall run 96: from a swinging start the SQP stopped at 7.7 s on 1.47 of the pump
-    while 10.2 s met it. The retry floors the duration past the bought one."""
+    """From a swinging start the SQP stopped at 7.7 s on 1.47 of the pump
+    while 10.2 s met it. The retry floors the duration past the bought one, by the
+    overshoot: flow goes as 1/T, and 1.25x left a 2.1x overdraw refused."""
     planner, start, position, yaw = planner_and_goal()
     request = dict(scene=[], avoid_collisions=True)
     clean = planner.plan(start, position, yaw, **request).timing
@@ -53,4 +55,4 @@ def test_a_bought_pump_limit_is_solved_again_slower_once():
     plan = planner.plan(start, position, yaw, **request)
 
     assert np.max(plan.timing.pump_flow) <= plan.timing.pump_flow_bound
-    assert floors == [None, pytest.approx(1.25 * bought.duration)]
+    assert floors == [None, pytest.approx(1.5 * bought.duration)]
