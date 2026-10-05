@@ -226,6 +226,14 @@ class Planner:
                 f"the measured start configuration clears '{body}' by only "
                 f"{clearance:.3f} m against the {required:.3f} m this plan requires"
             )
+        # Every candidate corridor ends here: an occupied goal is refused in 0.1 s, not after
+        # certifying 17 paths (7 min under load, sim terrain run 127).
+        clearance, required, body = geometry.margin(goal_q_a)
+        if not clearance > required:
+            raise PlanningError(
+                f"the goal configuration clears '{body}' by only {clearance:.3f} m against "
+                f"the {required:.3f} m this plan requires"
+            )
 
         # Below REST_VELOCITY treat as rest (else fit pins c'(0) to noise, breaks accel bound).
         dq_a_start = np.asarray(start.dq_a, dtype=float)
