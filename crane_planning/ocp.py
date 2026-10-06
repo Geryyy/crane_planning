@@ -940,7 +940,9 @@ class TrajectoryOcp:
         lh = np.concatenate(
             [
                 -np.ones(2),
-                [0.0],
+                # Flow >= 0 by construction; a 0 floor sits on the |v| kink of every
+                # stopped node and stalled the SQP whenever the pump row was active.
+                [-1.0],
                 np.full(planned, -rate_hi),
                 np.full(planned, -accel_hi),
                 command_lo,
@@ -999,6 +1001,30 @@ class TrajectoryOcp:
             duration_guess = float(np.clip(duration_guess, floor, cfg.ocp_duration_max))
         else:
             sigma_guess = np.linspace(0.0, 1.0, N + 1)
+            # Flow is |piston velocity| x area, so under uniform progress it goes as 1/T: start
+            # where the pump allows. At 7 s a long carried reach drew 2.1x the pump and the SQP
+            # settled on a local minimum that bought it (56 iterations, then the planner's retry).
+            q_guess = evaluate(coefficients, sigma_guess)
+            dq_guess = evaluate(coefficients, sigma_guess, order=1) / duration_guess
+            peak = max(
+                float(
+                    self._flow(
+                        np.concatenate(
+                            [q, passive_equilibrium(q), dq, np.zeros(cs.K_PASSIVE_DOF)]
+                        ),
+                        np.zeros_like(dq),
+                        parameters[: cs.NP],
+                    )
+                )
+                for q, dq in zip(q_guess, dq_guess)
+            )
+            duration_guess = float(
+                np.clip(
+                    duration_guess * max(1.0, peak / cfg.pump_flow_max / flow_hi),
+                    floor,
+                    cfg.ocp_duration_max,
+                )
+            )
             speed_guess = np.full(N + 1, 1.0 / duration_guess)
             accel_guess = np.zeros(N + 1)
         solver.reset()
