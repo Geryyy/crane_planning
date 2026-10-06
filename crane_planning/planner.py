@@ -230,6 +230,11 @@ class Planner:
         # certifying 17 paths (7 min under load).
         clearance, required, body = geometry.margin(goal_q_a)
         if not clearance > required:
+            if body is None:
+                raise PlanningError(
+                    "the goal configuration cannot be measured against the scene: the "
+                    f"machine is folded into itself there (goal {goal_position_m})"
+                )
             raise PlanningError(
                 f"the goal configuration clears '{body}' by only {clearance:.3f} m against "
                 f"the {required:.3f} m this plan requires"
