@@ -574,9 +574,33 @@ def solve_ik(
     spreads restarts over telescope range (residual flat there); corridor samples
     take one restart from predecessor, keeping lift on one IK branch. Reachability
     only -- clearance is the caller's question.
+
+    An unbounded axis is **unwound** before it is handed back: see `unwound`. The
+    search window stays a full turn either side -- narrowing it to half a turn
+    instead turns the long-way-round answers into refusals (36 of 576 goal solves
+    measured), because the yaw row pins the rotator against the wall and the slew
+    then has to take the yaw up, which moves the position off target.
     """
     lower = np.where(limits.bounded, limits.lower, seed - 2.0 * np.pi)
     upper = np.where(limits.bounded, limits.upper, seed + 2.0 * np.pi)
+    seed = np.asarray(seed, dtype=float)
+    turn = ~np.asarray(limits.bounded)
+
+    def unwound(q_a):
+        """
+        Fold a continuous axis onto the turn nearest `seed`; same pose, less travel.
+
+        The whole kinematics is 2pi-periodic in the rotator (a URDF `continuous`
+        joint, carried as cos/sin), so the fold is exact and only drops surplus
+        turns. Gauss-Newton on a wrapped yaw residual happily takes the long way
+        round -- measured 36 of 576 goal solves past pi, worst 3.55 rad -- and the
+        surplus is carried into the next move's seed, so the turn count walks.
+        Issue 213 saw a goal at 4.761 rad where -1.522 is the same angle.
+        """
+        q_a = np.asarray(q_a, dtype=float).copy()
+        delta = q_a[turn] - seed[turn]
+        q_a[turn] = seed[turn] + np.arctan2(np.sin(delta), np.cos(delta))
+        return q_a
 
     def residual(q_a):
         try:
@@ -652,7 +676,7 @@ def solve_ik(
         values = residual(current)
         for _ in range(8):
             if accepted(values):
-                return current
+                return unwound(current)
             try:
                 update = np.linalg.lstsq(jacobian(current), -values, rcond=None)[0]
             except np.linalg.LinAlgError:
@@ -687,7 +711,7 @@ def solve_ik(
         # inside tolerance: not a local minimum. Returned outright, not via `best`,
         # which mixes metres/radians in one norm while acceptance is two scalars
         if accepted(answer.fun):
-            return answer.x
+            return unwound(answer.x)
 
     final = residual(best)
     position_error = float(np.linalg.norm(final[:3]))
@@ -701,7 +725,7 @@ def solve_ik(
             f"(tolerances {config.eps_pos * 1e3:.1f} mm, "
             f"{np.degrees(config.eps_yaw):.2f} deg)"
         )
-    return best
+    return unwound(best)
 
 
 # ---------------------------------------------------------- geometric candidates
