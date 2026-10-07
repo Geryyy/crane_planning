@@ -6,7 +6,14 @@ from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 import numpy as np
-from crane_model import ACTUATED_INDICES, Frame, Tool, hydraulic_limits, parse
+from crane_model import (
+    ACTUATED_INDICES,
+    CraneModelError,
+    Frame,
+    Tool,
+    hydraulic_limits,
+    parse,
+)
 from crane_model.conventions import (
     CONTROL_SAFE_AXES,
     canonical_joints,
@@ -294,7 +301,39 @@ def passive_equilibrium(q_a: np.ndarray) -> np.ndarray:
     """
     Return where the tool hangs, in closed form.
 
-    Tip absorbs boom accumulation, tilt fixed; good to 1e-4 rad vs the
-    grid-Newton solve replaced, 22.6 ms vs two subtractions.
+    Tip absorbs boom accumulation, tilt fixed. Exact for no payload or a centre
+    of mass on the tool axis -- 2e-12 against `CraneModel.passive_equilibrium`
+    over the whole box -- for two subtractions against its 1.7 ms. An off-axis
+    centre moves the real equilibrium (0.03 rad for a measured crooked grip, as
+    wide as the terminal settled box), which is what `settled_offset` adds.
     """
     return np.array([0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi])
+
+
+def settled_offset(model, payload, q_tool: float):
+    """
+    Return `(q_a) -> q_u shift` the payload moves the hanging pose by.
+
+    Zero without a valid payload, so the no-payload path stays the closed form.
+    The shift turns with the rotator and with nothing else (measured: slewing,
+    boom, arm, telescope and the tool coordinate move it by 0), so it is not one
+    constant along a path that rotates.
+
+    Zero too where the numeric solve finds no hanging pose inside the passive
+    range -- the boom-low/arm-low corner, ~2% of the box, where the closed form
+    puts the tip past its own stop. Refusing there would retire poses that plan
+    today; the closed form stands, as it did before.
+    """
+    if payload is None or not getattr(payload, "valid", False):
+        return lambda q_a: np.zeros(2)
+
+    def offset(q_a: np.ndarray) -> np.ndarray:
+        q_a = np.asarray(q_a, dtype=float)
+        actuated = np.concatenate([q_a[:PLANNED_DOF], [q_tool]])
+        try:
+            settled = model.passive_equilibrium(actuated, payload)
+        except CraneModelError:
+            return np.zeros(2)
+        return settled - passive_equilibrium(q_a)
+
+    return offset

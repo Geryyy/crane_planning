@@ -33,6 +33,7 @@ from .config import (
     PlanningError,
     passive_equilibrium,
     read_limits,
+    settled_offset,
 )
 from .geometry import (
     PAYLOAD_ID,
@@ -194,6 +195,10 @@ class Planner:
 
         primitives = self.prepare_scene(scene, avoid_collisions)
         payload_vector = payload_parameters(payload)
+        # Where the payload hangs the tool, as one shift read at the measured pose:
+        # the scene is checked at thousands of configurations and the numeric solve is
+        # 1.7 ms, so geometry carries the start's shift rather than each pose's own.
+        offset = settled_offset(self.model, payload, start.q_tool)
         geometry = Geometry(
             self.model,
             limits,
@@ -202,6 +207,7 @@ class Planner:
             start.q_tool,
             payload_vector,
             payload_shape if avoid_collisions else None,
+            offset(start.q_a),
         )
 
         # Redundant arm config picked by restarts marching to the goal, not pinned
@@ -256,7 +262,10 @@ class Planner:
             goal_q_a,
         )
 
-        equilibrium_start = passive_equilibrium(path.position(0.0))
+        # Node 0's sway row is centred here too, so a start admitted here is a start the
+        # first QP can hold.
+        start_pose = path.position(0.0)
+        equilibrium_start = passive_equilibrium(start_pose) + offset(start_pose)
         q_u_start = start.q_u if start.passive_measured else equilibrium_start
         dq_u_start = (
             np.asarray(start.dq_u, dtype=float)
@@ -291,6 +300,7 @@ class Planner:
             payload=payload_vector,
             q_tool=start.q_tool,
             speed_scale=speed_scale,
+            settled_offset=offset,
         )
         timing = self.ocp.solve(**solve)
         # From a swinging start the SQP can settle on a short local minimum that buys pump
@@ -411,11 +421,13 @@ class Planner:
             raise PlanningError(f"'{PAYLOAD_ID}' is a reserved scene id")
         return primitives
 
-    def _settled(self, q_a: np.ndarray, q_tool: float) -> np.ndarray:
+    def _settled(self, q_a: np.ndarray, q_tool: float, offset=None) -> np.ndarray:
         q = np.zeros(GENERALIZED_DOF)
         q[list(PLANNED_INDICES)] = q_a
         q[TOOL_INDEX] = q_tool
-        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a) + (
+            np.zeros(2) if offset is None else offset(q_a)
+        )
         return q
 
     def _tcp_yaw(self, q: np.ndarray) -> float:
@@ -432,17 +444,21 @@ class Planner:
         """
         Tool's offset from tip pivot K5, for one yaw.
 
-        Settle, turn by yaw, settle again; payload unused (closed form in boom/arm).
+        Settle, turn by yaw, settle again. An off-axis payload tilts the settled
+        pose and so moves the tool off the pivot's plumb line; the shift does not
+        turn with slewing (measured: identical to 1e-16), so the two settles stay
+        one yaw apart and the gate below still closes.
         """
         if not (np.isfinite(yaw) and np.isfinite(q_tool)):
             raise PlanningError(
                 "`phi_tool_n` or the tool coordinate q8 is not finite, so the hanging "
                 "tip-to-tool offset cannot be evaluated"
             )
+        settled = settled_offset(self.model, payload, q_tool)
         q_a = np.zeros(PLANNED_DOF)
-        canonical = self._settled(q_a, q_tool)
+        canonical = self._settled(q_a, q_tool, settled)
         q_a[0] = wrap(yaw - self._tcp_yaw(canonical))
-        q = self._settled(q_a, q_tool)
+        q = self._settled(q_a, q_tool, settled)
 
         error = wrap(self._tcp_yaw(q) - yaw)
         if abs(error) > 1.0e-9:

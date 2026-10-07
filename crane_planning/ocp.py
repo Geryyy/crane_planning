@@ -171,8 +171,26 @@ SIM_SUBSTEPS = 3
 TANGENT_STEP_MAX = 10.0
 
 
-def equilibrium(q_a):
-    return ca.vertcat(0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi)
+def _no_offset(_q_a) -> np.ndarray:
+    """No payload (or none declared): the closed form is the equilibrium."""
+    return np.zeros(cs.K_PASSIVE_DOF)
+
+
+def equilibrium(q_a, offset):
+    """
+    Hanging pair the sway rows are measured from: closed form plus `offset`.
+
+    `offset` is a parameter, not an expression: the payload's shift of the
+    equilibrium has no closed form, and an off-axis centre of mass moves it by
+    as much as the settled box is wide (0.03 rad measured), so a row centred on
+    the closed form alone asked a carried plan to end somewhere the pendulum
+    cannot rest. The caller writes it per node off `crane_model`'s numeric
+    solve; `sigma` is pinned at nodes `0` and `N`, so there it is the exact
+    equilibrium of the pose the row is applied at.
+    """
+    return (
+        ca.vertcat(0.5 * np.pi - q_a[BOOM_AXIS] - q_a[ARM_AXIS], 0.5 * np.pi) + offset
+    )
 
 
 def baked_parameters(config, limits) -> dict:
@@ -196,6 +214,9 @@ def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     # `INTEGRATORS` decides the order; editing the map alone would load the old one.
     baked["sim_stages"] = INTEGRATORS[parameters["ocp_integrator"]]
     baked["path_derivatives"] = PATH_DERIVATIVES
+    #: Settled offset rides the last two rows of `p`; a tree built before it carries the
+    #: old width and rejects every `set(node, "p", ...)`, so it has to move the directory.
+    baked["np_settled_offset"] = cs.K_PASSIVE_DOF
     # Solver settings are generated into the C, so a tuning change must move the tree too.
     baked["tuning"] = solver_tuning()
     baked["description"] = hashlib.sha1(description.encode()).hexdigest()
@@ -545,6 +566,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     #: `path_segments` fixes the knot vector: only these numbers change between requests, solver
     # generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
+    #: Payload's shift of the hanging pair; last rows of `p` so `model.p` and the
+    # coefficients keep the offsets every caller slices them at.
+    q_u_offset = ca.SX.sym("q_u_offset", cs.K_PASSIVE_DOF)
 
     q_a, tangent, curvature, third = path_expression(sigma, coefficients, segments)[:4]
     # Faa di Bruno on `q_a(t) = c(sigma(t))`, physical seconds since `v` = d sigma/dt. Snap not
@@ -552,7 +576,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration
     dddq_a = third * speed**3 + 3.0 * curvature * speed * acceleration + tangent * jerk
-    sway = q_u - equilibrium(q_a)
+    sway = q_u - equilibrium(q_a, q_u_offset)
 
     # Substitute the eliminated coordinates into `crane_model`'s graph rather than rebuild it.
     planned = ca.vertcat(model.x, model.u)
@@ -571,7 +595,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     acados_model.name = SOLVER_NAME
     acados_model.x = ca.vertcat(sigma, speed, acceleration, jerk, q_u, dq_u, theta)
     acados_model.u = snap
-    acados_model.p = ca.vertcat(model.p, coefficients)
+    acados_model.p = ca.vertcat(model.p, coefficients, q_u_offset)
     acados_model.f_expl_expr = ca.vertcat(
         nominal * theta * ca.vertcat(speed, acceleration, jerk, snap, dq_u, ddq_u),
         0.0,
@@ -598,7 +622,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # isolates the dynamic part (hanging, zero rate/input).
     at_rest = ca.vertcat(
         q_a,
-        equilibrium(q_a),
+        equilibrium(q_a, q_u_offset),
         ca.SX.zeros(cs.K_PLANNED_DOF),
         ca.SX.zeros(cs.K_PASSIVE_DOF),
         ca.SX.zeros(cs.NU),
@@ -624,7 +648,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     ocp = AcadosOcp()
     ocp.model = acados_model
-    ocp.parameter_values = np.zeros(cs.NP + segments * ORDER * cs.K_PLANNED_DOF)
+    ocp.parameter_values = np.zeros(
+        cs.NP + segments * ORDER * cs.K_PLANNED_DOF + cs.K_PASSIVE_DOF
+    )
 
     # Yaml weights baked as defaults, still runtime-settable so a weight change needs no re-export.
     stage_w, terminal_w = w.matrices(parameters["weights"])
@@ -878,11 +904,14 @@ class TrajectoryOcp:
         q_tool: float,
         speed_scale: float,
         duration_min: float | None = None,
+        settled_offset=None,
     ) -> Trajectory:
         """
         Solve one request, or refuse with what the solver said.
 
         `duration_min` raises the configured duration floor for this solve only.
+        `settled_offset(q_a)` is where the payload moves the hanging pair to (see
+        `config.settled_offset`); without it the sway rows stay on the closed form.
         """
         cfg, lim, N = self.config, self.limits, self.N
         floor = cfg.ocp_duration_min if duration_min is None else duration_min
@@ -1027,18 +1056,25 @@ class TrajectoryOcp:
             )
             speed_guess = np.full(N + 1, 1.0 / duration_guess)
             accel_guess = np.zeros(N + 1)
+        # Where the sway rows are centred, per node. Node `N` is read at `sigma = 1`
+        # whatever the guess says: its `sigma` is pinned there, and the settled box and
+        # `plan`'s gate are measured against this row.
+        guessed = evaluate(coefficients, sigma_guess)
+        guessed[-1] = evaluate(coefficients, 1.0)[0]
+        offsets = np.array(
+            [(settled_offset or _no_offset)(row) for row in guessed], dtype=float
+        )
         solver.reset()
         for node in range(N + 1):
             sigma = float(sigma_guess[node])
-            guess = evaluate(coefficients, sigma)[0]
-            solver.set(node, "p", parameters)
+            solver.set(node, "p", np.concatenate([parameters, offsets[node]]))
             solver.set(
                 node,
                 "x",
                 np.concatenate(
                     [
                         [sigma, speed_guess[node], accel_guess[node], 0.0],
-                        passive_equilibrium(guess),
+                        passive_equilibrium(guessed[node]) + offsets[node],
                         np.zeros(cs.K_PASSIVE_DOF),
                         [duration_guess / self.nominal],
                     ]
@@ -1120,11 +1156,20 @@ class TrajectoryOcp:
         flow = raw_flow / cfg.pump_flow_max
         command = np.array(
             [
-                np.asarray(self._command(state[node], parameters)).ravel()
+                np.asarray(
+                    self._command(
+                        state[node], np.concatenate([parameters, offsets[node]])
+                    )
+                ).ravel()
                 for node in range(N + 1)
             ]
         )
-        q_u_eq = np.array([passive_equilibrium(row) for row in q_a])
+        # Centre of the solver's own sway rows, node by node -- not a second opinion on
+        # where the tool hangs, or `rows` below and `plan`'s settled gate would be
+        # measuring from somewhere acados never saw.
+        q_u_eq = np.array(
+            [passive_equilibrium(row) + offsets[node] for node, row in enumerate(q_a)]
+        )
         # `con_h` rebuilt from the states acados handed back, in `lh`/`uh` order and divided by
         # `self.scale`, which is what the solver divides them by -- the same row, not a second
         # opinion on it. Node `N` carries `h_e` instead (the settled box, which `plan` gates), so

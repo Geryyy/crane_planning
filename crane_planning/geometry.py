@@ -161,6 +161,7 @@ class Geometry:
         q_tool: float,
         payload: np.ndarray,
         payload_shape=None,
+        q_u_offset=None,
     ):
         self.model = model
         self.limits = limits
@@ -169,6 +170,11 @@ class Geometry:
         self.q_tool = float(q_tool)
         self.payload = payload
         self.payload_shape = payload_shape
+        #: Where the payload hangs the tool, off the closed form (`config.settled_offset`).
+        #: One shift for the whole scene: it turns with the rotator, but the solve's sway
+        #: rows are centred on this same number at the start, and the box the swept search
+        #: charges is `q_sway_max` wide either way.
+        self.q_u_offset = np.zeros(2) if q_u_offset is None else np.asarray(q_u_offset)
         #: What the carried body's row was nearest, from the last distance query.
         self.partners: dict[str, str] = {}
         self.envelope = self._envelope()
@@ -226,7 +232,9 @@ class Geometry:
         """
         q = np.zeros(GENERALIZED_DOF)
         q[TOOL_INDEX] = self.q_tool
-        q[list(PASSIVE_INDICES)] = passive_equilibrium(q[list(PLANNED_INDICES)])
+        q[list(PASSIVE_INDICES)] = (
+            passive_equilibrium(q[list(PLANNED_INDICES)]) + self.q_u_offset
+        )
         tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
         reach = self._carried_reach()
         swing = []
@@ -252,7 +260,9 @@ class Geometry:
         extension = self.limits.upper[TELESCOPE_AXIS]
         if np.isfinite(extension):
             q[PLANNED_INDICES[TELESCOPE_AXIS]] = extension
-        q[list(PASSIVE_INDICES)] = passive_equilibrium(q[list(PLANNED_INDICES)])
+        q[list(PASSIVE_INDICES)] = (
+            passive_equilibrium(q[list(PLANNED_INDICES)]) + self.q_u_offset
+        )
         tcp = self.model.forward_kinematics(
             q, Frame.MOUNTING_BASE, Frame.TCP
         ).position_m
@@ -281,7 +291,7 @@ class Geometry:
         q = np.zeros(GENERALIZED_DOF)
         q[list(PLANNED_INDICES)] = q_a
         q[TOOL_INDEX] = self.q_tool
-        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a)
+        q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a) + self.q_u_offset
         return q
 
     def _distances(self, q: np.ndarray, swinging=None, scene=None) -> dict | None:
