@@ -7,6 +7,7 @@ from collections import deque
 
 import numpy as np
 import rclpy
+from builtin_interfaces.msg import Time
 from crane_model import (
     ACTUATED_INDICES,
     GENERALIZED_DOF,
@@ -303,7 +304,6 @@ class CranePlanner(Node):
             q[index] = actuated.position[where]
             if index != TOOL_INDEX:
                 dq_a[slot] = actuated.velocity[where]
-        self.start_stamp = actuated.header.stamp
 
         # Passive half: missing-sway-as-zero is the stopped-start convention; no third answer.
         deadline = self.get_parameter("pendulum_state_deadline").value
@@ -433,9 +433,6 @@ class CranePlanner(Node):
             start = translate_start(request)
             if start is None:
                 start = self._start()
-            else:
-                # Supplied feasibility state, not a measurement: stamped now, no clock to use.
-                self.start_stamp = self.get_clock().now().to_msg()
             offset = self.planner.tip_to_tcp_offset(
                 payload, request.phi_tool_n, start.q_tool
             )
@@ -455,8 +452,12 @@ class CranePlanner(Node):
             self._report(DiagnosticStatus.ERROR, str(refusal), refusal.stats)
             return response
 
+        # Stamped zero: the JTC reads that as "start at the first point now", whatever latency
+        # the caller adds before sending it, and the legacy server left it zero too. A stamp is
+        # an instant `time_from_start` counts from, so stamping planning start had the JTC skip
+        # the solve -- ~4 s of a 7.4 s move, 0.5 rad of tilt (`pid_move.py`, 2026-10-08).
         # Canonical eight; passive pair is free (OCP-solved) -- claimed sway, not settle point.
-        legacy = self._trajectory(plan, self.start_stamp, range(GENERALIZED_DOF))
+        legacy = self._trajectory(plan, Time(), range(GENERALIZED_DOF))
         # `publish_path` gates the topic only: response always carries `tcp_path`.
         if request.publish_path:
             self.legacy_tcp_path.publish(path)
@@ -502,11 +503,15 @@ class CranePlanner(Node):
                 shape if avoid_collisions else None,
             )
         )
-        trajectory = self._trajectory(plan, self.start_stamp, ACTUATED_INDICES)
+        # Stamped at publish, not at the measurement the solve started from: the MPC's
+        # no-path fallback reads `first_knot - stamp` as how much of the plan is already
+        # spent, and a planning-start stamp spends the whole solve time (seconds).
+        published = self.get_clock().now().to_msg()
+        trajectory = self._trajectory(plan, published, ACTUATED_INDICES)
         path = self._path(plan)
         self.reference.publish(trajectory)
         # Same stamp as the reference: that is what pairs the two forms of one plan.
-        self.joint_path.publish(self._joint_path(plan, self.start_stamp))
+        self.joint_path.publish(self._joint_path(plan, published))
         self.planned_path.publish(path)
         self.get_logger().info(plan.message)
         # WARN not OK when slack bought the answer: priced violation executes silently otherwise.
