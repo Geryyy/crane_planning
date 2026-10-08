@@ -18,13 +18,48 @@ overridable -- not copied -- in `config/crane_planner.yaml`.
 Joint ranges and velocity limits come from the `robot_description` the profile
 remaps this node onto, **intersected with
 `crane_model/config/control_safe_limits.yaml`** -- narrower than the description
-on the boom, the arm and four velocity rows, and the same box `crane_mpc`
-enforces, so this planner cannot certify a pose or a speed the MPC refuses. That
-box may never exclude the measured pose: the machine parks with the boom folded
-below its 0.02 rad, so `Limits.relaxed_to` widens the row to wherever the
-machine is, exactly as the MPC's `position_box` does. The start state is still
-checked against the *description*'s stops, which is a different question -- can
-this measurement be real.
+on the boom, the arm and four velocity rows, so this planner cannot certify a
+pose or a speed the MPC refuses.
+
+The position rows retreat **two** `q_a_margin`, not one. One margin is the box
+`crane_mpc`'s `position_box` enforces, and a plan allowed *onto* that bound
+leaves the MPC's first interval no interior -- `position_box` is
+`max(upper, measured)`, so a thousandth of a radian of tracking error pins the
+hard box to the measurement and HPIPM returns `MIN_STEP`. The second is a
+`q_a_margin` of room for the machine to be off the plan and still leave that
+interval an interior. Measured on `--goal out`: the telescope used to sit on
+0.038000 with 0.000000 of clearance and a fifth to a quarter of cycles refused;
+it now sits on 0.076 with 0.038 of clearance and none do (231).
+
+The box still gives way to where the machine is -- axes park on their own stops,
+inside that retreat, and refusing there would refuse to plan at all; widening
+rather than projecting is forced by `plan_fitted_path`, which scans containment
+against this box at 1e-6. **So the retreat is what `read_limits` returns, and
+`Limits.relaxed_to` hands both margins back on an axis the machine is standing
+inside them** -- goal included, since `solve_ik` is bounded by the same object.
+A plan from a parked telescope is still a plan on the MPC's pinned bound; what
+231 bounded is how far that can go, not that it happens. `relaxed_to` gives way
+only as far as the control-safe row *itself*, both margins dropped and one
+`LIMIT_DEADBAND` of creep allowed. Past it the measurement is not a margin
+artefact, and a plan from there is one the MPC demonstrably cannot hold, so it
+is refused by name. `initial_pose:=1` is that case: it starts the arm at 1.5708
+rad, 0.246 above the row's 1.324864, and the old unbounded relaxation let the
+planner keep the arm outside the box for a whole move -- so from 231 the first
+move under that pose is refused rather than planned, and the sim wants
+`initial_pose:=2`, which is inside every row
+(`control_safe_limits.yaml`'s `known_gaps.arm_start_pose`). The start state is
+separately checked against the *description*'s stops, which is a different
+question -- can this measurement be real.
+
+Two things the retreat is not. It is not derived: `q_a_margin` is one 60 ms
+transport dead time of pre-128 travel, where what has to fit between the state
+`position_box` is posed from and the state stage 1 is asked for is that dead time
+*plus* the measurement latency -- at `kappa` 0.8 and 26 ms it is 5-10 % short on
+the arm and the slewing column, and nothing ties `PLAN_MARGINS` to `crane_mpc`'s
+`Ts`. And it is not free on reach: `TELESCOPE_TRAVEL_PER_UNIT` is 2, so 0.038 of
+`q4` at each end is **0.076 m of tip reach at each end**, 0.152 m of travel,
+before the boom's and the arm's own 0.020/0.021 rad. A goal in that shell does
+not read as out of reach -- `solve_ik` refuses the corridor instead.
 
 `Limits.dq_max` is the one intersected number: it is also what the timing OCP's
 rate row is divided by, so that row's ceiling is `kappa * speed_scale` of the
@@ -258,21 +293,25 @@ development image, one run:
 
 | | |
 |---|---|
-| lifted configurations | 177 |
-| OCP solve | 75 SQP iterations, 0.60 s |
-| planner call | 0.72 s, so 0.12 s of geometry |
-| trajectory duration | 6.46 s |
-| terminal sway | 0.40 deg, 0.000 rad/s |
-| peak pump draw | 0.75 of the limit at kappa = 0.8 |
+| lifted configurations | 179 |
+| OCP solve | 18 SQP iterations, 1.38 s (load ~2) |
+| planner call | 1.56 s, so 0.18 s of geometry |
+| trajectory duration | 8.14 s |
+| terminal sway | 0.26 deg, 0.000 rad/s |
+| peak pump draw | 0.64 of the limit at kappa = 0.8 |
 
-Near-worst case for the shipped settings: 75 iterations against 26 under the ones
-they replaced, on an answer 0.01 s longer. Kept anyway -- the corpus says the trade
-is worth it, and quoting only a best case is not worth reading.
+**Not comparable to the pre-231 numbers**: 231 moved `DEFAULT_START`/`DEFAULT_GOAL`'s
+held boom from -0.2 to +0.2, because -0.2 is outside the control-safe row and the
+planner now refuses a start there rather than relaxing the row to it. The iteration
+count fell with the move, not with anything about the solver -- the near-worst case
+quoted here before (75 iterations against 26 under the settings they replaced, on an
+answer 0.01 s longer) was that move, and *What chose the solver settings* below is
+still the record of what the settings bought.
 
 The solve is most of it, and more so since `crane_model` began bounding its self
 pairs before asking Coal for them -- that halved the geometric half (0.23 to 0.12 s
-here, 1.45x on a whole call over the bench corpus) and left the OCP the thing to
-beat. Two more integrator states and the C3 command row cost roughly an order of
+on the pre-231 move, 1.45x on a whole call over the bench corpus) and left the OCP
+the thing to beat. Two more integrator states and the C3 command row cost roughly an order of
 magnitude over the acceleration-input stage these numbers replaced. `margin_interp`
 is the knob still on the geometry -- one IK solve plus one collision query per
 lifted configuration, and halving it roughly doubles the configurations.

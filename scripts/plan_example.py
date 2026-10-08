@@ -37,9 +37,12 @@ from crane_planning.planner import (  # noqa: E402
 
 #: the expanded description crane_model keeps as a fixture
 DESCRIPTION = "pzs100.urdf"
-#: a lift: out, up, further out, rotator following
-DEFAULT_START = (0.0, -0.2, 0.4, 1.0, 0.0)
-DEFAULT_GOAL = (0.6, -0.2, 0.9, 1.4, 0.4)
+#: a lift: out, up, further out, rotator following. Boom held, and held at +0.2:
+#: -0.2 was outside crane_model's control-safe row (0.0), so from 231 the planner
+#: refuses it rather than relaxing the row to it -- the example cannot start where
+#: the machine may not be. Every number under "Cost" in the README is this move.
+DEFAULT_START = (0.0, 0.2, 0.4, 1.0, 0.0)
+DEFAULT_GOAL = (0.6, 0.2, 0.9, 1.4, 0.4)
 DEFAULT_TOOL_POSITION = 0.30
 
 

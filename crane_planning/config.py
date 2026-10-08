@@ -48,6 +48,29 @@ MIN_LIFT_STEP = 1.0e-6
 BOOM_AXIS = 1
 ARM_AXIS = 2
 
+#: `q_a_margin` multiples the plan keeps clear of a control-safe row. One is what
+#: `crane_mpc`'s `position_box` already enforces, so a plan retreating only that far
+#: sits *on* the MPC's hard bound and leaves its first interval no interior -- which
+#: is what `--goal out` did (telescope pinned to 0.038000, clearance 0.000000; 25% of
+#: cycles refused, 226 §3). The second is one `q_a_margin` of room for the machine to
+#: be off the plan and still leave the MPC's box an interior -- no new constant, and
+#: `q_a_margin` is the travel its own row derives (231).
+#: Two caveats, neither closed: the retreat is what `read_limits` returns and
+#: `relaxed_to` gives both margins back on an axis whose measurement is inside them,
+#: so the clearance holds for a start inside the retreat and not for a parked one;
+#: and the margin is one 60 ms dead time of pre-128 travel, where what has to fit is
+#: dead time *plus* measurement latency -- at kappa 0.8 and 26 ms that is 5-10 % short
+#: on the arm and the slewing column. Sufficient where measured, not derived.
+PLAN_MARGINS = 2.0
+
+#: m, rad. How far past a limit a start coordinate may sit and still be planned from.
+#: Telescope creeps past its stop each move; against the *description* it is clamped
+#: (not tolerated) since IK/fit/OCP need start inside the box. Equals eps_pos, so the
+#: projection reads as an accepted IK. `relaxed_to` reuses it as the slack on the
+#: control-safe row: axes park on their own stops and sim crept 7.9e-5..1.4e-4 rad past
+#: one (`test_start_limit_deadband`), which must not read as a machine out of the box.
+LIMIT_DEADBAND = 1e-3
+
 
 @lru_cache(maxsize=1)
 def _command_domain() -> tuple[np.ndarray, np.ndarray]:
@@ -80,6 +103,9 @@ class Limits:
     #: Same two rows pre control-safe box; start-state check alone reads these (outside-box normal).
     description_lower: np.ndarray
     description_upper: np.ndarray
+    #: The control-safe row itself, margins dropped: how far `relaxed_to` may give way.
+    control_safe_lower: np.ndarray
+    control_safe_upper: np.ndarray
     dq_max: np.ndarray  # velocity, per planned coordinate
     tau_max: np.ndarray  # rated actuated effort, per planned coordinate
     flow_max: float  # summed pump draw
@@ -88,8 +114,39 @@ class Limits:
     tool_bounded: bool
 
     def relaxed_to(self, q_a: np.ndarray) -> Limits:
-        """Widen rows to contain `q_a`; box gives way to the measured pose, never excludes it."""
+        """
+        Widen rows to contain `q_a`, as far as the control-safe row and no further.
+
+        The box gives way to where the machine is: axes park on their stops, inside
+        `PLAN_MARGINS * q_a_margin` of the row, and refusing there would refuse to
+        plan at all. Widening rather than clamping is load-bearing -- `plan_fitted_path`
+        scans containment against this box at a slack of 1e-6, so a start outside it is
+        a refusal however small the excess, which is also why `LIMIT_DEADBAND` past the
+        row is tolerated here and not projected onto it. **The cost is that a parked
+        axis hands `PLAN_MARGINS`' clearance straight back**: the plan may then use the
+        whole band down to the measurement, goal included, so the clearance is the
+        box's and not every plan's. Bounding it is the point. Further out the
+        measurement is no longer a margin artefact -- `crane_mpc`'s `position_box` pins
+        its hard box to exactly that state, so the first interval has no interior and a
+        quarter of cycles refuse (226 §2, the arm 0.24-0.41 rad over for a whole move).
+        Refused by name rather than planned: the only answer this package can give to a
+        machine outside its control-safe range.
+        """
         q_a = np.asarray(q_a, dtype=float)
+        outside = self.bounded & (
+            (q_a < self.control_safe_lower - LIMIT_DEADBAND)
+            | (q_a > self.control_safe_upper + LIMIT_DEADBAND)
+        )
+        if np.any(outside):
+            axis = int(np.flatnonzero(outside)[0])
+            raise PlanningError(
+                f"planned coordinate {axis} is measured at {q_a[axis]:.6f}, outside "
+                "crane_model's control-safe range "
+                f"[{self.control_safe_lower[axis]:.6f}, "
+                f"{self.control_safe_upper[axis]:.6f}] by more than "
+                f"{LIMIT_DEADBAND:.0e}; crane_mpc pins its hard position box to that "
+                "state, so no plan from here is one it can hold"
+            )
         return replace(
             self,
             lower=np.where(self.bounded, np.minimum(self.lower, q_a), self.lower),
@@ -114,6 +171,14 @@ def read_limits(
     `tau_max` is the description's per-joint effort, the scale `tau_weight`
     divides by.
 
+    The position rows retreat `PLAN_MARGINS` margins, not one, so a plan built in
+    *this* box never lies on a bound `crane_mpc` also enforces -- boom 0.04..1.523,
+    arm -0.868..1.2829, telescope 0.076..2.160, each exactly one `q_a_margin` inside
+    `position_box`. `relaxed_to` is what `plan` actually builds in and it gives the
+    retreat back where the machine stands inside it, so this is the box's clearance,
+    not every plan's. `control_safe_lower/upper` keep the row without any margin,
+    which is the furthest `relaxed_to` gives way.
+
     The two pump numbers come from the caller's `PlannerConfig`, which reads
     them off `crane_model`; they are never defaulted here.
     """
@@ -136,17 +201,23 @@ def read_limits(
     box = control_safe_limits()
     axis_of = {joint: axis for axis, joint in CONTROL_SAFE_AXES.items()}
     joints = canonical_joints()
+    control_safe_lower = lower.copy()
+    control_safe_upper = upper.copy()
     for axis, index in enumerate(PLANNED_INDICES):
         name = axis_of[joints[index]]
         dq_max[axis] = min(dq_max[axis], box["dq_a_max"][name])
         if not bounded[axis]:
             continue
-        lower[axis] = max(lower[axis], box["q_a_lower"][name] + box["q_a_margin"][name])
-        upper[axis] = min(upper[axis], box["q_a_upper"][name] - box["q_a_margin"][name])
+        control_safe_lower[axis] = max(lower[axis], box["q_a_lower"][name])
+        control_safe_upper[axis] = min(upper[axis], box["q_a_upper"][name])
+        retreat = PLAN_MARGINS * box["q_a_margin"][name]
+        lower[axis] = control_safe_lower[axis] + retreat
+        upper[axis] = control_safe_upper[axis] - retreat
         if lower[axis] >= upper[axis]:
             raise PlanningError(
                 f"{joints[index]} has an empty box: the description and "
-                "crane_model's control-safe limits do not overlap"
+                "crane_model's control-safe limits do not overlap by more than "
+                f"{2.0 * retreat:g}"
             )
 
     if not np.all(np.isfinite(dq_max)) or np.any(dq_max <= 0.0):
@@ -171,6 +242,8 @@ def read_limits(
         upper=upper,
         description_lower=description_lower,
         description_upper=description_upper,
+        control_safe_lower=control_safe_lower,
+        control_safe_upper=control_safe_upper,
         bounded=bounded,
         dq_max=dq_max,
         tau_max=tau_max,

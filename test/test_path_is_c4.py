@@ -35,6 +35,8 @@ def limits() -> Limits:
         bounded=np.ones(PLANNED_DOF, dtype=bool),
         description_lower=-10.0 * ones,
         description_upper=10.0 * ones,
+        control_safe_lower=-10.0 * ones,
+        control_safe_upper=10.0 * ones,
         dq_max=ones,
         tau_max=1000.0 * ones,
         flow_max=1.0,

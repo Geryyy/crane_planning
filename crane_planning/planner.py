@@ -23,6 +23,7 @@ from . import weights as crane_weights
 from .config import (
     ARM_AXIS,
     BOOM_AXIS,
+    LIMIT_DEADBAND,
     PLANNED_DOF,
     PLANNED_FRAMES,
     PLANNED_INDICES,
@@ -58,11 +59,6 @@ from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coeffic
 REST_VELOCITY = 2e-2
 #: Duration floor of the pump retry, as a multiple of the duration that bought pump slack.
 PUMP_RETRY_STRETCH = 1.25
-
-#: m, rad. How far past a limit a start coordinate may sit and still be planned from.
-#: Telescope creeps past its stop each move; clamped (not tolerated) since IK/fit/OCP
-#: need start inside the box. Equals eps_pos, so the projection reads as an accepted IK.
-LIMIT_DEADBAND = 1e-3
 
 #: rad/s. Terminal drift above which a plan is refused; deliberately not REST_VELOCITY
 #: (that's encoder noise, this is what "solve stopped" means -- keep the two separate).
@@ -185,7 +181,8 @@ class Planner:
         if not 0.0 < speed_scale <= 1.0:
             raise PlanningError(f"speed_scale must be in (0, 1], not {speed_scale}")
         start = self._validate_start(start)
-        # Plans use this box (relaxed to the measured pose), not self.limits directly.
+        # Plans use this box (relaxed to the measured pose, and refusing a pose outside
+        # the control-safe rows), not self.limits directly.
         limits = self.limits.relaxed_to(start.q_a)
         if avoid_collisions and scene is None:
             raise PlanningError(
@@ -372,7 +369,9 @@ class Planner:
         if dq_u.size != len(PASSIVE_INDICES) or not np.all(np.isfinite(dq_u)):
             raise PlanningError("the start must contain two finite passive sway rates")
         q_a = q[list(PLANNED_INDICES)]
-        # Description's box, not control-safe one; plan() relaxes to wherever the machine is.
+        # Description's box, not the control-safe one -- a different question (can this
+        # measurement be real). plan() relaxes the control-safe rows to the machine, but
+        # only within them; past them it refuses.
         outside = self.limits.bounded & (
             (q_a < self.limits.description_lower - LIMIT_DEADBAND)
             | (q_a > self.limits.description_upper + LIMIT_DEADBAND)

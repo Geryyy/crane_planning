@@ -58,6 +58,14 @@ def test_the_rate_rows_ceiling_is_the_control_safe_one():
 
 
 def test_no_planned_axis_leaves_constraint_ones_box():
+    """
+    231: `>=` is not enough -- a plan allowed *onto* the MPC's bound leaves its first
+    interval no interior, because `position_box` then pins the hard box to the
+    measurement. Every row must keep a whole `q_a_margin` of clearance to it.
+
+    This is `read_limits`' box, not `plan`'s: `relaxed_to` hands the retreat back on
+    an axis the machine is standing inside it, and the next two tests are that half.
+    """
     read = limits()
     box = control_safe_limits()
     axis_of = {joint: axis for axis, joint in CONTROL_SAFE_AXES.items()}
@@ -68,16 +76,18 @@ def test_no_planned_axis_leaves_constraint_ones_box():
         if not read.bounded[axis]:
             continue
         margin = box["q_a_margin"][name]
-        assert read.lower[axis] >= box["q_a_lower"][name] + margin - 1e-12, name
-        assert read.upper[axis] <= box["q_a_upper"][name] - margin + 1e-12, name
+        assert read.lower[axis] >= box["q_a_lower"][name] + 2.0 * margin - 1e-12, name
+        assert read.upper[axis] <= box["q_a_upper"][name] - 2.0 * margin + 1e-12, name
 
 
 def test_the_intersection_bites_where_the_description_is_wider():
     read = limits()
     # boom: -1.2 admits 1.22 rad four-bar can't reach; arm: 4.6 past dead point 1.8466647
-    assert read.lower[1] == 0.02
-    assert read.upper[2] == 1.324864 - 0.021
+    assert read.lower[1] == 0.02 + 0.020
+    assert read.upper[2] == 1.324864 - 2.0 * 0.021
     assert read.dq_max[1] == 0.239067
+    # the row itself, margins dropped: how far relaxed_to gives way
+    assert (read.control_safe_lower[1], read.control_safe_upper[2]) == (0.0, 1.324864)
 
 
 def test_the_tool_keeps_the_descriptions_travel():
@@ -86,16 +96,19 @@ def test_the_tool_keeps_the_descriptions_travel():
     assert (read.tool_lower, read.tool_upper) == (0.0, 0.538)
 
 
-def test_the_box_gives_way_to_where_the_machine_is():
-    # machine parks with boom folded below control-safe 0.02; crane_mpc's position_box
-    # relaxes the same way, refusing here would refuse to plan at all
+def test_the_box_gives_way_to_a_machine_parked_inside_the_margins():
+    # sim parks the boom and the telescope on their own stops, i.e. inside the retreat
+    # this planner takes, and creeps a fraction of a mrad past them
+    # (test_start_limit_deadband); crane_mpc's position_box relaxes the same way, and
+    # refusing here would refuse to plan at all
     read = limits()
-    folded = read.lower.copy()
-    folded[1] = -0.2
-    relaxed = read.relaxed_to(folded)
+    parked = read.lower.copy()
+    parked[1] = -1.44e-4
+    parked[3] = 0.0
+    relaxed = read.relaxed_to(parked)
 
-    assert relaxed.lower[1] == -0.2
+    assert (relaxed.lower[1], relaxed.lower[3]) == (-1.44e-4, 0.0)
     assert relaxed.upper[1] == read.upper[1]
-    assert list(relaxed.lower[2:]) == list(read.lower[2:])
+    assert list(relaxed.lower[[0, 2, 4]]) == list(read.lower[[0, 2, 4]])
     # and the description still says where the stop actually is
     assert read.description_lower[1] == -1.2
