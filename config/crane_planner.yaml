@@ -173,10 +173,33 @@ crane_planner:
     # (0.62 of `q_sway_max` here, 0.90 at `time` 1.0) with `dq_a` still at 0.57 of
     # rate -- pendulum-bound, so the drive rows are not reachable by a weight.
     # 0.0 is not free either: `ax_rot` then refuses outright.
+    #
+    # `sway`/`dq_u` above 1.0 since issue 218. **The plan, not the plant**: at 1.0
+    # the empty A2B move (slew 0.785/boom 0.034/arm 1.709 -> `y_n` 6.06,0.35,2.0)
+    # arrives settled (0.47 deg, 0.000 rad/s) but swings the tilt 3.99 deg on the
+    # way and peaks at 0.154 rad/s of sway rate in its last second -- 4x the
+    # settled box, and only 0.35 of `q_sway_max`, which is a clearance bound and
+    # so says nothing about comfort. Replaying that plan open loop through the
+    # passive model reproduces Gazebo's measured sway to 0.2 deg, so there is no
+    # model error and no tracking error to fix; preference was the only lever.
+    #
+    # 4/4 costs +12.7% duration on that move and buys -34% peak sway, -19% peak
+    # rate, *and* a terminal offset that falls 0.47 -> 0.27 deg. Pricing the rate
+    # alone is far cheaper (`dq_u` 4 alone: -21%/-20% at +3.6%) but it pays for it
+    # at the end, pushing terminal sway the other way, 0.47 -> 0.73 deg; the sway
+    # row is what holds that down, so both move together or the arrival gets worse
+    # to make the middle better.
+    #
+    # Ceiling on this pair is **not** sway or the pump, it is `test_speed_scale`:
+    # a gentler plan stops needing acceleration above the `s**2` allowance at
+    # `slow_down` 0.5, which is that test's evidence for dividing rate and accel
+    # linearly. Margin there is 1.51 at 1/1, 1.11 at 4/4, and 0.999 at 2/8 -- so
+    # 2/8, which reads better on sway alone, is not available. Preferences still:
+    # `q_sway_max` alone is the envelope.
     weights:
       dq_a: 1.0
-      sway: 1.0
-      dq_u: 1.0
+      sway: 4.0
+      dq_u: 4.0
       dynamic_tau: 1.0
       ddq_a: 1.0
       dddq_a: 1.0

@@ -7,8 +7,9 @@ get copied onto every stage before every solve, `W` is set once at build, so
 per-stage copies would be wasted on weights that don't change within a run.
 
 Every residual row is dimensionless (exporter divides by the limit it's measured
-against, so 1.0 is the bound); weight is preference only, 1.0 everywhere means one
-bound violated costs the same wherever it happens.
+against, so 1.0 is the bound); weight is preference only, so equal weights mean one
+bound violated costs the same wherever it happens. The two sway rows carry more than
+that because their bounds come from the clearance envelope, not from comfort.
 """
 
 from __future__ import annotations
@@ -33,11 +34,13 @@ NY_E = sum(width for _, width in TERMINAL_BLOCKS)
 
 
 #: What shipped `config/crane_planner.yaml` carries, and what a node falls back to.
-#: `time` is bounded by terminal sway, not by the pump -- that yaml's `weights` block.
+#: Held equal to it by `test_parameters_are_declared.py` -- the yaml overrides these,
+#: so a value edited in one place alone is live for the node and stale for every
+#: offline script. Why `sway`/`dq_u` are not 1.0: that yaml's `weights` block.
 DEFAULTS = {
     "dq_a": 1.0,
-    "sway": 1.0,
-    "dq_u": 1.0,
+    "sway": 4.0,
+    "dq_u": 4.0,
     "dynamic_tau": 1.0,
     "ddq_a": 1.0,
     "dddq_a": 1.0,

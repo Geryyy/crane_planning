@@ -44,6 +44,13 @@ def test_every_yaml_key_is_declared():
     assert written() - declared() == set()
 
 
+def test_the_shipped_weights_are_the_declared_defaults():
+    """Names agreeing is not enough: the yaml overrides `DEFAULTS`, so a value
+    raised in one place alone runs on the node and not in any offline script."""
+    deployed = yaml.safe_load(CONFIG.read_text())["crane_planner"]["ros__parameters"]
+    assert deployed["weights"] == crane_weights.DEFAULTS
+
+
 def test_every_typed_parameter_is_a_config_field():
     """`_declare` reads its default off `PlannerConfig`, so a typo is fatal."""
     assert set(TYPED) - {field.name for field in fields(PlannerConfig)} == set()
