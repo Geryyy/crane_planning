@@ -46,7 +46,7 @@ DEFAULTS = {
     "ddq_a": 1.0,
     "dddq_a": 1.0,
     "terminal_scale": 1.0,
-    "time": 0.3,
+    "time": 1.0,
 }
 
 

@@ -301,11 +301,17 @@ development image, one run:
 | | |
 |---|---|
 | lifted configurations | 179 |
-| OCP solve | 18 SQP iterations, 1.38 s (load ~2) |
-| planner call | 1.56 s, so 0.18 s of geometry |
-| trajectory duration | 8.14 s |
-| terminal sway | 0.26 deg, 0.000 rad/s |
-| peak pump draw | 0.64 of the limit at kappa = 0.8 |
+| OCP solve | 100 SQP iterations -- the cap -- 11.5 s (load ~15) |
+| planner call | 11.9 s, so 0.4 s of geometry |
+| trajectory duration | 6.70 s |
+| terminal sway | 0.40 deg, 0.000 rad/s |
+| peak pump draw | 0.76 of the limit at kappa = 0.8, i.e. all of the reservation |
+
+**This move is admitted at the iteration cap since issue 251** raised `time` to
+1.0: every row is met at stationarity 1.2e-4 against a 1e-4 tolerance, so the
+answer ships with "duration not proven minimal". It was 18 iterations, 1.38 s and
+8.14 s of duration at `time` 0.3. Only the duration/sway/pump rows above compare
+across machines -- the two wall-clock rows were taken with a sim on the box.
 
 **Not comparable to the pre-231 numbers**: 231 moved `DEFAULT_START`/`DEFAULT_GOAL`'s
 held boom from -0.2 to +0.2, because -0.2 is outside the control-safe row and the

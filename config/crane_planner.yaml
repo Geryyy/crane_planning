@@ -159,21 +159,47 @@ crane_planner:
     # Every residual row is divided by the limit it is measured against, so 1.0 is
     # the bound and these are preferences, not unit conversions. Scalar sets a
     # whole block. `time` prices the terminal horizon row, i.e. the whole
-    # minimum-time objective. 0.3 lands the answer at 0.91 of the pump reservation
-    # in 17 iterations.
+    # minimum-time objective.
     #
-    # What stops `time` rising is **terminal sway, not the pump** (issue 191, over
-    # the 21 bench moves): at 0.6 every move that converged at 0.3 still converges
-    # and durations fall 2-18%, but terminal sway rises on all of them -- `slew`
-    # 0.58 -> 1.09 deg against a 1.15 deg settled box. Only at 1.0 does a move
-    # (`pair_tuck`) hit the iteration cap.
+    # 1.0 since issue 251. **At 0.3 the plan left half the pump unused**: the two
+    # A2Bs of the 2026-10-09 wall-assembly run logged peak draw 0.42 (empty, 7.68 s)
+    # and 0.47 (loaded, 6.92 s) of the physical limit against a 0.76 reservation
+    # (`kappa` times `pump_flow_planning_factor`). Re-planned offline from those two
+    # endpoint pairs at the three settings, duration / peak pump / terminal sway:
+    #
+    #     time    empty approach              loaded carry (800 kg)
+    #     0.3     7.47 s  0.535  0.32 deg     7.03 s  0.546  0.28 deg
+    #     0.6     6.79 s  0.586  0.35 deg     6.75 s  0.579  0.41 deg
+    #     1.0     6.31 s  0.633  0.42 deg     5.37 s  0.706  0.62 deg
+    #
+    # -16% / -24% duration at terminal sway still 0.37/0.54 of the 1.15 deg settled
+    # box. What held `time` at 0.3 was issue 191's sweep, measured **before** 218
+    # raised `sway`/`dq_u` to 4.0 -- terminal sway then reached 1.09 deg (`slew`) at
+    # 0.6 alone. With that pair at 4.0 the worst of the 21 bench moves at 1.0 is
+    # `pair_slew_lift`, 1.07 deg = 0.93 of the box, and nothing refuses that did not
+    # already refuse on geometry at 0.3. Cost: `pair_tuck` spends the whole
+    # `ocp_max_iterations` at 1.0, as 191 predicted, and so does `plan_example`'s own
+    # move, which now ends exactly on the reservation (0.84 of it in 18 iterations at
+    # 0.3). Both are *admitted* at the cap, every row met, duration not proven
+    # minimal -- not refused -- and 0.3 already carried such a move (`ax_rot`,
+    # which at 1.0 converges in 58), so the cap-hit count over the bench is one
+    # either way: the same risk at a different move, not a new one.
+    #
+    # The two soft rows are **met, not bought**, at 1.0: over the 19 solving bench
+    # moves `sway_slack` stays below 1.3e-8 against the 1e-6 `planner.py` refuses on,
+    # and the pump retry fires on none of them -- nine of them sit exactly on 0.760
+    # and acados still returns the row inside `SLACK_SPENT`. Checked from rest only;
+    # the retry exists for a swinging start and that case is untested here.
     #
     # `dq_a` is **not** what holds a slew back, the other half of 191: sweeping it
     # 1.0 -> 0.0 moves `ax_slew` 2.8% and `sh_slew` not at all, while telescope and
     # reach moves gain 9-20% and end on the pump. A slew is priced by the sway row
-    # (0.62 of `q_sway_max` here, 0.90 at `time` 1.0) with `dq_a` still at 0.57 of
-    # rate -- pendulum-bound, so the drive rows are not reachable by a weight.
-    # 0.0 is not free either: `ax_rot` then refuses outright.
+    # with `dq_a` still at 0.57 of rate -- pendulum-bound, so the drive rows are not
+    # reachable by a weight. 191 read that row as 0.62 of `q_sway_max` at `time` 0.3
+    # and 0.90 at 1.0; post-218 and re-measured for 251, `ax_slew`'s in-flight sway is
+    # 0.45 at 0.3 and 0.62 at 1.0, and it is still the worst of the 21 -- the pair at
+    # 4.0 bought back the whole headroom 191 was reading. 0.0 is not free either:
+    # `ax_rot` then refuses outright.
     #
     # `sway`/`dq_u` above 1.0 since issue 218. **The plan, not the plant**: at 1.0
     # the empty A2B move (slew 0.785/boom 0.034/arm 1.709 -> `y_n` 6.06,0.35,2.0)
@@ -184,8 +210,9 @@ crane_planner:
     # passive model reproduces Gazebo's measured sway to 0.2 deg, so there is no
     # model error and no tracking error to fix; preference was the only lever.
     #
-    # 4/4 costs +12.7% duration on that move and buys -34% peak sway, -19% peak
-    # rate, *and* a terminal offset that falls 0.47 -> 0.27 deg. Pricing the rate
+    # 4/4 costs +12.7% duration on that move (measured at `time` 0.3) and buys
+    # -34% peak sway, -19% peak rate, *and* a terminal offset that falls
+    # 0.47 -> 0.27 deg. Pricing the rate
     # alone is far cheaper (`dq_u` 4 alone: -21%/-20% at +3.6%) but it pays for it
     # at the end, pushing terminal sway the other way, 0.47 -> 0.73 deg; the sway
     # row is what holds that down, so both move together or the arrival gets worse
@@ -205,7 +232,7 @@ crane_planner:
       ddq_a: 1.0
       dddq_a: 1.0
       terminal_scale: 1.0
-      time: 0.3
+      time: 1.0
     # The command row is stiffer than the `dddq_a` row it replaced: `ax_slew` needs
     # 70 iterations against 48 before, and 60 refuses it. Not higher, because a
     # refusal spends the whole budget first -- `sh_boom` takes 29.9 s to refuse at
