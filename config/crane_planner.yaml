@@ -238,6 +238,11 @@ crane_planner:
     # refusal spends the whole budget first -- `sh_boom` takes 29.9 s to refuse at
     # 200, against the tree's 30 s call timeout. `ax_rot` never converges; issue
     # 113's notes.
+    # That 29.9 s is **load**, not iterations: issue 261 measured the cap itself
+    # (`pair_tuck`, 100/100 at `time` 1.0) at 0.98 s of acados on a quiet box, i.e.
+    # ~10 ms/iteration. The same solve costs 34-41 s under 32-way CPU contention
+    # with the iteration count bit-identical. Read every wall-clock number here as
+    # that machine's load; the budget binds on contention, not on the cap.
     ocp_max_iterations: 100
     # The duration box `theta` is limited by, in seconds.
     ocp_duration_min: 2.0

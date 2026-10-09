@@ -333,6 +333,13 @@ Read wall clock here as an upper bound and nothing finer: the same solve measure
 0.60 and 2.65 s in three consecutive runs on a loaded box. Iteration counts are the
 comparable numbers; these are best of three.
 
+How wide "upper bound" is, measured for issue 261: the 100-iteration cap costs
+**0.98 s of acados / 1.29 s of planner call** at load ~3 (`pair_tuck`, `time` 1.0),
+and the *same* 37-iteration solve costs 0.44 s at load ~2 and 34-41 s under 32-way
+CPU contention. Iteration counts reproduce bit-for-bit across both. So a solve that
+reads as seconds is reporting the box, and the 11.5 s row above is a load-~15
+artefact of a ~1 s solve -- not 10x headroom spent on the cost weight.
+
 ## Tuning
 
 `plan_example.py` runs the deployment's own `Planner` against the checked-in
