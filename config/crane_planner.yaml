@@ -32,9 +32,10 @@ crane_planner:
     #     required = margin_safety + margin_interp + swing envelope
     # and no consecutive pair moves further than `margin_interp`, nothing touches
     # in between. Each part spent once; `margin_safety` is the clearance the answer
-    # carries. Envelope is `l_pendulum * sin(q_sway_max)`, computed not configured,
-    # owed by the hanging links only (README, "The collision certificate"). Halving
-    # `margin_interp` roughly doubles cost.
+    # carries. Envelope is computed, not configured: the hypotenuse of the two
+    # per-hinge chords `2 L sin(q_sway_max / 2)` -- the hinges are orthogonal and
+    # both reach their bound at once -- owed by the hanging links only (README,
+    # "The collision certificate"). Halving `margin_interp` roughly doubles cost.
     margin_safety: 0.05
     margin_interp: 0.10
     # Tool collision reach past the TCP. Over-estimate on purpose: too large costs
@@ -80,7 +81,7 @@ crane_planner:
     truck_headboard_thickness: 0.45
     truck_headboard_height: 1.922
 
-    # Cubic segments in the fitted path, whatever the sample count. **The dial that
+    # Quintic segments in the fitted path, whatever the sample count. **The dial that
     # keeps the certificate and the curve from fighting**: the certificate wants
     # dense samples, the curve wants long end intervals (clamped to leave/arrive at
     # rest). Interpolating squeezes the clamp into a sliver of s -- measured

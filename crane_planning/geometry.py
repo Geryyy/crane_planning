@@ -830,7 +830,7 @@ def lift_candidate(
     Lift one TCP polyline into joint space via continuation IK.
 
     Samples fix IK branch/interpolation bound, not executed or collision-checked -- the certificate
-    runs once, on the fitted C2 curve, since that curve executes.
+    runs once, on the fitted quintic, since that curve executes.
     """
     positions = _without_repeated_positions(candidate.positions_m)
     if len(positions) < 2:
@@ -915,10 +915,11 @@ def lift_joint_line(
 @dataclass
 class Path:
     """
-    q_a(s) on [0, 1], twice differentiable everywhere.
+    q_a(s) on [0, 1], quintic with simple interior knots, so C4 in s everywhere.
 
     A kink makes q_a'' unbounded there, so the certificate's step bound refuses it and any
-    differentiating consumer sees a spike.
+    differentiating consumer sees a spike. C4 rather than C2 because the PT1 inversion needs
+    one derivative beyond `qdddot_d` (`test_path_is_c4.py`).
     """
 
     spline: BSpline
@@ -1098,5 +1099,5 @@ def plan_fitted_path(
         summary += f"; and {len(failures) - 3} more corridor refusals"
     raise PlanningError(
         f"none of the {len(candidates)} deterministic tool corridors survives "
-        f"lifting, C2 fitting and collision certification: {summary}"
+        f"lifting, quintic fitting and collision certification: {summary}"
     )

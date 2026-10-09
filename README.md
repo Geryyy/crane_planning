@@ -119,10 +119,12 @@ tunnels.
 |---|---|
 | `margin_safety` | clearance the answer actually carries |
 | `margin_interp` | pays for the gap between two checked configurations |
-| `envelope` | `l_tool*sin(q_sway_max)` -- how far the tool swings inside the admissible box |
+| `envelope` | `hypot` of the two per-hinge chords `2 L sin(q_sway_max/2)` -- how far the carried body swings inside the admissible box |
 
-The envelope is **computed, not configured** -- pendulum length read from the
-description. One distance test at the hanging pose answers the whole box for any
+The envelope is **computed, not configured** -- each hinge's lever read from the
+description at the hanging pose, plus the carried body's reach past the TCP.
+Both hinges, because they are orthogonal and can be at their bound at once:
+dropping the upper one understates the PZS100's swing by 0.098 m. One distance test at the hanging pose answers the whole box for any
 configuration clearing more than `required`: no sway state can then reach
 anything.
 
@@ -159,11 +161,16 @@ Five planned coordinates against a four-DOF tool task leaves one redundant DOF,
 so every pose is reached by a one-parameter family and the IK picks one member by
 continuity from its seed.
 
-So the **goal configuration is an output of the walk, not an input**. Solving the
-goal independently picks its own member, and between two members there is a
-finite jump no refinement closes. What is specified is the goal *pose*; the cold
-multi-restart solve at the top of `plan` only establishes reachability and its
-answer is discarded.
+So for the Cartesian corridors the **goal configuration is an output of the
+walk, not an input**: solving the goal independently picks its own member, and
+between two members there is a finite jump no refinement closes. What is
+specified is the goal *pose*.
+
+The cold multi-restart solve at the top of `plan` is not thrown away, though. It
+establishes reachability, it is collision-checked so an occupied goal is refused
+in 0.1 s rather than after certifying every corridor, and it is the target of
+the joint-space line candidate — which needs no IK precisely because that
+configuration is already in hand.
 
 An IK branch change cannot slip through: it is a large joint step for an
 arbitrarily small tool step, so `step_bound` refuses it and the step halves until

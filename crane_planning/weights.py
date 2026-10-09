@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import numpy as np
 
-#: Stage residual order: y=[dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]; ddq_a was
-#: `u` when acceleration was the input, now a state since input is snap.
+#: Stage residual order: y=[dq_a, sway, dq_u, dynamic_tau, ddq_a, dddq_a]. `ddq_a` was
+#: the input when acceleration was; the input is snap now, and `ddq_a` is an expression
+#: in the path derivatives and the states `v`, `a` -- not itself a state.
 STAGE_BLOCKS = (
     ("dq_a", 5),
     ("sway", 2),

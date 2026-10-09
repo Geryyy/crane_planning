@@ -171,8 +171,8 @@ def read_limits(
     refs up to 2.7x the MPC bound). Rotator and tool rows stay unintersected
     (continuous joint; tool row is a retired jaw-gripper angle, not this
     rail). No cylinder-force constraint (unmeasured relief pressure);
-    `tau_max` is the description's per-joint effort, the scale `tau_weight`
-    divides by.
+    `tau_max` is the description's per-joint effort, the scale the
+    `dynamic_tau` residual row divides by.
 
     The position rows retreat `PLAN_MARGINS` margins, not one, so a plan built in
     *this* box never lies on a bound `crane_mpc` also enforces -- boom 0.04..1.523,
@@ -285,7 +285,7 @@ class PlannerConfig:
 
     q_sway_max: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2]))
 
-    #: Cubic segments in fitted path, independent of sample count (certificate dense, curve long).
+    #: Quintic segments in fitted path, independent of sample count (certificate dense, curve long).
     path_segments: int = 12
 
     # ocp_horizon is a *scaling*: solver carries theta = T/ocp_horizon, duration box limits answer.

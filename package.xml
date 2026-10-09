@@ -3,7 +3,7 @@
   <name>crane_planning</name>
   <version>0.1.0</version>
   <description>The `crane_planner` node: deterministic collision-checked tool
-    corridors lifted into the five planned joint coordinates, a C2 fit, and a
+    corridors lifted into the five planned joint coordinates, a quintic fit, and a
     vectorized dynamic timing certificate. Provides
     the legacy-compatible `/a2b_movement` service and publishes `/crane/reference`;
     grip motion is owned by concrete_block_motion_planning.</description>
