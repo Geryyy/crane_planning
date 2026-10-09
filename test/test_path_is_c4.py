@@ -82,7 +82,7 @@ def test_evaluate_and_path_expression_agree_at_every_level():
     assert coefficients.shape[1] == ORDER
 
     s = ca.SX.sym("s")
-    symbols = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
+    symbols = ca.SX.sym("c", segments * ORDER * cs.PLANNED_DOF)
     levels = ca.Function(
         "levels",
         [s, symbols],

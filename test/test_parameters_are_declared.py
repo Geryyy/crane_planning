@@ -76,12 +76,12 @@ def test_the_actuator_and_its_domain_are_the_ones_in_crane_model():
     """The same discipline for C3: the planner refuses what the feedforward
     cannot deliver, so its `k` and its domain have to be the deliverer's."""
     import numpy as np
-    from crane_model.symbolic import K_ACTUATOR_FIT
+    from crane_model.symbolic import ACTUATOR_FIT
     from crane_model.velocity_loop import load_velocity_loop
 
     declared = PlannerConfig()
-    assert np.array_equal(declared.command_k, np.asarray(K_ACTUATOR_FIT.k))
-    assert declared.command_dead_time_s == K_ACTUATOR_FIT.dead_time_s
+    assert np.array_equal(declared.command_k, np.asarray(ACTUATOR_FIT.k))
+    assert declared.command_dead_time_s == ACTUATOR_FIT.dead_time_s
 
     # Psi's domain is the inner loop's clamp -- one number, not two that drift.
     from crane_model.conventions import ACTUATED_INDICES, canonical_joints

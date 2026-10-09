@@ -16,16 +16,19 @@ from crane_model import (
 )
 from crane_model.conventions import (
     CONTROL_SAFE_AXES,
+    PLANNED_DOF,
+    PLANNED_INDICES,
+    TOOL_AXIS,
     canonical_joints,
     control_safe_limits,
 )
-from crane_model.symbolic import K_ACTUATOR_FIT
+from crane_model.symbolic import ACTUATOR_FIT
 from crane_model.velocity_loop import load_velocity_loop
 
-#: Five planned coordinates; tool axis (q8) held constant by the low-level controller.
-PLANNED_INDICES = ACTUATED_INDICES[:5]
-TOOL_INDEX = ACTUATED_INDICES[5]
-PLANNED_DOF = len(PLANNED_INDICES)
+#: Five planned coordinates; tool axis (q8) held constant by the low-level
+#: controller. `PLANNED_*` are `crane_model.conventions`', re-exported here
+#: because the rest of this package reads them off config.
+TOOL_INDEX = ACTUATED_INDICES[TOOL_AXIS]
 
 #: Frame each planned coordinate turns about; telescope is prismatic (`None` = no radius).
 PLANNED_FRAMES = (
@@ -320,7 +323,7 @@ class PlannerConfig:
     #: (telescope a geometry prior, rotator four bags -- indicative, not
     #: measured); read here, never repeated.
     command_k: np.ndarray = field(
-        default_factory=lambda: np.array(K_ACTUATOR_FIT.k, dtype=float)
+        default_factory=lambda: np.array(ACTUATOR_FIT.k, dtype=float)
     )
     #: Psi's identified domain; outside it the compensator extrapolates a monotone
     #: spline past its data. Value lives in `crane_model/config/velocity_loop.yaml`
@@ -336,11 +339,11 @@ class PlannerConfig:
     #: x25-x52. Common to every axis -- the fit pinned the dead time common. Value lives in
     #: `crane_model/config/c3_full_model.json`; read here, never repeated.
     command_dead_time_s: float = field(
-        default_factory=lambda: float(K_ACTUATOR_FIT.dead_time_s)
+        default_factory=lambda: float(ACTUATOR_FIT.dead_time_s)
     )
     #: s/axis, C3 block 2 PT1. Zero is shipped: feedforward inverts block3/RNEA/block1, not block2.
     #: Non-zero adds tau_v du/dt (path C4); the arm that turns it on is
-    #: `crane_model.symbolic.K_ACTUATOR_FIT.tau_v`, not restated here -- only the
+    #: `crane_model.symbolic.ACTUATOR_FIT.tau_v`, not restated here -- only the
     #: lag/dead-time sum is identified, so it is a choice, not a measurement.
     command_lag_s: np.ndarray = field(default_factory=lambda: np.zeros(5))
     visualization_samples: int = 25

@@ -63,11 +63,11 @@ NX, NU = 9, 1
 #: Row order of `h`; caller reads it back, must not re-derive.
 H_SWAY, H_FLOW, H_RATE = 0, 2, 3
 NH_SWAY = 2  # rows sway box occupies, stage and terminal alike
-H_ACCEL = 3 + cs.K_PLANNED_DOF
+H_ACCEL = 3 + cs.PLANNED_DOF
 #: C3 command, `u = dq_a + tau_dot_a / k`; not `dddq_a` (jerk alone priced a sum, not the worst case
 # the machine pays).
-H_COMMAND = 3 + 2 * cs.K_PLANNED_DOF
-NH = 3 + 3 * cs.K_PLANNED_DOF
+H_COMMAND = 3 + 2 * cs.PLANNED_DOF
+NH = 3 + 3 * cs.PLANNED_DOF
 #: Row order of `h_e`: settled box caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
@@ -173,7 +173,7 @@ TANGENT_STEP_MAX = 10.0
 
 def _no_offset(_q_a) -> np.ndarray:
     """No payload (or none declared): the closed form is the equilibrium."""
-    return np.zeros(cs.K_PASSIVE_DOF)
+    return np.zeros(cs.PASSIVE_DOF)
 
 
 def equilibrium(q_a, offset):
@@ -216,7 +216,7 @@ def cache_key(parameters: dict, hydraulics: dict, description: str) -> dict:
     baked["path_derivatives"] = PATH_DERIVATIVES
     #: Settled offset rides the last two rows of `p`; a tree built before it carries the
     #: old width and rejects every `set(node, "p", ...)`, so it has to move the directory.
-    baked["np_settled_offset"] = cs.K_PASSIVE_DOF
+    baked["np_settled_offset"] = cs.PASSIVE_DOF
     # Solver settings are generated into the C, so a tuning change must move the tree too.
     baked["tuning"] = solver_tuning()
     baked["description"] = hashlib.sha1(description.encode()).hexdigest()
@@ -299,7 +299,7 @@ def row_excess(rows, lh, uh, s, speed) -> float:
     )
 
 
-#: `h` rows in the order `solve` stacks them; planned axes in `K_PLANNED_ROWS` order.
+#: `h` rows in the order `solve` stacks them; planned axes in `PLANNED_INDICES` order.
 ROW_NAMES = ("sway tip", "sway tilt", "pump flow") + tuple(
     f"{kind} {axis}"
     for kind in ("velocity", "acceleration", "command")
@@ -513,14 +513,14 @@ def path_expression(s, coefficients, segments: int) -> list:
     """`PATH_DERIVATIVES` levels of the path as `casadi.SX`; symbolic mirror of `evaluate`, must agree at every level."""
     index = ca.fmin(ca.fmax(ca.floor(s * segments), 0.0), segments - 1)
     local = s - index / segments
-    value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(PATH_DERIVATIVES)]
+    value = [ca.SX.zeros(cs.PLANNED_DOF) for _ in range(PATH_DERIVATIVES)]
     for segment in range(segments):
         # comparison carries no derivative in casadi, so d/ds is the selected polynomial's own
         # -- correct at a breakpoint since C4 there.
         on = index == segment
         for m in range(ORDER):
-            first = (segment * ORDER + m) * cs.K_PLANNED_DOF
-            block = on * coefficients[first : first + cs.K_PLANNED_DOF]
+            first = (segment * ORDER + m) * cs.PLANNED_DOF
+            block = on * coefficients[first : first + cs.PLANNED_DOF]
             for order in range(min(PATH_DERIVATIVES, m + 1)):
                 scale = float(np.prod([m - k for k in range(order)]))
                 power = m - order
@@ -558,9 +558,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
         )
 
     s = ca.SX.sym("s")
-    q_u = ca.SX.sym("q_u", cs.K_PASSIVE_DOF)
+    q_u = ca.SX.sym("q_u", cs.PASSIVE_DOF)
     speed = ca.SX.sym("v")
-    dq_u = ca.SX.sym("dq_u", cs.K_PASSIVE_DOF)
+    dq_u = ca.SX.sym("dq_u", cs.PASSIVE_DOF)
     # `theta = T / T_nominal`: acados fixes `p` for a solve, horizon the solver picks cannot live
     # there.
     theta = ca.SX.sym("theta")
@@ -570,10 +570,10 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     snap = ca.SX.sym("snap")
     #: `path_segments` fixes the knot vector: only these numbers change between requests, solver
     # generated once.
-    coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
+    coefficients = ca.SX.sym("c", segments * ORDER * cs.PLANNED_DOF)
     #: Payload's shift of the hanging pair; last rows of `p` so `model.p` and the
     # coefficients keep the offsets every caller slices them at.
-    q_u_offset = ca.SX.sym("q_u_offset", cs.K_PASSIVE_DOF)
+    q_u_offset = ca.SX.sym("q_u_offset", cs.PASSIVE_DOF)
 
     q_a, tangent, curvature, third = path_expression(s, coefficients, segments)[:4]
     # Faa di Bruno on `q_a(t) = c(s(t))`, physical seconds since `v` = d s/dt. Snap not
@@ -587,11 +587,9 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     planned = ca.vertcat(model.x, model.u)
     moving = ca.vertcat(q_a, q_u, dq_a, dq_u, ddq_a)
     ddq_u = ca.substitute(model.ddq_u, planned, moving)
-    tau_a = ca.substitute(model.tau_a[: cs.K_PLANNED_DOF], planned, moving)
+    tau_a = ca.substitute(model.tau_a[: cs.PLANNED_DOF], planned, moving)
     flow = ca.substitute(
-        ca.sum1(
-            model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
-        ),
+        ca.sum1(model.z[cs.Z_AXIS_FLOW : cs.Z_AXIS_FLOW + cs.PLANNED_DOF]),
         planned,
         moving,
     )
@@ -628,11 +626,11 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     at_rest = ca.vertcat(
         q_a,
         equilibrium(q_a, q_u_offset),
-        ca.SX.zeros(cs.K_PLANNED_DOF),
-        ca.SX.zeros(cs.K_PASSIVE_DOF),
+        ca.SX.zeros(cs.PLANNED_DOF),
+        ca.SX.zeros(cs.PASSIVE_DOF),
         ca.SX.zeros(cs.NU),
     )
-    tau_static = ca.substitute(model.tau_a[: cs.K_PLANNED_DOF], planned, at_rest)
+    tau_static = ca.substitute(model.tau_a[: cs.PLANNED_DOF], planned, at_rest)
 
     # No `q_a` row: tracking a position the machine is on by construction only adds a stiff Hessian
     # direction.
@@ -654,7 +652,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     ocp = AcadosOcp()
     ocp.model = acados_model
     ocp.parameter_values = np.zeros(
-        cs.NP + segments * ORDER * cs.K_PLANNED_DOF + cs.K_PASSIVE_DOF
+        cs.NP + segments * ORDER * cs.PLANNED_DOF + cs.PASSIVE_DOF
     )
 
     # Yaml weights baked as defaults, still runtime-settable so a weight change needs no re-export.
@@ -846,9 +844,7 @@ class TrajectoryOcp:
             description_xml, {**baked, "weights": weights}, hydraulics
         )
         # Pump row in unreduced coordinates so reported/bounded cannot drift apart.
-        flow = ca.sum1(
-            model.z[cs.K_AXIS_FLOW_OFFSET : cs.K_AXIS_FLOW_OFFSET + cs.K_PLANNED_DOF]
-        )
+        flow = ca.sum1(model.z[cs.Z_AXIS_FLOW : cs.Z_AXIS_FLOW + cs.PLANNED_DOF])
         self._flow = ca.Function("flow", [model.x, model.u, model.p], [flow])
         self._command = model.command_function
         self.N = ocp.solver_options.N_horizon
@@ -970,7 +966,7 @@ class TrajectoryOcp:
         ubx = np.concatenate([[1.0, big], free, cfg.dq_sway_max, theta[1:]])
         # No measured accel/jerk: chain starts flat above the measured velocity.
         x0 = np.concatenate([[0.0, speed_start, 0.0, 0.0], q_u_start, dq_u_start])
-        planned = cs.K_PLANNED_DOF
+        planned = cs.PLANNED_DOF
         lh = np.concatenate(
             [
                 -np.ones(2),
@@ -1044,7 +1040,7 @@ class TrajectoryOcp:
                 float(
                     self._flow(
                         np.concatenate(
-                            [q, passive_equilibrium(q), dq, np.zeros(cs.K_PASSIVE_DOF)]
+                            [q, passive_equilibrium(q), dq, np.zeros(cs.PASSIVE_DOF)]
                         ),
                         np.zeros_like(dq),
                         parameters[: cs.NP],
@@ -1080,7 +1076,7 @@ class TrajectoryOcp:
                     [
                         [s, speed_guess[node], accel_guess[node], 0.0],
                         passive_equilibrium(guessed[node]) + offsets[node],
-                        np.zeros(cs.K_PASSIVE_DOF),
+                        np.zeros(cs.PASSIVE_DOF),
                         [duration_guess / self.nominal],
                     ]
                 ),
@@ -1143,8 +1139,8 @@ class TrajectoryOcp:
             + 3.0 * curvature * speed[:, None] * accel[:, None]
             + tangent * jerk[:, None]
         )
-        q_u = state[:, X_PASSIVE : X_PASSIVE + cs.K_PASSIVE_DOF]
-        dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.K_PASSIVE_DOF]
+        q_u = state[:, X_PASSIVE : X_PASSIVE + cs.PASSIVE_DOF]
+        dq_u = state[:, X_PASSIVE_RATE : X_PASSIVE_RATE + cs.PASSIVE_DOF]
         slack, sway_slack = slack_spent(solver, N)
         raw_flow = np.array(
             [
