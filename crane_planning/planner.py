@@ -52,11 +52,15 @@ from .geometry import (
     wrap,
     yaw_of,
 )
-from .ocp import SLACK_SPENT, Trajectory, TrajectoryOcp, evaluate, power_coefficients
+from .ocp import (
+    REST_VELOCITY,  # noqa: F401  -- defined there (the refusal quotes it), re-exported here
+    SLACK_SPENT,
+    Trajectory,
+    TrajectoryOcp,
+    evaluate,
+    power_coefficients,
+)
 
-#: rad/s (m/s telescope). Below = rest. Measured standing noise: rms .002-.005, max
-#: .0126 rad/s; old 1e-3 was under that floor (noise read as motion, plans died in QP1).
-REST_VELOCITY = 2e-2
 #: Duration floor of the pump retry, as a multiple of the duration that bought pump slack.
 PUMP_RETRY_STRETCH = 1.25
 

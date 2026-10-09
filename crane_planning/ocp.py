@@ -170,6 +170,12 @@ SIM_SUBSTEPS = 3
 # 0.9x/1.2x from rest; 10 clears both with an order to spare.
 TANGENT_STEP_MAX = 10.0
 
+#: rad/s (m/s telescope). Below = rest. Measured standing noise: rms .002-.005, max
+#: .0126 rad/s; old 1e-3 was under that floor (noise read as motion, plans died in QP1).
+#: Here rather than in `planner.py` (which re-exports it): the TANGENT_STEP_MAX refusal
+#: below quotes the start velocity against this deadband, and planner.py imports ocp.
+REST_VELOCITY = 2e-2
+
 
 def _no_offset(_q_a) -> np.ndarray:
     """No payload (or none declared): the closed form is the equilibrium."""
@@ -949,15 +955,25 @@ class TrajectoryOcp:
                 ]
             )
         )
+        # Two causes, and the message must not pick one: the old text asserted the
+        # noise floor outright and sent the reader to `REST_VELOCITY`. Issue 238
+        # measured this refusal three times on a machine that was genuinely still
+        # drifting after an aborted move -- peaks 2.3e-2, 4.6e-2 and 1.3e-1 rad/s,
+        # i.e. 1.2x to 6.7x REST_VELOCITY -- where raising the deadband would have
+        # planned from a state the machine is not in. Report the ratio against the
+        # deadband and let the caller tell the two apart.
         if np.any(dq_a_start) and tangent_start * TANGENT_STEP_MAX < interior:
+            peak = float(np.max(np.abs(dq_a_start)))
             raise PlanningError(
                 f"the fitted path leaves at {interior / tangent_start:.0f}x under "
                 f"its own interior speed: the measured start velocity peaks at "
-                f"{np.max(np.abs(dq_a_start)):.2e} rad/s, which this fit took for "
-                "the direction of travel and the timing solve cannot recover from. "
-                "That rate is the encoder noise floor, not motion -- raise "
-                "`REST_VELOCITY` (planner.py) above this machine's standing noise, "
-                "or plan from a machine that has settled"
+                f"{peak:.2e} rad/s, which this fit took for the direction of travel "
+                "and the timing solve cannot recover from. That is "
+                f"{peak / REST_VELOCITY:.1f}x the rest deadband REST_VELOCITY "
+                f"({REST_VELOCITY:.0e} rad/s, planner.py): near 1x it is this "
+                "machine's standing noise read as motion and the deadband is what "
+                "moves; well above it the machine really is moving, and the plan has "
+                "to be asked for again once it has settled"
             )
 
         # `s` in [0, 1], `v >= 0`: machine may not run backwards along its own curve.
