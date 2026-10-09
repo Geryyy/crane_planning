@@ -27,8 +27,10 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
     sys.path.insert(0, str(PACKAGE))
     sys.path.insert(0, str(PACKAGE.parent / "crane_model"))
 
-from crane_model import Frame  # noqa: E402
+import pinocchio as pin  # noqa: E402
+from crane_model import CollisionPrimitive, Frame, Payload  # noqa: E402
 from crane_planning import Planner, PlannerConfig, PlanningError, Start  # noqa: E402
+from crane_planning import geometry as geometry_module  # noqa: E402
 from crane_planning import planner as planner_module  # noqa: E402
 from crane_planning import weights as crane_weights  # noqa: E402
 from crane_planning.planner import (  # noqa: E402
@@ -97,7 +99,48 @@ WIDE_MOVES = (
 
 #: Timed separately, in call order; plan runs them as module functions/methods
 #: so wrapping names suffices -- no production edit, the point of a baseline.
+#: `swept` is inside `ik`/`path` (`Geometry._swept`), not beside them -- it is the
+#: sway branch-and-bound those two pay for per configuration, and the only stage
+#: a carried body changes by an order of magnitude, so it is reported separately.
 PHASES = ("prepare_scene", "geometry", "ik", "path", "coefficients", "ocp", "resample")
+NESTED = ("swept",)
+
+#: What `--carry` plans with. The block as the behaviour tree publishes it
+#: (`sim_captures/2026-10-09-pp-check/run1`: 800 kg, r=0.54, l=0.60, com in K8),
+#: the `truck` primitive as `config/crane_planner.yaml` documents the vehicle box,
+#: and five blocks on the ground inside reach -- 13 bodies after `expand_truck`,
+#: the order the live wall-assembly scene carries.
+#:
+#: Poses are in K0_mounting_base, so the vehicle box is *behind* the column and the
+#: bed top sits at K0's own height: ground is 1.26 m below K0 (the yaml's bed
+#: height), not 0. Placing it at its world-frame z stands the headboard through the
+#: machine and every pose refuses.
+CARRY_MASS = 800.0
+CARRY_COM = np.array([-0.010, -0.021, 1.032])
+CARRY_SHAPE = ("cylinder", np.array([1.08, 1.08, 0.60]), CARRY_COM)
+CARRY_SCENE = [
+    CollisionPrimitive(
+        id="truck",
+        shape="box",
+        pose_in_mounting_base=pin.SE3(np.eye(3), np.array([-5.2, 0.0, -0.33])),
+        dimensions_m=np.array([5.554, 2.518, 0.663]),
+        structural=True,
+    )
+] + [
+    CollisionPrimitive(
+        id=f"block_{index}",
+        shape="cylinder",
+        # Ground is ~1.26 m below K0 (the yaml's bed height), blocks 0.60 tall.
+        pose_in_mounting_base=pin.SE3(np.eye(3), np.array([x, y, -0.96])),
+        dimensions_m=np.array([1.08, 1.08, 0.60]),
+    )
+    for index, (x, y) in enumerate(
+        ((5.4, -1.2), (5.4, 0.0), (5.4, 1.2), (6.6, -0.6), (6.6, 0.6))
+    )
+]
+
+#: Carry from over one block to over a stack place, both inside the shared box.
+CARRY_MOVES = (("carry", (0.6, 0.4, 0.6, 1.0, 0.0), (-0.2, 0.5, 0.7, 1.3, 0.3)),)
 
 
 def description() -> str:
@@ -132,6 +175,7 @@ def timed(record: dict):
         wrap(planner_module, "power_coefficients", "coefficients"),
         wrap(planner_module.TrajectoryOcp, "solve", "ocp"),
         wrap(planner_module.Planner, "_resample", "resample"),
+        wrap(geometry_module.Geometry, "_swept", "swept"),
     ]
     try:
         yield
@@ -211,11 +255,16 @@ def utilisation(planner: Planner, timing) -> dict:
     }
 
 
-def run(planner: Planner, move, speed_scale: float) -> dict | None:
+def run(planner: Planner, move, speed_scale: float, carry: bool = False) -> dict | None:
     """One planned move, per-phase seconds plus what the solve reported."""
     _name, start_q, goal_q = move
     start = Start(q=configuration(planner, start_q), dq_a=np.zeros(5))
     position, yaw = goal_pose(planner, goal_q)
+    payload = (
+        Payload(mass_kg=CARRY_MASS, center_of_mass_k8_m=CARRY_COM, valid=True)
+        if carry
+        else None
+    )
     record: dict = defaultdict(float)
     started = time.perf_counter()
     try:
@@ -224,7 +273,9 @@ def run(planner: Planner, move, speed_scale: float) -> dict | None:
                 start,
                 position,
                 yaw,
-                scene=[],
+                payload=payload,
+                payload_shape=CARRY_SHAPE if carry else None,
+                scene=CARRY_SCENE if carry else [],
                 avoid_collisions=True,
                 speed_scale=speed_scale,
             )
@@ -242,16 +293,18 @@ def report(samples: dict) -> None:
     """Median and worst per phase, over every repeat of every move."""
     print(f"\n{'phase':<14} {'median s':>10} {'p90 s':>10} {'share':>7}")
     total = float(np.median(samples["total"]))
-    for phase in (*PHASES, "total"):
+    for phase in (*PHASES, *NESTED, "total"):
         values = np.asarray(samples[phase], dtype=float)
         if not values.size:
             continue
         median = float(np.median(values))
         share = "" if phase == "total" else f"{100.0 * median / total:6.1f}%"
+        label = f"{phase} *" if phase in NESTED else phase
         print(
-            f"{phase:<14} {median:10.3f} "
+            f"{label:<14} {median:10.3f} "
             f"{float(np.percentile(values, 90)):10.3f} {share:>7}"
         )
+    print("* nested inside ik/path, so its share is already counted there")
     acados = np.asarray(samples["acados"], dtype=float)
     ocp = np.asarray(samples["ocp"], dtype=float)
     print(
@@ -261,7 +314,9 @@ def report(samples: dict) -> None:
     )
     print(
         f"iterations    {int(np.median(samples['iterations']))} median, "
-        f"{int(np.max(samples['iterations']))} worst"
+        f"{int(np.max(samples['iterations']))} worst, "
+        f"{1e3 * float(np.median(acados)) / max(float(np.median(samples['iterations'])), 1.0):.0f} "
+        "ms each -- the load figure to quote (261)"
     )
 
 
@@ -289,10 +344,11 @@ def main() -> int:
     parser.add_argument(
         "--set",
         dest="move_set",
-        choices=("core", "wide", "all"),
+        choices=("core", "wide", "carry", "all"),
         default="core",
         help="`core` is the five long moves, `wide` adds single-axis, short and "
-        "near-limit ones; `all` is both",
+        "near-limit ones; `all` is both. `carry` is the one move planned with a "
+        "block hanging against `CARRY_SCENE`, which `core`/`wide` never are",
     )
     parser.add_argument(
         "--emit-requests",
@@ -302,7 +358,13 @@ def main() -> int:
     )
     options = parser.parse_args()
 
-    catalogue = {"core": MOVES, "wide": WIDE_MOVES, "all": MOVES + WIDE_MOVES}
+    catalogue = {
+        "core": MOVES,
+        "wide": WIDE_MOVES,
+        "carry": CARRY_MOVES,
+        "all": MOVES + WIDE_MOVES,
+    }
+    carry = options.move_set == "carry"
     moves = [m for m in catalogue[options.move_set] if options.only in (None, m[0])]
     if not moves:
         raise SystemExit(f"no move named {options.only!r}")
@@ -326,7 +388,12 @@ def main() -> int:
 
     # Discarded: first call pays for whatever the solver loaded lazily; a
     # baseline carrying that once is no baseline of a served request.
-    run(planner, moves[0], options.speed_scale)
+    run(planner, moves[0], options.speed_scale, carry)
+    if carry:
+        print(
+            f"carrying {CARRY_MASS:.0f} kg against "
+            f"{len(planner.prepare_scene(CARRY_SCENE, True))} bodies after truck expansion"
+        )
 
     samples: dict = defaultdict(list)
     # Utilisation beside duration: a move that got faster by spending a row it
@@ -338,7 +405,7 @@ def main() -> int:
     for move in moves:
         per_move: dict = defaultdict(list)
         for _ in range(options.repeats):
-            answer = run(planner, move, options.speed_scale)
+            answer = run(planner, move, options.speed_scale, carry)
             if "refused" in answer:
                 print(f"{move[0]:<14} refused: {answer['refused']}")
                 break
