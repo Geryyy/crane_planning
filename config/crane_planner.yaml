@@ -242,7 +242,6 @@ crane_planner:
     max_input_age: 0.5
     pendulum_state_deadline: 0.15
     max_scene_age: 10.0
-    payload_estimate_deadline: 1.0
 
     # --- the one hydraulic number the description does not carry -------------
     # Not set here. `pump_flow_max` and `pump_flow_planning_factor` are declared

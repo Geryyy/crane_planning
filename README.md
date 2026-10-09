@@ -447,7 +447,7 @@ bought pump limit through. Refused now, beside the same test. Not a tuning artef
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's name, for RViz |
 | | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |
 | | `~/solver_stats` (`diagnostic_msgs/DiagnosticArray`, transient-local) |
-| subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene`, `/crane/payload_estimate` |
+| subscribes | `/joint_states`, `/robot_description`, `/crane/collision_scene` |
 | frame | `K0_mounting_base` throughout; nothing is converted |
 
 One plan in two forms, published together and stamped alike: `/crane/joint_path` is the

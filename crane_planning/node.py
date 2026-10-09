@@ -15,7 +15,7 @@ from crane_model import (
     Tool,
     canonical_joints,
 )
-from crane_msgs.msg import CollisionScene, JointPath, PayloadEstimate
+from crane_msgs.msg import CollisionScene, JointPath
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
@@ -59,7 +59,6 @@ LEGACY_TCP_PATH_TOPIC = "tcp_path"
 MARKERS_TOPIC = "/crane_planner/markers"
 JOINT_STATES_TOPIC = "/joint_states"
 COLLISION_SCENE_TOPIC = "/crane/collision_scene"
-PAYLOAD_ESTIMATE_TOPIC = "/crane/payload_estimate"
 ROBOT_DESCRIPTION_TOPIC = "/robot_description"
 #: Last-request OCP result; private diagnostics like crane_mpc's `~/shadow_comparison`, latched.
 SOLVER_STATS_TOPIC = "~/solver_stats"
@@ -151,7 +150,6 @@ OTHER_PARAMETERS = (
     "max_input_age",
     "max_scene_age",
     "pendulum_state_deadline",
-    "payload_estimate_deadline",
     "c3_feedforward",
 )
 
@@ -164,7 +162,6 @@ class CranePlanner(Node):
         self.planner: Planner | None = None
         self.joint_states: deque = deque(maxlen=8)
         self.scene: CollisionScene | None = None
-        self.estimate: PayloadEstimate | None = None
 
         self.create_subscription(
             String, ROBOT_DESCRIPTION_TOPIC, self._description, latched()
@@ -175,9 +172,6 @@ class CranePlanner(Node):
         )
         self.create_subscription(
             CollisionScene, COLLISION_SCENE_TOPIC, self._collision_scene, latched()
-        )
-        self.create_subscription(
-            PayloadEstimate, PAYLOAD_ESTIMATE_TOPIC, self._payload_estimate, latched()
         )
         self.reference = self.create_publisher(
             JointTrajectory, REFERENCE_TOPIC, latched()
@@ -211,7 +205,6 @@ class CranePlanner(Node):
         # Test rig only: without it a scene-less collision request is refused (else empty-world).
         self.declare_parameter("allow_missing_scene", True)
         self.declare_parameter("pendulum_state_deadline", 0.15)
-        self.declare_parameter("payload_estimate_deadline", 1.0)
         # C3 inversion in effort field; controllers lacking effort_field_is_feedforward reject it.
         self.declare_parameter("c3_feedforward", True)
 
@@ -274,9 +267,6 @@ class CranePlanner(Node):
 
     def _collision_scene(self, message: CollisionScene) -> None:
         self.scene = message
-
-    def _payload_estimate(self, message: PayloadEstimate) -> None:
-        self.estimate = message
 
     def _start(self) -> Start:
         actuated = self._newest({self.joint_names[index] for index in ACTUATED_INDICES})
@@ -390,17 +380,6 @@ class CranePlanner(Node):
     def _payload(self, declared):
         mass = float(declared.mass)
         com = np.array([declared.com.x, declared.com.y, declared.com.z])
-        if self.estimate is not None and self.estimate.valid:
-            age = self._age(self.estimate.header)
-            if age <= self.get_parameter("payload_estimate_deadline").value:
-                mass = float(self.estimate.payload.mass)
-                com = np.array(
-                    [
-                        self.estimate.payload.com.x,
-                        self.estimate.payload.com.y,
-                        self.estimate.payload.com.z,
-                    ]
-                )
         payload = Payload(
             mass_kg=mass,
             center_of_mass_k8_m=com,
