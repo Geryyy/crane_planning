@@ -24,9 +24,10 @@ COEFFICIENTS[0, 2] = [-0.40, 0.70, 0.30, -0.50, 0.20]
 
 
 def test_the_path_carries_the_curve_endpoints_and_the_plans_own_duration():
+    law = np.linspace(0.0, 1.0, 9) ** 2
     plan = SimpleNamespace(
         timing=SimpleNamespace(
-            coefficients=COEFFICIENTS, time=np.linspace(0.0, 4.03, 9)
+            coefficients=COEFFICIENTS, time=np.linspace(0.0, 4.03, 9), s=law
         )
     )
     node = SimpleNamespace(joint_names=list(canonical_joints()))
@@ -39,4 +40,7 @@ def test_the_path_carries_the_curve_endpoints_and_the_plans_own_duration():
     assert q_path[0] == pytest.approx(evaluate(COEFFICIENTS, 0.0)[0])
     assert q_path[-1] == pytest.approx(evaluate(COEFFICIENTS, 1.0)[0])
     assert message.duration.sec + message.duration.nanosec * 1e-9 == pytest.approx(4.03)
+    # The `s` row as it stands, on the solve's own uniform-in-time grid: resampled
+    # or rescaled here it would be a second time law beside the planner's.
+    assert message.s_profile == pytest.approx(law)
     assert (message.header.stamp.sec, message.header.stamp.nanosec) == (7, 250000000)

@@ -67,6 +67,7 @@ def plan() -> SimpleNamespace:
         timing=SimpleNamespace(
             coefficients=COEFFICIENTS,
             time=np.linspace(0.0, 2.0, POINTS),
+            s=np.linspace(0.0, 1.0, POINTS),
             slack=0.0,
             stats={"acados_status": 0.0},
             report=dict,

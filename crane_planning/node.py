@@ -544,13 +544,16 @@ class CranePlanner(Node):
         return trajectory
 
     def _joint_path(self, plan, stamp) -> JointPath:
-        """Geometry off the planner's own curve, not the resample: no timing law in the path."""
+        """Geometry off the planner's own curve, not the resample, plus the pace it meant."""
         places = np.linspace(0.0, 1.0, PATH_SAMPLES)
         message = JointPath()
         message.header.stamp = stamp
         message.joint_names = [self.joint_names[index] for index in PLANNED_INDICES]
         # Row-major, one row per place: `evaluate` already returns (places, planned).
         message.q_path = evaluate(plan.timing.coefficients, places).reshape(-1).tolist()
+        # `timing.time` is uniform over [0, T], so the `s` row *is* s(t) sampled
+        # uniformly in time -- no resample, and the grid is the field's contract.
+        message.s_profile = [float(value) for value in plan.timing.s]
         total = float(plan.timing.time[-1])
         message.duration.sec = int(total)
         message.duration.nanosec = int((total - int(total)) * 1e9)

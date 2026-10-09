@@ -455,7 +455,7 @@ bought pump limit through. Refused now, beside the same test. Not a tuning artef
 |---|---|
 | services | `/a2b_movement` (`timber_crane_planning_interfaces/CalcMovement`) |
 | publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
-| | `/crane/joint_path` (`crane_msgs/JointPath`, transient-local) -- `q_a(s)`, stamped like the reference |
+| | `/crane/joint_path` (`crane_msgs/JointPath`, transient-local) -- `q_a(s)` plus the timing solve's own `s(t)` in `s_profile`, stamped like the reference |
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's name, for RViz |
 | | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |
