@@ -1,20 +1,30 @@
-"""`slow_down` divides rate/accel/jerk linearly, not by `s**k`: at s=0.5 on 21 bench
-moves, linear answered 3/5 core moves vs 1/5 under `s**k` (rules coincide at s=1)."""
+"""`slow_down` re-times the full-speed answer; it does not re-solve with tighter ceilings.
+
+Scaling the rate/accel/flow rows by `speed_scale` instead bought 1.3-1.6x the duration
+for a factor 2 and 1.7-2.3x for a factor 3, and refused `across` (16 s at full speed) at
+both -- what sets that duration is the sway rows, not a kinematic ceiling, so tightening
+the ceilings moves the answer somewhere else rather than slowing it down.
+"""
 
 import numpy as np
 import pinocchio as pin
+import pytest
 from crane_model import ACTUATED_INDICES, Frame
 from crane_planning import weights as crane_weights
-from crane_planning.config import PLANNED_INDICES, TOOL_INDEX, PlannerConfig
+from crane_planning.config import (
+    PLANNED_INDICES,
+    TOOL_INDEX,
+    PlannerConfig,
+    PlanningError,
+)
 from crane_planning.geometry import yaw_of
 from crane_planning.planner import Planner, Start
 from test_jerk_bound import GOAL, START, TOOL_POSITION, description
 
-#: at 0.25 refuses in the QP first iteration (start-guess failure, not a ceiling)
-SPEED_SCALE = 0.5
+SLOW_DOWN = 2.0
 
 
-def test_slow_down_divides_every_ceiling_once():
+def plans():
     config = PlannerConfig()
     planner = Planner(description(), config, dict(crane_weights.DEFAULTS))
 
@@ -33,27 +43,42 @@ def test_slow_down_divides_every_ceiling_once():
             np.concatenate([pose.position_m, pose.orientation_xyzw])
         ).rotation
     )
-    plan = planner.plan(
-        Start(q=configuration(START), dq_a=np.zeros(5)),
-        pose.position_m,
-        yaw,
-        scene=[],
-        avoid_collisions=True,
-        speed_scale=SPEED_SCALE,
+
+    def plan(speed_scale):
+        return planner.plan(
+            Start(q=configuration(START), dq_a=np.zeros(5)),
+            pose.position_m,
+            yaw,
+            scene=[],
+            avoid_collisions=True,
+            speed_scale=speed_scale,
+        )
+
+    return planner, plan
+
+
+def test_a_slowed_plan_is_the_fast_one_stretched():
+    planner, plan = plans()
+
+    fast = plan(1.0)
+    slow = plan(1.0 / SLOW_DOWN)
+
+    assert slow.duration == pytest.approx(SLOW_DOWN * fast.duration)
+    assert slow.timing.duration == pytest.approx(SLOW_DOWN * fast.timing.duration)
+    peak = np.max(np.abs(fast.timing.dq_a), axis=0)
+    assert np.max(np.abs(slow.timing.dq_a), axis=0) == pytest.approx(peak / SLOW_DOWN)
+    # The row every rate ceiling is written on, so the stretch cannot leave the box the
+    # full-speed answer met: half of what met it, met twice over.
+    assert np.all(peak <= planner.config.kappa * planner.limits.dq_max + 1.0e-6)
+    # Emitted reference too, not just the solve's grid: `time_from_start` is what the JTC
+    # paces the move by, and leaving it at the full-speed clock would run the machine fast
+    # while every velocity row claimed otherwise.
+    assert slow.time[-1] == pytest.approx(SLOW_DOWN * fast.time[-1])
+    emitted = slow.dq[:, list(PLANNED_INDICES)]
+    assert np.max(np.abs(emitted)) == pytest.approx(
+        np.max(np.abs(fast.dq[:, list(PLANNED_INDICES)])) / SLOW_DOWN, rel=1.0e-2
     )
 
-    reservation = config.kappa * SPEED_SCALE
-    peak_rate = np.max(np.abs(plan.timing.dq_a), axis=0)
-    peak_accel = np.max(np.abs(plan.timing.ddq_a), axis=0)
-    assert np.all(peak_rate <= reservation * planner.limits.dq_max + 1.0e-6), (
-        f"peak rate {peak_rate.tolist()} over {reservation} of "
-        f"{planner.limits.dq_max.tolist()}"
-    )
-    assert np.all(peak_accel <= reservation * config.ddq_a_max + 1.0e-6), (
-        f"peak acceleration {peak_accel.tolist()} over {reservation} of "
-        f"{config.ddq_a_max.tolist()}"
-    )
-
-    # discriminating: under s**k unavailable (accel reaches 1.03-1.48x of s**2's allowance)
-    # no jerk assertion: dddq_a_max is a cost scale now, bounds nothing
-    assert np.any(peak_accel > config.kappa * SPEED_SCALE**2 * config.ddq_a_max)
+    # `kappa` is the deployment's reservation and a scale above 1 would spend it.
+    with pytest.raises(PlanningError, match="speed_scale"):
+        plan(1.5)

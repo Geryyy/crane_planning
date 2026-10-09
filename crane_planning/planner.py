@@ -300,7 +300,6 @@ class Planner:
             dq_u_start=dq_u_start,
             payload=payload_vector,
             q_tool=start.q_tool,
-            speed_scale=speed_scale,
             settled_offset=offset,
         )
         timing = self.ocp.solve(**solve)
@@ -355,6 +354,11 @@ class Planner:
                 f"{self.config.terminal_dq_sway_max.tolist()}",
                 stats=timing.report(),
             )
+        # slow_down re-times the full-speed answer; scaling the solve's ceilings bought only
+        # 1.3-1.6x at 2 and refused `across` (bench_plan --set core, 2026-10-09).
+        timing = self.ocp.stretch(
+            timing, 1.0 / speed_scale, payload_vector, start.q_tool
+        )
         return self._resample(geometry, path, timing, start, lifted, candidate_name)
 
     def _validate_start(self, start: Start) -> Start:

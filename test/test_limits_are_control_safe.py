@@ -34,7 +34,7 @@ def limits():
 
 def test_the_rate_rows_ceiling_is_the_control_safe_one():
     """
-    The rate row is bounded at `kappa * speed_scale`, so its ceiling is that times
+    The rate row is bounded at `kappa`, so its ceiling is that times
     the divisor the solver was built with. Read off the built solver's `scale` --
     the same array `row_excess` mirrors and the exporter writes into the header --
     not off `read_limits`: the two used to disagree, the solver dividing by the
@@ -50,9 +50,8 @@ def test_the_rate_rows_ceiling_is_the_control_safe_one():
             {"pump_flow_max": config.pump_flow_max},
         )
 
-    for speed_scale in (1.0, 0.5):
-        ceiling = config.kappa * speed_scale * scale[H_RATE : H_RATE + PLANNED_DOF]
-        assert ceiling == pytest.approx(config.kappa * speed_scale * read.dq_max)
+    ceiling = config.kappa * scale[H_RATE : H_RATE + PLANNED_DOF]
+    assert ceiling == pytest.approx(config.kappa * read.dq_max)
     # discriminating: the boom's description row is 0.5257, which is what it read before
     assert scale[H_RATE + 1] == pytest.approx(0.239067)
 

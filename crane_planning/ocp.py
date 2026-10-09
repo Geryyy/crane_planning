@@ -21,7 +21,7 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import casadi as ca
@@ -909,30 +909,25 @@ class TrajectoryOcp:
         dq_u_start: np.ndarray,
         payload: np.ndarray,
         q_tool: float,
-        speed_scale: float,
         duration_min: float | None = None,
         settled_offset=None,
     ) -> Trajectory:
         """
-        Solve one request, or refuse with what the solver said.
+        Solve one request at full speed, or refuse with what the solver said.
 
-        `duration_min` raises the configured duration floor for this solve only.
-        `settled_offset(q_a)` is where the payload moves the hanging pair to (see
+        No speed scale: `slow_down` is `stretch`'s re-timing of the answer, not a set of
+        tighter ceilings here. `duration_min` raises the configured duration floor for this
+        solve only. `settled_offset(q_a)` is where the payload moves the hanging pair to (see
         `config.settled_offset`); without it the sway rows stay on the closed form.
         """
         cfg, lim, N = self.config, self.limits, self.N
         floor = cfg.ocp_duration_min if duration_min is None else duration_min
         solver, big = self.solver, 1.0e6
-        # `CalcMovement.slow_down` divides qDotMax/qDDotMax/qDDDotMax alike; s**2 on acceleration
-        # would remove the authority to cancel sway at the (fixed) pendulum frequency, so rate/accel
-        # scale linearly instead.
-        rate_hi = accel_hi = cfg.kappa * speed_scale
-        # Command row not scaled by `speed_scale`: slowing down doesn't shrink the valve's domain.
-        # `kappa` still applies.
+        rate_hi = accel_hi = cfg.kappa
         reference = np.maximum(np.abs(cfg.command_u_min), cfg.command_u_max)
         command_lo = cfg.kappa * cfg.command_u_min / reference
         command_hi = cfg.kappa * cfg.command_u_max / reference
-        flow_hi = cfg.kappa * speed_scale * lim.flow_max / cfg.pump_flow_max
+        flow_hi = cfg.kappa * lim.flow_max / cfg.pump_flow_max
         theta = np.array([floor, cfg.ocp_duration_max]) / self.nominal
 
         speed_start, unrepresentable = self.start_speed(coefficients, dq_a_start)
@@ -1028,11 +1023,8 @@ class TrajectoryOcp:
 
         # Uniform progress, pendulum hanging: no rollout. `1/nominal` alone guesses `ocp_horizon`
         # not the request: first QP fails outright when far off (needs 16s vs nominal 7, dies at SQP
-        # iter 1), since what sets 16s is sway rows, not a kinematic ceiling. `speed_scale` known:
-        # half speed roughly doubles duration, so the guess carries it.
-        duration_guess = float(
-            np.clip(self.nominal / speed_scale, floor, cfg.ocp_duration_max)
-        )
+        # iter 1), since what sets 16s is sway rows, not a kinematic ceiling.
+        duration_guess = float(np.clip(self.nominal, floor, cfg.ocp_duration_max))
         chain = None
         if INITIAL_GUESS == "PATH_PROFILE":
             chain = profile_guess(
@@ -1258,4 +1250,89 @@ class TrajectoryOcp:
             acados_time_s=float(solver.get_stats("time_tot")),
             residuals=residuals,
             stats=stats,
+        )
+
+    def stretch(
+        self, timing: Trajectory, slow_down: float, payload: np.ndarray, q_tool: float
+    ) -> Trajectory:
+        """
+        Re-time a solved plan `slow_down` x slower.
+
+        `q_a(s)` is untouched, so the clearance certificate holds verbatim, and every
+        derivative divides by `k` once per order, so every rate, acceleration and flow row
+        the solve met is met again. The hanging pair is re-timed the same way, not
+        re-integrated: a slower profile excites less swing (user, 2026-10-09).
+        """
+        k = float(slow_down)
+        if k == 1.0:
+            return timing
+        duration = timing.duration * k
+        speed, accel = timing.speed / k, timing.acceleration / k**2
+        jerk, snap = timing.jerk / k**3, timing.snap / k**4
+        parameters = np.concatenate(
+            [
+                [q_tool],
+                np.asarray(payload, dtype=float),
+                np.asarray(timing.coefficients, dtype=float).reshape(-1),
+            ]
+        )
+        # The payload's shift of the hanging pair, read back out of the row the solve
+        # centred its sway constraints on rather than evaluated a second time.
+        offsets = timing.q_u_eq - np.array(
+            [passive_equilibrium(row) for row in timing.q_a]
+        )
+        q_u, dq_u = timing.q_u, timing.dq_u / k
+        state = np.column_stack(
+            [
+                timing.s,
+                speed,
+                accel,
+                jerk,
+                q_u,
+                dq_u,
+                np.full(self.N + 1, duration / self.nominal),
+            ]
+        )
+        dq_a, ddq_a = timing.dq_a / k, timing.ddq_a / k**2
+        # Flow and command are not powers of the stretch: flow goes through |piston
+        # velocity| at the stretched pose, and `u = dq_a + tau_dot_a / k_i` mixes a static
+        # term that scales as 1/k with an inertial one that scales as 1/k**3. Both are
+        # re-read off the model, the same call the solve read them with.
+        flow = (
+            np.array(
+                [
+                    float(
+                        self._flow(
+                            np.concatenate([timing.q_a[n], q_u[n], dq_a[n], dq_u[n]]),
+                            ddq_a[n],
+                            parameters[: cs.NP],
+                        )
+                    )
+                    for n in range(self.N + 1)
+                ]
+            )
+            / self.config.pump_flow_max
+        )
+        command = np.array(
+            [
+                np.asarray(
+                    self._command(state[n], np.concatenate([parameters, offsets[n]]))
+                ).ravel()
+                for n in range(self.N + 1)
+            ]
+        )
+        return replace(
+            timing,
+            time=np.linspace(0.0, duration, self.N + 1),
+            dq_a=dq_a,
+            ddq_a=ddq_a,
+            dddq_a=timing.dddq_a / k**3,
+            command=command,
+            speed=speed,
+            acceleration=accel,
+            jerk=jerk,
+            snap=snap,
+            q_u=q_u,
+            dq_u=dq_u,
+            pump_flow=flow,
         )
