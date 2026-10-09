@@ -19,22 +19,22 @@ def test_row_excess_refuses_what_the_bookkeeping_would_not_see():
     `sway_slack` is a slack variable, not a state. This is the row itself.
     """
     lh, uh = -np.ones(3), np.ones(3)
-    sigma, speed = np.linspace(0.0, 1.0, 4), np.zeros(4)
+    s, speed = np.linspace(0.0, 1.0, 4), np.zeros(4)
 
-    # endpoints sit on the sigma box, so a clean iterate reaches zero, never above it
-    assert row_excess(np.zeros((4, 3)), lh, uh, sigma, speed) <= 0.0
+    # endpoints sit on the s box, so a clean iterate reaches zero, never above it
+    assert row_excess(np.zeros((4, 3)), lh, uh, s, speed) <= 0.0
 
     rows = np.zeros((4, 3))
     rows[2, 1] = 1.05  # one row, one node, 5% past its bound
-    assert row_excess(rows, lh, uh, sigma, speed) == pytest.approx(0.05)
+    assert row_excess(rows, lh, uh, s, speed) == pytest.approx(0.05)
 
-    # sigma past 1 runs the answer off the end of the certified curve
+    # s past 1 runs the answer off the end of the certified curve
     over = np.array([0.0, 0.3, 0.7, 1.2])
     assert row_excess(np.zeros((4, 3)), lh, uh, over, speed) == pytest.approx(0.2)
 
     # v < 0 runs the machine backwards along its own curve
     back = np.array([0.0, -0.4, 0.1, 0.0])
-    assert row_excess(np.zeros((4, 3)), lh, uh, sigma, back) == pytest.approx(0.4)
+    assert row_excess(np.zeros((4, 3)), lh, uh, s, back) == pytest.approx(0.4)
 
 
 def test_the_refusal_names_the_row_it_broke():

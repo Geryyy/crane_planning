@@ -19,10 +19,10 @@ COEFFICIENTS[0, 3] = [0.60, -0.30, 0.40, -0.50, 0.25]
 def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
     """Solved chain over `[0, duration]`: constant acceleration, zero above it."""
     time = np.linspace(0.0, duration, nodes + 1)
-    a = 2.0 / duration**2  # sigma(0) = 0, sigma(T) = 1, from rest
+    a = 2.0 / duration**2  # s(0) = 0, s(T) = 1, from rest
     return SimpleNamespace(
         time=time,
-        sigma=0.5 * a * time**2,
+        s=0.5 * a * time**2,
         speed=a * time,
         acceleration=np.full(nodes + 1, a),
         jerk=np.zeros(nodes + 1),
@@ -31,17 +31,17 @@ def timing(nodes: int = 4, duration: float = 2.0) -> SimpleNamespace:
     )
 
 
-def unclamped(coefficients, sigma) -> np.ndarray:
-    """`evaluate` as it was before the `sigma` clamp: segment index clipped, `sigma` not."""
-    sigma = np.atleast_1d(np.asarray(sigma, dtype=float))
+def unclamped(coefficients, s) -> np.ndarray:
+    """`evaluate` as it was before the `s` clamp: segment index clipped, `s` not."""
+    s = np.atleast_1d(np.asarray(s, dtype=float))
     segments = coefficients.shape[0]
-    index = np.clip(np.floor(sigma * segments).astype(int), 0, segments - 1)
-    local = sigma - index / segments
+    index = np.clip(np.floor(s * segments).astype(int), 0, segments - 1)
+    local = s - index / segments
     return sum(local[:, None] ** m * coefficients[index, m, :] for m in range(ORDER))
 
 
-def recovered_sigma(row: np.ndarray) -> float:
-    """`sigma` read back off coordinate 0, monotone over `[0, 1]`."""
+def recovered_s(row: np.ndarray) -> float:
+    """`s` read back off coordinate 0, monotone over `[0, 1]`."""
     dense = np.linspace(0.0, 1.0, 200001)
     return float(np.interp(row[0], evaluate(COEFFICIENTS, dense)[:, 0], dense))
 
@@ -52,7 +52,7 @@ def test_every_emitted_configuration_lies_on_the_curve():
     q_a, _, _ = actuated_samples(plan, stamps)
 
     for row in q_a:
-        on_curve = evaluate(COEFFICIENTS, recovered_sigma(row))[0]
+        on_curve = evaluate(COEFFICIENTS, recovered_s(row))[0]
         assert np.allclose(row, on_curve, atol=1e-6)
 
 
@@ -60,20 +60,20 @@ def test_the_chord_would_fail_this():
     """Oracle discriminates: linear interpolation over the nodes does not pass."""
     plan = timing()
     stamps = np.linspace(0.0, plan.time[-1], 37)
-    at_nodes = evaluate(COEFFICIENTS, plan.sigma)
+    at_nodes = evaluate(COEFFICIENTS, plan.s)
     chord = np.array(
         [np.interp(stamps, plan.time, at_nodes[:, i]) for i in range(PLANNED_DOF)]
     ).T
 
     worst = max(
-        float(np.max(np.abs(row - evaluate(COEFFICIENTS, recovered_sigma(row))[0])))
+        float(np.max(np.abs(row - evaluate(COEFFICIENTS, recovered_s(row))[0])))
         for row in chord
     )
     assert worst > 1e-3
 
 
 def test_a_reconstruction_past_the_end_stops_at_the_curves_endpoint():
-    """`sigma` is reconstructed, so it overshoots 1; past the end is the end, not more curve."""
+    """`s` is reconstructed, so it overshoots 1; past the end is the end, not more curve."""
     past = np.array([1.0, 1.0 + 1e-9, 1.01, 1.3])
     endpoint = evaluate(COEFFICIENTS, 1.0)[0]
     assert evaluate(COEFFICIENTS, past) == pytest.approx(

@@ -1,13 +1,13 @@
 """
 Trajectory OCP: definition + solver.
 
-`x = [sigma, v, a, j, q_u, dq_u, theta]`, `u = s`, time normalised to [0, 1].
+`x = [s, v, a, j, q_u, dq_u, theta]`, `u = snap`, time normalised to [0, 1].
 `theta = T / ocp_horizon`: one solve is time-optimal. `q_a` not decided here:
-geometric stage hands over certified curve `c(sigma)`, this only picks speed:
-    q_a   = c(sigma)
-    dq_a  = c'(sigma) v
-    ddq_a = c''(sigma) v^2 + c'(sigma) a
-`sigma` integrated 4x (input snap): `q_a(t)` is C4, what C3's flat inversion
+geometric stage hands over certified curve `c(s)`, this only picks speed:
+    q_a   = c(s)
+    dq_a  = c'(s) v
+    ddq_a = c''(s) v^2 + c'(s) a
+`s` integrated 4x (input snap): `q_a(t)` is C4, what C3's flat inversion
 needs. Executed curve is the certified curve: clearance proof holds verbatim.
 Each residual row / its limit, 1.0 is the bound, `W` preference alone -- one row
 in physical units wrecks Gauss-Newton conditioning (stalled at stationarity 1e6;
@@ -55,8 +55,8 @@ MANIFEST = "cache_key.json"
 BOOM_AXIS = 1
 ARM_AXIS = 2
 
-#: Row order of `x`: `sigma` chain, passive pair, then `theta`.
-X_SIGMA, X_SPEED, X_ACCEL, X_JERK = 0, 1, 2, 3
+#: Row order of `x`: `s` chain, passive pair, then `theta`.
+X_S, X_SPEED, X_ACCEL, X_JERK = 0, 1, 2, 3
 X_PASSIVE, X_PASSIVE_RATE, X_HORIZON = 4, 6, 8
 NX, NU = 9, 1
 
@@ -71,17 +71,17 @@ NH = 3 + 3 * cs.K_PLANNED_DOF
 #: Row order of `h_e`: settled box caller accepts.
 HE_SWAY, HE_SWAY_RATE, NH_E = 0, 2, 4
 
-#: Quintic path: degree 5, simple interior knots -> `C4` in `sigma` by construction.
+#: Quintic path: degree 5, simple interior knots -> `C4` in `s` by construction.
 ORDER = 6
 
-#: Derivative levels built off path: `c` through its fourth, what `q_a(t) = c(sigma(t))` needs.
+#: Derivative levels built off path: `c` through its fourth, what `q_a(t) = c(s(t))` needs.
 PATH_DERIVATIVES = 5
 
 #: Numerical guard on input, not physical; `solve` refuses if it binds. Swept 20/200/2000/20000 at
-# `speed_scale` 0.9: binding stops at 200, above it agrees to the hundredth (`max|s|`
+# `speed_scale` 0.9: binding stops at 200, above it agrees to the hundredth (`max|snap|`
 # 24.5/131.8/51.3/41.2, demand ~132). `H_COMMAND` carries the physical row, this bounds only snap,
 # loosely.
-SIGMA_INPUT_MAX = 2000.0
+SNAP_INPUT_MAX = 2000.0
 
 #: Row scales the caller reads off `Limits`, not off the description: `dq_max` is the
 #: description intersected with `crane_model/config/control_safe_limits.yaml`, so the
@@ -185,7 +185,7 @@ def equilibrium(q_a, offset):
     as much as the settled box is wide (0.03 rad measured), so a row centred on
     the closed form alone asked a carried plan to end somewhere the pendulum
     cannot rest. The caller writes it per node off `crane_model`'s numeric
-    solve; `sigma` is pinned at nodes `0` and `N`, so there it is the exact
+    solve; `s` is pinned at nodes `0` and `N`, so there it is the exact
     equilibrium of the pose the row is applied at.
     """
     return (
@@ -284,9 +284,9 @@ def residuals_at(solver, status: int) -> np.ndarray:
     return np.asarray(solver.get_residuals(recompute=True), dtype=float)
 
 
-def row_excess(rows, lh, uh, sigma, speed) -> float:
+def row_excess(rows, lh, uh, s, speed) -> float:
     """
-    Worst violation over the solver's own `h` rows and the `sigma`/`v` box, on the returned states.
+    Worst violation over the solver's own `h` rows and the `s`/`v` box, on the returned states.
 
     Same rows `res_ineq` covers, measured rather than read off bookkeeping that can belong to
     another iterate. Every row is already divided by its own limit, so the answer is a fraction
@@ -294,7 +294,7 @@ def row_excess(rows, lh, uh, sigma, speed) -> float:
     """
     return max(
         float(np.max(np.maximum(rows - uh, lh - rows))),
-        float(np.max(np.maximum(sigma - 1.0, -sigma))),
+        float(np.max(np.maximum(s - 1.0, -s))),
         float(np.max(-speed)),
     )
 
@@ -366,7 +366,7 @@ def divergence(key: dict) -> list:
 
 
 def power_coefficients(path, segments: int) -> np.ndarray:
-    """`(segments, ORDER, 5)`: `c(sigma) = sum_m a[k, m] (sigma - k/S)^m`. Power basis on uniform breakpoints, not B-spline, so the solver's segment lookup is a `floor`, not a knot search."""
+    """`(segments, ORDER, 5)`: `c(s) = sum_m a[k, m] (s - k/S)^m`. Power basis on uniform breakpoints, not B-spline, so the solver's segment lookup is a `floor`, not a knot search."""
     spline = path.spline
     breaks = np.unique(spline.t)
     if len(breaks) - 1 != segments or not np.allclose(
@@ -391,72 +391,77 @@ def power_coefficients(path, segments: int) -> np.ndarray:
     return np.stack(rows, axis=1)
 
 
-def evaluate(coefficients: np.ndarray, sigma, order: int = 0) -> np.ndarray:
-    """`c(sigma)` and derivatives, from the coefficients the solver holds; mirrors `path_expression` (not the spline) so reported equals constrained."""
-    # `sigma` clamped, not just the segment index: outside [0, 1] a clipped index still
+def evaluate(coefficients: np.ndarray, s, order: int = 0) -> np.ndarray:
+    """`c(s)` and derivatives, from the coefficients the solver holds; mirrors `path_expression` (not the spline) so reported equals constrained."""
+    # `s` clamped, not just the segment index: outside [0, 1] a clipped index still
     # evaluates the end segment's quintic at a `local` past its span, i.e. extrapolates off
     # the certified curve. Callers reach here with a reconstruction that can overshoot 1
     # (`actuated_samples`' quartic Taylor) or with a caller-supplied grid (`node._joint_path`).
-    sigma = np.clip(np.atleast_1d(np.asarray(sigma, dtype=float)), 0.0, 1.0)
+    s = np.clip(np.atleast_1d(np.asarray(s, dtype=float)), 0.0, 1.0)
     segments = coefficients.shape[0]
-    index = np.clip(np.floor(sigma * segments).astype(int), 0, segments - 1)
-    local = sigma - index / segments
-    out = np.zeros((sigma.size, coefficients.shape[2]))
+    index = np.clip(np.floor(s * segments).astype(int), 0, segments - 1)
+    local = s - index / segments
+    out = np.zeros((s.size, coefficients.shape[2]))
     for m in range(order, ORDER):
         scale = float(np.prod([m - k for k in range(order)])) if order else 1.0
         out += scale * (local[:, None] ** (m - order)) * coefficients[index, m, :]
     return out
 
 
-#: Initial guess for the `sigma` chain. "CONSTANT" is the shipped one: uniform progress at
+#: Initial guess for the `s` chain. "CONSTANT" is the shipped one: uniform progress at
 #: `ocp_horizon / speed_scale`, i.e. the same 7 s whatever was asked. "PATH_PROFILE" guesses the
 #: fastest profile the rate and acceleration rows alone allow. Read here, not compiled in, so it
 #: stays out of `cache_key` -- a variant of it reuses the solver.
 INITIAL_GUESS = os.environ.get("CRANE_PLANNING_OCP_INIT", "CONSTANT")
 
-#: Tangent below which a row constrains `s = v^2` directly instead of its slope (units of the
+#: Tangent below which a row constrains `v^2` directly instead of its slope (units of the
 #: normalised curve, so this is "that joint does not move here").
 TANGENT_EPS = 1.0e-9
 
 
 def path_profile(coefficients, dq_max, ddq_a_max, speed_start, samples: int):
-    """Fastest `(sigma, v)` the rate and acceleration rows alone allow on this curve: TOPP's velocity limit curve, then a forward and a backward pass in `s = v^2`. Sway, pump and the command row are not in it, so the duration this implies is a floor and the profile is a shape to start from -- never an answer."""
-    sigma = np.linspace(0.0, 1.0, samples)
+    """Fastest `(s, v)` the rate and acceleration rows alone allow on this curve: TOPP's velocity limit curve, then a forward and a backward pass in `v^2`. Sway, pump and the command row are not in it, so the duration this implies is a floor and the profile is a shape to start from -- never an answer."""
+    s = np.linspace(0.0, 1.0, samples)
     step = 1.0 / (samples - 1)
-    tangent = evaluate(coefficients, sigma, order=1)
-    curvature = evaluate(coefficients, sigma, order=2)
+    tangent = evaluate(coefficients, s, order=1)
+    curvature = evaluate(coefficients, s, order=2)
     moving = np.abs(tangent) > TANGENT_EPS
 
-    # Rate rows cap `v` outright. Where a joint is still, its acceleration row caps `s` instead --
-    # `ddq_a = c'' v^2 + c' a` has no `a` in it there.
+    # Rate rows cap `v` outright. Where a joint is still, its acceleration row caps `v^2` instead
+    # -- `ddq_a = c'' v^2 + c' a` has no `a` in it there.
     ceiling = np.where(
         moving, dq_max / np.maximum(np.abs(tangent), TANGENT_EPS), np.inf
     )
     still = ~moving & (np.abs(curvature) > TANGENT_EPS)
-    s_cap = np.where(
+    squared_cap = np.where(
         still, ddq_a_max / np.maximum(np.abs(curvature), TANGENT_EPS), np.inf
     )
-    limit = np.minimum(np.min(ceiling, axis=1) ** 2, np.min(s_cap, axis=1))
+    limit = np.minimum(np.min(ceiling, axis=1) ** 2, np.min(squared_cap, axis=1))
 
-    def slopes(node: int, s: float) -> tuple:
-        """Admissible `ds/dsigma` at `node`, from the acceleration rows at speed `s`."""
+    def slopes(node: int, squared: float) -> tuple:
+        """Admissible `d(v^2)/ds` at `node`, from the acceleration rows at `v^2 = squared`."""
         rows = moving[node]
         if not rows.any():
             return -np.inf, np.inf
         c1, c2 = tangent[node][rows], curvature[node][rows]
-        edge = 2.0 * (np.stack([-ddq_a_max[rows], ddq_a_max[rows]]) - c2 * s) / c1
+        edge = 2.0 * (np.stack([-ddq_a_max[rows], ddq_a_max[rows]]) - c2 * squared) / c1
         return float(np.max(np.min(edge, axis=0))), float(np.min(np.max(edge, axis=0)))
 
-    s = np.minimum(limit, np.inf)
-    s[0] = min(limit[0], speed_start**2)
+    squared = np.minimum(limit, np.inf)
+    squared[0] = min(limit[0], speed_start**2)
     for node in range(samples - 1):  # forward: accelerate as hard as the rows allow
-        s[node + 1] = min(s[node + 1], s[node] + step * slopes(node, s[node])[1])
-    s[-1] = 0.0  # arrives stopped, which is what the terminal box asks for
+        squared[node + 1] = min(
+            squared[node + 1], squared[node] + step * slopes(node, squared[node])[1]
+        )
+    squared[-1] = 0.0  # arrives stopped, which is what the terminal box asks for
     for node in range(samples - 2, -1, -1):  # backward: and brake in time
-        s[node] = min(s[node], s[node + 1] - step * slopes(node + 1, s[node + 1])[0])
-    s = np.maximum(s, 0.0)
+        squared[node] = min(
+            squared[node],
+            squared[node + 1] - step * slopes(node + 1, squared[node + 1])[0],
+        )
+    squared = np.maximum(squared, 0.0)
 
-    speed = np.sqrt(s)
+    speed = np.sqrt(squared)
     pair = speed[:-1] + speed[1:]
     duration = float(
         np.sum(
@@ -465,7 +470,7 @@ def path_profile(coefficients, dq_max, ddq_a_max, speed_start, samples: int):
             )
         )
     )
-    return sigma, speed, duration
+    return s, speed, duration
 
 
 #: What the profile's duration is multiplied by to guess the answer's. The profile prices rate and
@@ -476,8 +481,8 @@ PROFILE_SLACK = float(os.environ.get("CRANE_PLANNING_OCP_INIT_SLACK", "1.0"))
 def profile_guess(
     coefficients, dq_max, ddq_a_max, speed_start, nodes: int, samples: int = 201
 ):
-    """`(sigma, v, a, duration)` on the solver's grid, which is uniform in *time*, not in `sigma`. The shipped guess is uniform in `sigma`, which on a curve that accelerates and brakes is wrong at both ends. `None` when the profile says the curve cannot be traversed at all."""
-    sigma_of, speed, duration = path_profile(
+    """`(s, v, a, duration)` on the solver's grid, which is uniform in *time*, not in `s`. The shipped guess is uniform in `s`, which on a curve that accelerates and brakes is wrong at both ends. `None` when the profile says the curve cannot be traversed at all."""
+    s_of, speed, duration = path_profile(
         coefficients, dq_max, ddq_a_max, speed_start, samples
     )
     if not np.isfinite(duration) or duration <= 0.0:
@@ -498,19 +503,19 @@ def profile_guess(
     # its square, and the normalised grid does not move.
     duration = duration * PROFILE_SLACK
     times = np.linspace(0.0, elapsed[-1], nodes)
-    sigma = np.interp(times, elapsed, sigma_of)
+    s = np.interp(times, elapsed, s_of)
     v = np.interp(times, elapsed, speed) / PROFILE_SLACK
     a = np.gradient(v, times / PROFILE_SLACK, edge_order=1)
-    return sigma, v, a, duration
+    return s, v, a, duration
 
 
-def path_expression(sigma, coefficients, segments: int) -> list:
+def path_expression(s, coefficients, segments: int) -> list:
     """`PATH_DERIVATIVES` levels of the path as `casadi.SX`; symbolic mirror of `evaluate`, must agree at every level."""
-    index = ca.fmin(ca.fmax(ca.floor(sigma * segments), 0.0), segments - 1)
-    local = sigma - index / segments
+    index = ca.fmin(ca.fmax(ca.floor(s * segments), 0.0), segments - 1)
+    local = s - index / segments
     value = [ca.SX.zeros(cs.K_PLANNED_DOF) for _ in range(PATH_DERIVATIVES)]
     for segment in range(segments):
-        # comparison carries no derivative in casadi, so d/dsigma is the selected polynomial's own
+        # comparison carries no derivative in casadi, so d/ds is the selected polynomial's own
         # -- correct at a breakpoint since C4 there.
         on = index == segment
         for m in range(ORDER):
@@ -552,17 +557,17 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
             f"ocp_integrator is {integrator!r}, not one of {sorted(INTEGRATORS)}"
         )
 
-    sigma = ca.SX.sym("sigma")
+    s = ca.SX.sym("s")
     q_u = ca.SX.sym("q_u", cs.K_PASSIVE_DOF)
     speed = ca.SX.sym("v")
     dq_u = ca.SX.sym("dq_u", cs.K_PASSIVE_DOF)
     # `theta = T / T_nominal`: acados fixes `p` for a solve, horizon the solver picks cannot live
     # there.
     theta = ca.SX.sym("theta")
-    # Chain: `a`, `j` states, `s` input; holding snap constant leaves C4.
+    # Chain: `a`, `j` states, snap the input; holding snap constant leaves C4.
     acceleration = ca.SX.sym("a")
     jerk = ca.SX.sym("j")
-    snap = ca.SX.sym("s")
+    snap = ca.SX.sym("snap")
     #: `path_segments` fixes the knot vector: only these numbers change between requests, solver
     # generated once.
     coefficients = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
@@ -570,8 +575,8 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
     # coefficients keep the offsets every caller slices them at.
     q_u_offset = ca.SX.sym("q_u_offset", cs.K_PASSIVE_DOF)
 
-    q_a, tangent, curvature, third = path_expression(sigma, coefficients, segments)[:4]
-    # Faa di Bruno on `q_a(t) = c(sigma(t))`, physical seconds since `v` = d sigma/dt. Snap not
+    q_a, tangent, curvature, third = path_expression(s, coefficients, segments)[:4]
+    # Faa di Bruno on `q_a(t) = c(s(t))`, physical seconds since `v` = d s/dt. Snap not
     # built: jerk bound + input box already bounds `q_a''''`.
     dq_a = tangent * speed
     ddq_a = curvature * speed * speed + tangent * acceleration
@@ -593,7 +598,7 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
 
     acados_model = AcadosModel()
     acados_model.name = SOLVER_NAME
-    acados_model.x = ca.vertcat(sigma, speed, acceleration, jerk, q_u, dq_u, theta)
+    acados_model.x = ca.vertcat(s, speed, acceleration, jerk, q_u, dq_u, theta)
     acados_model.u = snap
     acados_model.p = ca.vertcat(model.p, coefficients, q_u_offset)
     acados_model.f_expl_expr = ca.vertcat(
@@ -689,8 +694,8 @@ def build_ocp(description_xml: str, parameters: dict, hydraulics: dict):
         setattr(ocp.constraints, f"lbx{stage}", -np.ones(NX))
         setattr(ocp.constraints, f"ubx{stage}", np.ones(NX))
     ocp.constraints.idxbu = np.arange(NU)
-    ocp.constraints.lbu = -np.full(NU, SIGMA_INPUT_MAX)
-    ocp.constraints.ubu = np.full(NU, SIGMA_INPUT_MAX)
+    ocp.constraints.lbu = -np.full(NU, SNAP_INPUT_MAX)
+    ocp.constraints.ubu = np.full(NU, SNAP_INPUT_MAX)
     for stage in ("_0", ""):
         setattr(ocp.constraints, f"lh{stage}", -np.ones(NH))
         setattr(ocp.constraints, f"uh{stage}", np.ones(NH))
@@ -748,9 +753,9 @@ class Trajectory:
     dddq_a: np.ndarray  # what the C3 inversion pays for, third term
     #: `u_d = dq_a + tau_dot_a / k` per axis, what `AddC3Feedforward` will command.
     command: np.ndarray
-    #: `q_a` is a function of these coefficients: resample `sigma`, don't interpolate `q_a` (that
+    #: `q_a` is a function of these coefficients: resample `s`, don't interpolate `q_a` (that
     # leaves the curve for a chord).
-    sigma: np.ndarray  # (N+1,)
+    s: np.ndarray  # (N+1,)
     speed: np.ndarray  # (N+1,)
     acceleration: np.ndarray  # (N+1,)
     jerk: np.ndarray  # (N+1,)
@@ -943,8 +948,8 @@ class TrajectoryOcp:
         interior = float(
             np.median(
                 [
-                    np.linalg.norm(evaluate(coefficients, sigma, order=1)[0])
-                    for sigma in np.linspace(0.0, 1.0, 21)
+                    np.linalg.norm(evaluate(coefficients, s, order=1)[0])
+                    for s in np.linspace(0.0, 1.0, 21)
                 ]
             )
         )
@@ -959,7 +964,7 @@ class TrajectoryOcp:
                 "or plan from a machine that has settled"
             )
 
-        # `sigma` in [0, 1], `v >= 0`: machine may not run backwards along its own curve.
+        # `s` in [0, 1], `v >= 0`: machine may not run backwards along its own curve.
         free = np.full(4, big)
         lbx = np.concatenate([[0.0, 0.0], -free, -cfg.dq_sway_max, theta[:1]])
         ubx = np.concatenate([[1.0, big], free, cfg.dq_sway_max, theta[1:]])
@@ -1026,15 +1031,15 @@ class TrajectoryOcp:
                 N + 1,
             )
         if chain is not None:
-            sigma_guess, speed_guess, accel_guess, duration_guess = chain
+            s_guess, speed_guess, accel_guess, duration_guess = chain
             duration_guess = float(np.clip(duration_guess, floor, cfg.ocp_duration_max))
         else:
-            sigma_guess = np.linspace(0.0, 1.0, N + 1)
+            s_guess = np.linspace(0.0, 1.0, N + 1)
             # Flow is |piston velocity| x area, so under uniform progress it goes as 1/T: start
             # where the pump allows. At 7 s a long carried reach drew 2.1x the pump and the SQP
             # settled on a local minimum that bought it (56 iterations, then the planner's retry).
-            q_guess = evaluate(coefficients, sigma_guess)
-            dq_guess = evaluate(coefficients, sigma_guess, order=1) / duration_guess
+            q_guess = evaluate(coefficients, s_guess)
+            dq_guess = evaluate(coefficients, s_guess, order=1) / duration_guess
             peak = max(
                 float(
                     self._flow(
@@ -1056,24 +1061,24 @@ class TrajectoryOcp:
             )
             speed_guess = np.full(N + 1, 1.0 / duration_guess)
             accel_guess = np.zeros(N + 1)
-        # Where the sway rows are centred, per node. Node `N` is read at `sigma = 1`
-        # whatever the guess says: its `sigma` is pinned there, and the settled box and
+        # Where the sway rows are centred, per node. Node `N` is read at `s = 1`
+        # whatever the guess says: its `s` is pinned there, and the settled box and
         # `plan`'s gate are measured against this row.
-        guessed = evaluate(coefficients, sigma_guess)
+        guessed = evaluate(coefficients, s_guess)
         guessed[-1] = evaluate(coefficients, 1.0)[0]
         offsets = np.array(
             [(settled_offset or _no_offset)(row) for row in guessed], dtype=float
         )
         solver.reset()
         for node in range(N + 1):
-            sigma = float(sigma_guess[node])
+            s = float(s_guess[node])
             solver.set(node, "p", np.concatenate([parameters, offsets[node]]))
             solver.set(
                 node,
                 "x",
                 np.concatenate(
                     [
-                        [sigma, speed_guess[node], accel_guess[node], 0.0],
+                        [s, speed_guess[node], accel_guess[node], 0.0],
                         passive_equilibrium(guessed[node]) + offsets[node],
                         np.zeros(cs.K_PASSIVE_DOF),
                         [duration_guess / self.nominal],
@@ -1082,10 +1087,10 @@ class TrajectoryOcp:
             )
             if node < N:
                 solver.set(node, "u", np.zeros(NU))
-                # `SIGMA_INPUT_MAX` is baked into the `.so`, not in the cache hash: changing it on a
+                # `SNAP_INPUT_MAX` is baked into the `.so`, not in the cache hash: changing it on a
                 # warm tree would be inert, same failure as weights.
-                solver.constraints_set(node, "lbu", -np.full(NU, SIGMA_INPUT_MAX))
-                solver.constraints_set(node, "ubu", np.full(NU, SIGMA_INPUT_MAX))
+                solver.constraints_set(node, "lbu", -np.full(NU, SNAP_INPUT_MAX))
+                solver.constraints_set(node, "ubu", np.full(NU, SNAP_INPUT_MAX))
                 solver.constraints_set(node, "lh", lh)
                 solver.constraints_set(node, "uh", uh)
                 solver.cost_set(node, "zl", np.full(soft, price))
@@ -1121,15 +1126,15 @@ class TrajectoryOcp:
         state = np.array([solver.get(node, "x") for node in range(N + 1)])
         control = np.array([solver.get(node, "u") for node in range(N)])
         control = np.vstack([control, control[-1]])
-        guard = float(np.max(np.abs(control))) / SIGMA_INPUT_MAX
+        guard = float(np.max(np.abs(control))) / SNAP_INPUT_MAX
         duration = float(state[0, X_HORIZON]) * self.nominal
-        sigma = state[:, X_SIGMA]
+        s = state[:, X_S]
         speed = state[:, X_SPEED]
         accel = state[:, X_ACCEL]
-        q_a = evaluate(coefficients, sigma)
-        tangent = evaluate(coefficients, sigma, order=1)
-        curvature = evaluate(coefficients, sigma, order=2)
-        third = evaluate(coefficients, sigma, order=3)
+        q_a = evaluate(coefficients, s)
+        tangent = evaluate(coefficients, s, order=1)
+        curvature = evaluate(coefficients, s, order=2)
+        third = evaluate(coefficients, s, order=3)
         dq_a = tangent * speed[:, None]
         ddq_a = curvature * speed[:, None] ** 2 + tangent * accel[:, None]
         jerk = state[:, X_JERK]
@@ -1190,7 +1195,7 @@ class TrajectoryOcp:
         # `res_ineq` is one scalar from bookkeeping and `sway_slack` is a slack variable, neither
         # of which is a statement about what was returned. Raising `ocp_max_iterations` instead
         # buys the same answer later and hides the cycle, so it is not the lever.
-        excess = row_excess(rows[:N], lh, uh, sigma, speed)
+        excess = row_excess(rows[:N], lh, uh, s, speed)
         admissible = (
             status == 2
             and float(np.max(residuals[1:])) <= cfg.ocp_tolerance
@@ -1211,7 +1216,7 @@ class TrajectoryOcp:
             )
         if guard > 0.99:
             raise PlanningError(
-                f"the snap guard bound at {guard:.2f} of {SIGMA_INPUT_MAX:g}: the "
+                f"the snap guard bound at {guard:.2f} of {SNAP_INPUT_MAX:g}: the "
                 "duration this answer carries is partly that constant's and not the "
                 "machine's",
                 stats=stats,
@@ -1223,7 +1228,7 @@ class TrajectoryOcp:
             ddq_a=ddq_a,
             dddq_a=dddq_a,
             command=command,
-            sigma=sigma,
+            s=s,
             speed=speed,
             acceleration=accel,
             jerk=jerk,

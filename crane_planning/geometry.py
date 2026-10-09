@@ -499,10 +499,10 @@ class Geometry:
         # below them, so its row bounds every body it was queried against too.
         # Uncapped, a stack under the links' bound was pruned while the block went through it.
         self._cap_by_carried(bounds, bounds, self.scene)
-        sigma, step, count = 0.0, INITIAL_LIFT_STEP, 1
-        while sigma < 1.0:
-            step = min(step, 1.0 - sigma)
-            candidate = path.position(sigma + step)
+        s, step, count = 0.0, INITIAL_LIFT_STEP, 1
+        while s < 1.0:
+            step = min(step, 1.0 - s)
+            candidate = path.position(s + step)
             motion = self.step_bound(previous, candidate)
             if motion > self.config.margin_interp:
                 step *= 0.5
@@ -510,7 +510,7 @@ class Geometry:
                     raise PlanningError(
                         f"the fitted path moves the machine faster than the "
                         f"{self.config.margin_interp:.3f} m interpolation margin "
-                        f"resolves near sigma = {sigma:.3f}, so it is not certified"
+                        f"resolves near s = {s:.3f}, so it is not certified"
                     )
                 continue
             for body in bounds:
@@ -524,12 +524,11 @@ class Geometry:
             clearance, required, body = self._decide(q, distances, near)
             if not clearance > required:
                 raise PlanningError(
-                    f"the fitted path is blocked at sigma = {sigma + step:.3f} "
-                    f"by '{body}'"
+                    f"the fitted path is blocked at s = {s + step:.3f} by '{body}'"
                 )
             bounds.update(distances)
             self._cap_by_carried(bounds, distances, near)
-            previous, sigma = candidate, sigma + step
+            previous, s = candidate, s + step
             count += 1
             if count > int(self.config.max_lift_samples):
                 raise PlanningError(
@@ -916,7 +915,7 @@ def lift_joint_line(
 @dataclass
 class Path:
     """
-    q_a(sigma) on [0, 1], twice differentiable everywhere.
+    q_a(s) on [0, 1], twice differentiable everywhere.
 
     A kink makes q_a'' unbounded there, so the certificate's step bound refuses it and any
     differentiating consumer sees a spike.
@@ -924,8 +923,8 @@ class Path:
 
     spline: BSpline
 
-    def position(self, sigma) -> np.ndarray:
-        return self.spline(sigma)
+    def position(self, s) -> np.ndarray:
+        return self.spline(s)
 
 
 def _densify(waypoints: np.ndarray, count: int) -> np.ndarray:
@@ -950,9 +949,9 @@ def fit(
     dq_start: np.ndarray,
 ) -> Path:
     """
-    Fit `q_a(sigma)` to the waypoints.
+    Fit `q_a(s)` to the waypoints.
 
-    Sigma is distributed by how long each chord takes at its slowest axis's limit,
+    `s` is distributed by how long each chord takes at its slowest axis's limit,
     so a segment slow in one coordinate gets more parameter -- arclength in
     `dq_max` metric (varies 1.05 over path on shipped defaults, not
     reparametrised). Approximates, not interpolates: interpolation ties segment
@@ -966,7 +965,7 @@ def fit(
         raise PlanningError("the lifted path carries fewer than two configurations")
 
     # degree 5: simple interior knots make degree-d B-spline C(d-1), quintic is C4 in
-    # sigma -- must match ocp.ORDER = degree + 1
+    # s -- must match ocp.ORDER = degree + 1
     degree = 5
     # exactly path_segments, never fewer: OCP is code-generated for that many
     # polynomials, so fewer pieces is a different problem. Resampling along own
@@ -1000,7 +999,7 @@ def fit(
     coefficients = np.array(spline.c, dtype=float)
     coefficients[0] = waypoints[0]
     coefficients[-1] = waypoints[-1]
-    # start slope is a boundary condition only while moving (dq_a = q_a'(sigma)*v,
+    # start slope is a boundary condition only while moving (dq_a = q_a'(s)*v,
     # q_a'(0) = dq_a*L); from rest no direction to honour, writing one would make
     # ddq_a singular. Goal end never clamped: arriving stopped is v=0, a timing
     # condition, not geometry's

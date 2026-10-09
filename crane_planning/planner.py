@@ -94,20 +94,20 @@ def actuated_samples(timing, stamps: np.ndarray) -> tuple:
     )
     dt = stamps - timing.time[node]
     v, a = timing.speed[node], timing.acceleration[node]
-    j, s = timing.jerk[node], timing.snap[node]
-    sigma = (
-        timing.sigma[node]
+    j, snap = timing.jerk[node], timing.snap[node]
+    s = (
+        timing.s[node]
         + v * dt
         + a * dt**2 / 2.0
         + j * dt**3 / 6.0
-        + s * dt**4 / 24.0
+        + snap * dt**4 / 24.0
     )
-    speed = v + a * dt + j * dt**2 / 2.0 + s * dt**3 / 6.0
-    accel = a + j * dt + s * dt**2 / 2.0
-    tangent = evaluate(timing.coefficients, sigma, order=1)
-    curvature = evaluate(timing.coefficients, sigma, order=2)
+    speed = v + a * dt + j * dt**2 / 2.0 + snap * dt**3 / 6.0
+    accel = a + j * dt + snap * dt**2 / 2.0
+    tangent = evaluate(timing.coefficients, s, order=1)
+    curvature = evaluate(timing.coefficients, s, order=2)
     return (
-        evaluate(timing.coefficients, sigma),
+        evaluate(timing.coefficients, s),
         tangent * speed[:, None],
         curvature * speed[:, None] ** 2 + tangent * accel[:, None],
     )

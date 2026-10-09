@@ -83,8 +83,8 @@ crane_planner:
     # Cubic segments in the fitted path, whatever the sample count. **The dial that
     # keeps the certificate and the curve from fighting**: the certificate wants
     # dense samples, the curve wants long end intervals (clamped to leave/arrive at
-    # rest). Interpolating squeezes the clamp into a sliver of sigma -- measured
-    # |q_a''| 361 at sigma = 0 against 0.4 in the interior.
+    # rest). Interpolating squeezes the clamp into a sliver of s -- measured
+    # |q_a''| 361 at s = 0 against 0.4 in the interior.
     path_segments: 12
 
     # --- what "settled" and "admissible" mean --------------------------------

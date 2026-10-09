@@ -1,4 +1,4 @@
-"""Snap as input makes sigma quartic per interval, C4 in time -- accel-as-input
+"""Snap as input makes s quartic per interval, C4 in time -- accel-as-input
 held ddq_a constant per node and only gave C1."""
 
 from pathlib import Path
@@ -15,7 +15,7 @@ from crane_planning.ocp import (
     X_ACCEL,
     X_HORIZON,
     X_JERK,
-    X_SIGMA,
+    X_S,
     X_SPEED,
     baked_parameters,
     build_ocp,
@@ -56,7 +56,7 @@ def test_the_state_layout_is_what_the_model_carries():
     assert ocp.model.x.shape[0] == NX
     assert ocp.model.u.shape[0] == NU
     names = [str(ocp.model.x[row]) for row in range(NX)]
-    assert names[X_SIGMA] == "sigma"
+    assert names[X_S] == "s"
     assert names[X_SPEED] == "v"
     assert names[X_ACCEL] == "a"
     assert names[X_JERK] == "j"
@@ -68,24 +68,27 @@ def chain(snap: np.ndarray, duration: float = 2.0) -> SimpleNamespace:
     nodes = len(snap)
     time = np.linspace(0.0, duration, nodes + 1)
     step = duration / nodes
-    sigma, speed, accel, jerk = (np.zeros(nodes + 1) for _ in range(4))
+    s, speed, accel, jerk = (np.zeros(nodes + 1) for _ in range(4))
     speed[0] = 0.05
-    for k, s in enumerate(snap):
-        sigma[k + 1] = (
-            sigma[k]
+    for k, snap_k in enumerate(snap):
+        s[k + 1] = (
+            s[k]
             + speed[k] * step
             + accel[k] * step**2 / 2.0
             + jerk[k] * step**3 / 6.0
-            + s * step**4 / 24.0
+            + snap_k * step**4 / 24.0
         )
         speed[k + 1] = (
-            speed[k] + accel[k] * step + jerk[k] * step**2 / 2.0 + s * step**3 / 6.0
+            speed[k]
+            + accel[k] * step
+            + jerk[k] * step**2 / 2.0
+            + snap_k * step**3 / 6.0
         )
-        accel[k + 1] = accel[k] + jerk[k] * step + s * step**2 / 2.0
-        jerk[k + 1] = jerk[k] + s * step
+        accel[k + 1] = accel[k] + jerk[k] * step + snap_k * step**2 / 2.0
+        jerk[k + 1] = jerk[k] + snap_k * step
     return SimpleNamespace(
         time=time,
-        sigma=sigma,
+        s=s,
         speed=speed,
         acceleration=accel,
         jerk=jerk,
@@ -101,8 +104,8 @@ def test_the_resampler_reproduces_the_chain_at_the_next_node():
     edges = plan.time[1:] - 1.0e-12  # inside interval k, at its right edge
     q_a, dq_a, _ = actuated_samples(plan, edges)
 
-    expected_q = evaluate(COEFFICIENTS, plan.sigma[1:])
-    expected_dq = evaluate(COEFFICIENTS, plan.sigma[1:], order=1) * plan.speed[1:, None]
+    expected_q = evaluate(COEFFICIENTS, plan.s[1:])
+    expected_dq = evaluate(COEFFICIENTS, plan.s[1:], order=1) * plan.speed[1:, None]
     assert q_a == pytest.approx(expected_q, abs=1e-9)
     assert dq_a == pytest.approx(expected_dq, abs=1e-9)
 
@@ -112,8 +115,6 @@ def test_a_quadratic_reconstruction_would_fail_that():
     plan = chain(np.array([3.0, -2.0, 1.5, -4.0, 0.5]))
     step = plan.time[1] - plan.time[0]
     quadratic = (
-        plan.sigma[:-1]
-        + plan.speed[:-1] * step
-        + 0.5 * plan.acceleration[:-1] * step**2
+        plan.s[:-1] + plan.speed[:-1] * step + 0.5 * plan.acceleration[:-1] * step**2
     )
-    assert np.max(np.abs(quadratic - plan.sigma[1:])) > 1e-3
+    assert np.max(np.abs(quadratic - plan.s[1:])) > 1e-3

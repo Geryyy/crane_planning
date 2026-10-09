@@ -56,9 +56,9 @@ class FakeGeometry:
 
     def check_path(self, path):
         """Real certificate's contract: fitted curve, not polyline."""
-        for sigma in np.linspace(0.0, 1.0, 201):
-            if not self.is_valid(path.position(sigma)):
-                raise planning.PlanningError(f"blocked at sigma = {sigma:.3f}")
+        for s in np.linspace(0.0, 1.0, 201):
+            if not self.is_valid(path.position(s)):
+                raise planning.PlanningError(f"blocked at s = {s:.3f}")
 
 
 @pytest.fixture
@@ -151,7 +151,7 @@ def test_blocked_direct_line_uses_overhead_corridor(identity_ik):
     start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
     path, name = certify(FakeGeometry(), start, [1.0, 0.0, 0.0])
     assert name.startswith("lift/traverse/descend")
-    sampled = np.array([path.position(sigma) for sigma in np.linspace(0.0, 1.0, 201)])
+    sampled = np.array([path.position(s) for s in np.linspace(0.0, 1.0, 201)])
     assert np.max(sampled[:, 2]) >= 0.45
     assert np.allclose(path.position(1.0)[:3], [1.0, 0.0, 0.0])
 

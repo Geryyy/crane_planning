@@ -185,10 +185,10 @@ half-width of 0.2 rad.
 
 ## The certified curve
 
-Least-squares **quintic** B-spline through the lifted configurations, `sigma`
+Least-squares **quintic** B-spline through the lifted configurations, `s`
 distributed by how long each chord takes at its slowest axis's limit. Degree 5,
 not 3: simple interior knots make a degree-`d` B-spline C(d-1), so a quintic is
-C4 in sigma -- the derivative count C3's flat inversion consumes, out of the
+C4 in s -- the derivative count C3's flat inversion consumes, out of the
 parameterisation rather than enforced. A kink is not a curve the machine can
 follow either way. `geometry.fit`'s docstring carries the rest; `ocp.ORDER` must
 stay `degree + 1`.
@@ -220,9 +220,9 @@ everything.
 **`q_a` is not a decision variable.** It is handed the certified curve and moves
 *along* it, deciding only how fast:
 
-    q_a = c(sigma)   dq_a = c'(sigma) v   ddq_a = c''(sigma) v^2 + c'(sigma) a
+    q_a = c(s)   dq_a = c'(s) v   ddq_a = c''(s) v^2 + c'(s) a
 
-`sigma` is integrated **four** times -- `x = [sigma, v, a, j, q_u, dq_u, theta]`
+`s` is integrated **four** times -- `x = [s, v, a, j, q_u, dq_u, theta]`
 and the input is snap -- so `q_a(t)` is C4, which is what C3's flat inversion
 consumes. Holding acceleration constant per interval left it C1. The jerk the C3
 feedforward can afford is a hard row per axis; `c3_feedforward:=false` at launch
@@ -236,7 +236,7 @@ duration and buys back half the SQP iterations. The price is lateral authority:
 sway is damped by timing alone.
 
 Joint velocity and acceleration, reserved pump flow and the sway box are
-constraints in the solve; `sigma` is boxed to [0, 1] and `v >= 0`, because the
+constraints in the solve; `s` is boxed to [0, 1] and `v >= 0`, because the
 machine may not run backwards along its own curve. `q_a` needs no range row -- it
 is on the curve, and `fit` already refused a curve leaving joint range. Terminal
 sway offset and rate are checked after the solve against
@@ -260,7 +260,7 @@ half-periods. `theta` then sits in a flat valley and there is no descent
 direction to find.
 
 So a status-2 iterate is admitted when it earns it: `eq`/`ineq`/`comp` within
-`ocp_tolerance`, and **every `h` row plus the `sigma`/`v` box re-measured on the
+`ocp_tolerance`, and **every `h` row plus the `s`/`v` box re-measured on the
 states acados handed back** (`row_excess`). That last part is the one that
 matters. `res_ineq` is a single scalar out of solver bookkeeping, and acados
 leaves the residuals unevaluated at the cap unless `eval_residual_at_max_iter`
@@ -427,7 +427,7 @@ attempt in a two-stage scheme, not a default.
 Left in, off: `path_profile` (`CRANE_PLANNING_OCP_INIT=PATH_PROFILE`), TOPP's
 forward-backward pass in `s = v^2`, replacing a guess that is `ocp_horizon /
 speed_scale` -- the same 7 s whatever was asked, against answers of 5.8-15.6 s --
-and uniform in `sigma` where the grid is uniform in time. Worth 11 refusals to 5
+and uniform in `s` where the grid is uniform in time. Worth 11 refusals to 5
 alone, but it does not stack with the feasibility QP (68 against 72), and the
 cheaper fix is the one that is only settings.
 
@@ -442,7 +442,7 @@ bought pump limit through. Refused now, beside the same test. Not a tuning artef
 |---|---|
 | services | `/a2b_movement` (`timber_crane_planning_interfaces/CalcMovement`) |
 | publishes | `/crane/reference` (`trajectory_msgs/JointTrajectory`, transient-local) |
-| | `/crane/joint_path` (`crane_msgs/JointPath`, transient-local) -- `q_a(sigma)`, stamped like the reference |
+| | `/crane/joint_path` (`crane_msgs/JointPath`, transient-local) -- `q_a(s)`, stamped like the reference |
 | | `/crane_planner/planned_path` (`nav_msgs/Path`, visualization only) |
 | | `tcp_path` (`nav_msgs/Path`) -- the legacy A2B server's name, for RViz |
 | | `/crane_planner/markers` (`visualization_msgs/MarkerArray`, transient-local) |

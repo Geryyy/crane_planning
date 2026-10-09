@@ -21,14 +21,14 @@ COEFFICIENTS[0, 1] = [1.20, -0.60, 0.90, 0.40, -0.30]
 def timing(gap: float, duration: float, nodes: int = 8) -> SimpleNamespace:
     """Solve stopping at `T`, whose last interval misses it by `gap` rad/s."""
     time = np.linspace(0.0, duration, nodes + 1)
-    # sigma(t) = 3 (t/T)^2 - 2 (t/T)^3: starts and ends at rest, ends at 1.
+    # s(t) = 3 (t/T)^2 - 2 (t/T)^3: starts and ends at rest, ends at 1.
     tau = time / duration
     speed = (6.0 * tau - 6.0 * tau**2) / duration
     speed[-2] += gap  # reconstructs last sample
     return SimpleNamespace(
         time=time,
         duration=duration,
-        sigma=3.0 * tau**2 - 2.0 * tau**3,
+        s=3.0 * tau**2 - 2.0 * tau**3,
         speed=speed,
         acceleration=(6.0 - 12.0 * tau) / duration**2,
         jerk=np.full(nodes + 1, -12.0 / duration**3),

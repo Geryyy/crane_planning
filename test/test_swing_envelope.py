@@ -16,7 +16,6 @@ from crane_model import (
     Tool,
 )
 from crane_model import PASSIVE_INDICES as SWAY
-
 from crane_planning.config import (
     PLANNED_DOF,
     TOOL_INDEX,
@@ -216,8 +215,8 @@ class _Line:
     def __init__(self, start, goal):
         self.start, self.goal = np.asarray(start, float), np.asarray(goal, float)
 
-    def position(self, sigma):
-        return self.start + sigma * (self.goal - self.start)
+    def position(self, s):
+        return self.start + s * (self.goal - self.start)
 
 
 def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
@@ -257,7 +256,7 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
 
     # slew towards it: wall is 4 m out, tool arcs to within the margin
     queried.clear()
-    with pytest.raises(Exception, match="blocked at sigma"):
+    with pytest.raises(Exception, match="blocked at s"):
         scene.check_path(_Line(np.zeros(PLANNED_DOF), [1.3, 0.0, 0.0, 0.0, 0.0]))
     assert any("far" in bodies for bodies in queried[1:])
 

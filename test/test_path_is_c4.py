@@ -1,4 +1,4 @@
-"""Path must be C4 in sigma (PT1 inversion needs one derivative beyond qdddot_d);
+"""Path must be C4 in s (PT1 inversion needs one derivative beyond qdddot_d);
 quintic gives that by construction where a C2 cubic B-spline would not."""
 
 import casadi as ca
@@ -81,12 +81,12 @@ def test_evaluate_and_path_expression_agree_at_every_level():
     segments = coefficients.shape[0]
     assert coefficients.shape[1] == ORDER
 
-    sigma = ca.SX.sym("sigma")
+    s = ca.SX.sym("s")
     symbols = ca.SX.sym("c", segments * ORDER * cs.K_PLANNED_DOF)
     levels = ca.Function(
         "levels",
-        [sigma, symbols],
-        path_expression(sigma, symbols, segments),
+        [s, symbols],
+        path_expression(s, symbols, segments),
     )
 
     flat = coefficients.reshape(-1)
