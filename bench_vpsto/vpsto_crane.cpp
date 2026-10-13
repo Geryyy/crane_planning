@@ -84,7 +84,7 @@ public:
         T = std::max(T, std::abs(qp[k * NDOF + i]) / dq_max[i]);
         T = std::max(T, std::sqrt(std::abs(qpp[k * NDOF + i]) / ddq_max[i]));
       }
-      // flow is linear in dq, so Q(q, q') is the flow at T = 1
+      // flow is positively homogeneous in dq (A(sign v)|v|), so Q(q, q') is the flow at T = 1
       const double * in[2] = {&q[k * NDOF], &qp[k * NDOF]};
       double flow = 0.;
       double * out[1] = {&flow};

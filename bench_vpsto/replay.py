@@ -77,6 +77,7 @@ class Replay:
             terminal_sway=float(np.abs(sway[n]).max()),
             terminal_rate=float(np.abs(rate[n]).max()),
             peak_sway=float(np.abs(sway[: n + 1]).max()),
+            residual_sway=float(np.abs(sway[n:]).max()),
             settled_at_T=bool(inside[n]),
             settle_s=float(settle),
         )

@@ -2,6 +2,7 @@
 
 import ctypes as C
 import json
+import os
 
 import numpy as np
 from common import GEN, HERE
@@ -14,6 +15,7 @@ _lib = None
 def lib():
     global _lib
     if _lib is None:
+        os.chdir(HERE / "build")  # ccmaes drops actparcmaes.par in the cwd
         _lib = C.CDLL(str(HERE / "build" / "libvpsto_crane.so"))
         _lib.vc_create.restype = C.c_void_p
         _lib.vc_cost.restype = _lib.vc_collision.restype = C.c_double
@@ -43,6 +45,7 @@ class CraneVpsto:
     ):
         """scene: CollisionPrimitives in K0 (already truck-expanded); payload_shape as Planner's."""
         L = lib()
+        self.lower, self.upper = np.asarray(lower), np.asarray(upper)
         self.h = C.c_void_p(
             L.vc_create(
                 _p(dq_max),
@@ -117,3 +120,8 @@ class CraneVpsto:
 
     def collision(self, q5):
         return lib().vc_collision(self.h, _p(q5))
+
+
+def set_threads(n):
+    """Set the OpenMP count for the whole process; acados and VP-STO share libgomp."""
+    C.CDLL("libgomp.so.1").omp_set_num_threads(int(n))

@@ -21,13 +21,8 @@ from crane_model.collision import default_collision_model_path
 from crane_model.symbolic import CraneSymbolicModel
 from crane_planning.planner import PASSIVE_INDICES, PLANNED_INDICES, TOOL_INDEX
 
-# EcB25 Eq 13-14 link weights; links upstream of the boom (column, base, boxes) are absent.
-WEIGHTS = {
-    "K2_boom": 1e5,
-    "K3_arm": 1e4,
-    "K4_outer_telescope": 1e3,
-    "K5_inner_telescope": 1e3,
-}
+# EcB25 Eq 13-14 link weights (K5 inner telescope down incl. gripper: 1e2); links upstream of the boom (column, base, boxes) are absent.
+WEIGHTS = {"K2_boom": 1e5, "K3_arm": 1e4, "K4_outer_telescope": 1e3}  # rest 1e2
 UPSTREAM = {
     "K0_mounting_base",
     "K1_slewing_column",

@@ -10,6 +10,8 @@ import bench_plan as bp
 import casadi as ca
 import numpy as np
 import pinocchio as pin
+import pinocchio.casadi as cpin
+from bench_vpsto import cases, cost_model
 from common import GEN, description
 from crane_model import CraneModel, Frame, Tool
 from crane_model.collision import LinkGeometry
@@ -123,6 +125,58 @@ assert abs(rep["terminal_sway"] - timing.terminal_sway) < 0.005, (
     timing.terminal_sway,
 )
 assert abs(rep["peak_sway"] - peak) < 0.1 * peak + 0.005, (rep["peak_sway"], peak)
+# (d) replay vs an independent pair of planar pendula (L = pivot -> payload CoM, driven by the
+# pivot's horizontal acceleration) on a VP-STO bench_carry plan: peak sway within 15 %
+case = cases(planner, ["bench_carry"])[0]
+carry = cost_model(planner, case, planner.prepare_scene(case.scene, True))
+q0, qd = case.start.q_a, np.array(case.goal_q)
+sol = carry.solve(q0, qd, 8, 80, 50, 8)
+T = sol["T"]
+_, q, dq, ddq = carry.sample(q0, qd, sol["via"], T, int(np.ceil(T / 1e-3)))
+grid = np.linspace(0, T, len(q))
+
+
+def sampler(t):
+    return tuple(
+        np.stack([np.interp(t, grid, a[:, i]) for i in range(5)], 1)
+        for a in (q, dq, ddq)
+    )
+
+
+params = np.concatenate([[case.start.q_tool], case.vector])
+carry_rep = Replay().run(sampler, T, case.start.q_u, params, case.offset)
+cmodel = cpin.Model(sym.description.model)
+qa_sx, frame_q = ca.SX.sym("qa", 5), ca.SX.zeros(8)
+for axis, row in enumerate(PLANNED_INDICES):
+    frame_q[row] = qa_sx[axis]
+frame_q[4] = 0.5 * np.pi - qa_sx[1] - qa_sx[2]
+frame_q[5], frame_q[TOOL_INDEX] = 0.5 * np.pi, case.start.q_tool
+conf, _ = sym._expand(frame_q, ca.SX.zeros(8))
+fdata = cmodel.createData()
+cpin.framesForwardKinematics(cmodel, fdata, conf)
+k8 = fdata.oMf[cmodel.getFrameId("K8_rotator_lower_part")]
+com = k8.translation + ca.mtimes(k8.rotation, ca.DM(bp.CARRY_COM))
+points = ca.Function(
+    "p", [qa_sx], [fdata.oMf[cmodel.getFrameId("moved_with_q6")].translation, com]
+)
+pivot, centre = (
+    np.array([np.asarray(points(x)[i]).ravel() for x in q]) for i in (0, 1)
+)
+length, h = np.linalg.norm(centre[0] - pivot[0]), grid[1] - grid[0]
+accel = np.gradient(np.gradient(pivot, h, axis=0), h, axis=0)[:, :2]
+theta, omega, swing = np.zeros(2), np.zeros(2), 0.0
+for k in range(len(q)):
+    omega += -(9.81 * np.sin(theta) + accel[k] * np.cos(theta)) / length * h
+    theta += omega * h
+    swing = max(swing, np.abs(theta).max())
+assert abs(swing - carry_rep["peak_sway"]) < 0.15 * swing, (
+    swing,
+    carry_rep["peak_sway"],
+)
+print(
+    f"pendulum cross-check: L={length:.2f} m, peak {np.degrees(swing):.1f} vs replay "
+    f"{np.degrees(carry_rep['peak_sway']):.1f} deg"
+)
 print(
     f"check_model ok: replay terminal {np.degrees(rep['terminal_sway']):.2f} vs plan "
     f"{np.degrees(timing.terminal_sway):.2f} deg, peak {np.degrees(rep['peak_sway']):.2f} vs "
