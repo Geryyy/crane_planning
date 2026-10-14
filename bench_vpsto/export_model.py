@@ -3,6 +3,7 @@
 Codegen for the C++ VP-STO cost: pump flow and collision-link poses as casadi C.
 
 vc_pump(q_a5, dq_a5) -> Q_P         axis flows summed, tool still (as the CBS OCP row)
+vc_ddqu(x14, ddq_a5, p11) -> ddq_u   passive dynamics, as replay.py integrates them (EcB25a)
 vc_frames(q_a5, q_tool) -> 12/body  R (row-major 9) + t (3) of each link primitive in K0,
                                     passive pair at the closed-form equilibrium;
                                     last body = K8_rotator_lower_part (payload mount)
@@ -50,6 +51,7 @@ def build(xml: str):
     values = ca.vertcat(x, ca.SX.zeros(5), ca.SX.zeros(11))
     flow = ca.sum1(ca.substitute(model.z[18:23], symbols, values))
     pump = ca.Function("vc_pump", [qa, dqa], [flow])
+    ddqu = ca.Function("vc_ddqu", [model.x, model.u, model.p], [model.ddq_u])
 
     q = ca.SX.zeros(8)
     for axis, row in enumerate(PLANNED_INDICES):
@@ -92,15 +94,16 @@ def build(xml: str):
         trans = ca.mtimes(placed.rotation, ca.DM(offset_t)) + placed.translation
         out += [ca.vec(rot.T), trans]
     frames = ca.Function("vc_frames", [qa, qt], [ca.vertcat(*out)])
-    return pump, frames, bodies
+    return pump, frames, bodies, ddqu
 
 
 def main() -> None:
-    pump, frames, bodies = build(description())
+    pump, frames, bodies, ddqu = build(description())
     GEN.mkdir(exist_ok=True)
     generator = ca.CodeGenerator("vpsto_crane_gen", {"with_header": True})
     generator.add(pump)
     generator.add(frames)
+    generator.add(ddqu)
     generator.generate(str(GEN) + "/")
     (GEN / "link_table.json").write_text(json.dumps({"bodies": bodies}, indent=1))
     print(

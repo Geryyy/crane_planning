@@ -1,4 +1,5 @@
 // VP-STO cost for the PZS100 crane as in EcB25 (T bound + W-SDF collision + joint limits),
+// optionally EcB25a's sway terms (13)-(15) on the passive dynamics integrated along the path,
 // plus a plain C ABI for ctypes. Const methods only touch per-call locals: OpenMP-safe.
 #include <coal/distance.h>
 #include <coal/shape/geometric_shapes.h>
@@ -72,6 +73,9 @@ public:
   std::vector<coal::Transform3s> obstacle_pose;
   Geometry payload;
   coal::Transform3s payload_offset;
+  double w_sway[3] = {0., 0., 0.};  // EcB25a w_vI, w_qT, w_vT; all 0 = EcB25
+  double qu0[2] = {0., 0.}, qu_end[2] = {0., 0.};  // start pose, equilibrium at the goal
+  std::vector<double> p;  // crane_model params, as replay.py
 
   double compute_final_time(
     const Eigen::VectorXd & q, const Eigen::VectorXd & qp,
@@ -98,7 +102,8 @@ public:
     const Eigen::VectorXd & q, const Eigen::VectorXd & qp,
     const Eigen::VectorXd & qpp) const override
   {
-    double cost = compute_final_time(q, qp, qpp);
+    const double T = compute_final_time(q, qp, qpp);
+    double cost = T;
     const int n = q.size() / NDOF;
     for (int k = 0; k < n; ++k) {
       for (int i = 0; i < NDOF; ++i) {
@@ -111,7 +116,46 @@ public:
       }
       cost += collision(&q[k * NDOF]);
     }
+    if (w_sway[0] + w_sway[1] + w_sway[2] > 0.) {cost += sway(q, qp, qpp, T);}
     return cost;
+  }
+
+  // EcB25a (13)-(15): RK4 of the passive pair between eval points, actuated state lerped
+  double sway(
+    const Eigen::VectorXd & q, const Eigen::VectorXd & qp, const Eigen::VectorXd & qpp,
+    double T) const
+  {
+    const int n = q.size() / NDOF;
+    const double h = T / (n - 1);
+    auto rhs = [&](int k, double a, const double * s, double * ds) {
+        double x[14], u[NDOF], ddq[2];
+        for (int i = 0; i < NDOF; ++i) {
+          const int j = k * NDOF + i, m = j + NDOF;
+          x[i] = q[j] + a * (q[m] - q[j]);
+          x[7 + i] = (qp[j] + a * (qp[m] - qp[j])) / T;
+          u[i] = (qpp[j] + a * (qpp[m] - qpp[j])) / (T * T);
+        }
+        x[5] = s[0]; x[6] = s[1]; x[12] = s[2]; x[13] = s[3];
+        const double * in[3] = {x, u, p.data()};
+        double * out[1] = {ddq};
+        vc_ddqu(in, out, nullptr, nullptr, 0);
+        ds[0] = s[2]; ds[1] = s[3]; ds[2] = ddq[0]; ds[3] = ddq[1];
+      };
+    double s[4] = {qu0[0], qu0[1], 0., 0.}, k1[4], k2[4], k3[4], k4[4], t[4], cost = 0.;
+    for (int k = 0; k + 1 < n; ++k) {
+      rhs(k, 0., s, k1);
+      for (int i = 0; i < 4; ++i) {t[i] = s[i] + 0.5 * h * k1[i];}
+      rhs(k, 0.5, t, k2);
+      for (int i = 0; i < 4; ++i) {t[i] = s[i] + 0.5 * h * k2[i];}
+      rhs(k, 0.5, t, k3);
+      for (int i = 0; i < 4; ++i) {t[i] = s[i] + h * k3[i];}
+      rhs(k, 1., t, k4);
+      for (int i = 0; i < 4; ++i) {s[i] += h / 6. * (k1[i] + 2. * k2[i] + 2. * k3[i] + k4[i]);}
+      cost += w_sway[0] * (s[2] * s[2] + s[3] * s[3]) * T / n;
+    }
+    const double e0 = s[0] - qu_end[0], e1 = s[1] - qu_end[1];
+    cost += w_sway[1] * (e0 * e0 + e1 * e1) + w_sway[2] * (s[2] * s[2] + s[3] * s[3]);
+    return std::isfinite(cost) ? cost : 1e6;
   }
 
   // W-SDF at the passive equilibrium: weight * (1 - sd) per penetrating link-obstacle pair
@@ -239,5 +283,16 @@ double vc_cost(
 }
 
 double vc_collision(void * h, const double * q5) {return model(h).collision(q5);}
+
+void vc_set_sway(
+  void * h, const double * w3, const double * qu0, const double * qu_end, const double * p,
+  int np)
+{
+  auto & m = model(h);
+  std::copy(w3, w3 + 3, m.w_sway);
+  std::copy(qu0, qu0 + 2, m.qu0);
+  std::copy(qu_end, qu_end + 2, m.qu_end);
+  m.p.assign(p, p + np);
+}
 
 }  // extern "C"

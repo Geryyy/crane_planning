@@ -280,13 +280,15 @@ def run_cbs(planner, label, threads, ev, case, scene, model, repeats):
     return rows, plan
 
 
-def run_vpsto(ev, case, scene, model, q_goal, runs, threads, n_via):
+def run_vpsto(ev, case, scene, model, q_goal, runs, threads, n_via, sway=False):
     q0, rows = case.start.q_a, []
     for run in range(runs):
         began = time.perf_counter()
-        sol = model.solve(q0, q_goal, n_via, N_EVAL, N_SAMPLES, threads)
+        sol = model.solve(
+            q0, q_goal, n_via, 100 if sway else N_EVAL, N_SAMPLES, threads
+        )
         row = dict(
-            planner=f"vpsto_t{threads}",
+            planner=f"{'ecb25a' if sway else 'vpsto'}_t{threads}",  # EcB25a: nEval 100
             threads=threads,
             run=run,
             plan_s=time.perf_counter() - began,
@@ -305,8 +307,8 @@ def run_vpsto(ev, case, scene, model, q_goal, runs, threads, n_via):
 
         row.update(ev.row(case, scene, model, sampler, T))
         row["success"] = int(
-            sol["cost"] - T < 1e-6 and clean(row)
-        )  # no penalty, dense clean
+            (sway or sol["cost"] - T < 1e-6) and clean(row)
+        )  # no penalty (sway cost is not one), dense clean
         rows.append(row)
     return rows
 
@@ -483,6 +485,11 @@ def main() -> int:
         "--force", action="store_true", help="start although load > 1.0"
     )
     parser.add_argument("--out", default="runs.csv")
+    parser.add_argument(
+        "--sway",
+        default=None,
+        help="EcB25a sway weights w_vI,w_qT,w_vT (paper: 1,10,1)",
+    )
     options = parser.parse_args()
 
     if options.cpus:
@@ -533,9 +540,24 @@ def main() -> int:
         )
         if goal is not None:
             goals[case.name] = goal
+        if options.sway and goal is not None:
+            q_end = passive_equilibrium(goal) + (
+                case.offset(goal) if case.offset else 0.0
+            )
+            params = np.concatenate([[case.start.q_tool], case.vector])
+            weights = [float(w) for w in options.sway.split(",")]
+            model.set_sway(weights, case.start.q_u, q_end, params)
         for threads in thread_list:
             rows += run_vpsto(
-                ev, case, scene, model, goal, options.runs, threads, options.n_via
+                ev,
+                case,
+                scene,
+                model,
+                goal,
+                options.runs,
+                threads,
+                options.n_via,
+                bool(options.sway),
             )
         for r in rows:
             r.update(move=case.name, load=load, load_flag=int(load > LOAD_FLAG))
@@ -562,7 +584,12 @@ def main() -> int:
     )
     summarise(
         all_rows,
-        RESULTS / ("summary.md" if options.out == "runs.csv" else "smoke.md"),
+        RESULTS
+        / (
+            "summary.md"
+            if options.out == "runs.csv"
+            else options.out.replace(".csv", ".md")
+        ),
         header,
     )
     return 0

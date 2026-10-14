@@ -118,6 +118,13 @@ class CraneVpsto:
             self.h, _p(q0), _p(qd), _p(via), via.size // NDOF + 2, n_eval
         )
 
+    def set_sway(self, weights, qu0, qu_end, params):
+        """EcB25a's sway cost (w_vI, w_qT, w_vT); passive pair from qu0, settled target qu_end."""
+        params = np.ascontiguousarray(params, dtype=float)
+        lib().vc_set_sway(
+            self.h, _p(weights), _p(qu0), _p(qu_end), _p(params), params.size
+        )
+
     def collision(self, q5):
         return lib().vc_collision(self.h, _p(q5))
 
