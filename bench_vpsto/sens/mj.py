@@ -33,8 +33,12 @@ from harness import ACTUATED, PASSIVE, PLANNED  # noqa: E402
 
 H, HOLD, DT = 0.01, 20.0, 5e-4
 OPT = dict(
-    control_rate=None, pi_scale=1.0, psi_gain_positive=None, psi_gain_negative=None,
-    dead_time=None, no_clamp=False,
+    control_rate=None,
+    pi_scale=1.0,
+    psi_gain_positive=None,
+    psi_gain_negative=None,
+    dead_time=None,
+    no_clamp=False,
 )
 
 
@@ -65,9 +69,14 @@ def execute(case, planner, payload, traj, rung):
     t, p, v, e = traj
     T = t[-1]
     plant = MujocoPlant(description(), timestep=DT)
-    carry(plant, case.payload.mass_kg if case.payload else 0.0,
-          np.asarray(case.payload.center_of_mass_k8_m) if case.payload else np.zeros(3))
-    chain = harness.Chain(plant, case.start.q_tool, SimpleNamespace(pi_rung=rung, **OPT))
+    carry(
+        plant,
+        case.payload.mass_kg if case.payload else 0.0,
+        np.asarray(case.payload.center_of_mass_k8_m) if case.payload else np.zeros(3),
+    )
+    chain = harness.Chain(
+        plant, case.start.q_tool, SimpleNamespace(pi_rung=rung, **OPT)
+    )
     q0 = np.zeros(8)
     q0[ACTUATED] = np.append(p[0], case.start.q_tool)
     q0[PASSIVE] = planner.model.passive_equilibrium(q0[ACTUATED], payload)
@@ -82,8 +91,13 @@ def execute(case, planner, payload, traj, rung):
         now = k * H
         q_ref, dq_ref, _ = sample(now)
         _, dq_next, eff_next = sample(now + H)
-        cmd = chain.loop.step(q_ref, dq_ref, plant.q[PLANNED], plant.dq[PLANNED],
-                              feedforward=ff * (dq_next - dq_ref) + eff_next)
+        cmd = chain.loop.step(
+            q_ref,
+            dq_ref,
+            plant.q[PLANNED],
+            plant.dq[PLANNED],
+            feedforward=ff * (dq_next - dq_ref) + eff_next,
+        )
         plant.drive(chain.actuator, chain.psi.apply(cmd), H)
         if k % 5 == 0:
             ts.append(now + H)
@@ -93,9 +107,15 @@ def execute(case, planner, payload, traj, rung):
     eq = np.array([planner.model.passive_equilibrium(q, payload) for q in qa])
     mag = np.abs(sway - eq).max(1)
     i = np.searchsorted(ts, T)
-    return dict(res=float(np.degrees(mag[i:].max())), atT=float(np.degrees(mag[i])),
-                peak=float(np.degrees(mag[:i].max())), T=float(T),
-                miss=float(np.abs(plant.q[PLANNED][:4] - p[-1][:4]).max()))
+    return dict(
+        res=float(np.degrees(mag[i:].max())),
+        atT=float(np.degrees(mag[i])),
+        peak=float(np.degrees(mag[:i].max())),
+        T=float(T),
+        miss=float(np.abs(plant.q[PLANNED][:4] - p[-1][:4]).max()),
+        t=ts.round(3).tolist(),
+        sway=np.degrees(mag).round(3).tolist(),
+    )  # trace, deg
 
 
 def main():
@@ -115,20 +135,38 @@ def main():
         plan = case.plan(planner)
         q_goal = plan.timing.q_a[-1]
         pay = case.payload
-        payload = (Payload(pay.mass_kg, pay.center_of_mass_k8_m, valid=True) if pay
-                   else Payload(0.0, np.zeros(3), valid=True))
-        trajs = {"cbs": (plan.time, plan.q[:, PLANNED], plan.dq[:, PLANNED], plan.effort[:, PLANNED])}
+        payload = (
+            Payload(pay.mass_kg, pay.center_of_mass_k8_m, valid=True)
+            if pay
+            else Payload(0.0, np.zeros(3), valid=True)
+        )
+        trajs = {
+            "cbs": (
+                plan.time,
+                plan.q[:, PLANNED],
+                plan.dq[:, PLANNED],
+                plan.effort[:, PLANNED],
+            )
+        }
         for k in range(o.seeds):
             sol = cm.solve(case.start.q_a, q_goal, 8, bv.N_EVAL, bv.N_SAMPLES, 1)
             T = sol["T"]
-            _, q, dq, _ = cm.sample(case.start.q_a, q_goal, sol["via"], T, int(round(T / 0.04)))
+            _, q, dq, _ = cm.sample(
+                case.start.q_a, q_goal, sol["via"], T, int(round(T / 0.04))
+            )
             trajs[f"vp{k}"] = (np.linspace(0, T, len(q)), q, dq, np.zeros_like(q))
         out[case.name] = {}
         for rung in o.rungs.split(","):
             for name, tr in trajs.items():
                 r = execute(case, planner, payload, tr, rung)
                 out[case.name].setdefault(rung, {})[name] = r
-                print(case.name, rung, name, {a: round(b, 2) for a, b in r.items()}, flush=True)
+                print(
+                    case.name,
+                    rung,
+                    name,
+                    {a: round(b, 2) for a, b in r.items() if a not in ("t", "sway")},
+                    flush=True,
+                )
         Path(o.out).write_text(json.dumps(out))
 
 

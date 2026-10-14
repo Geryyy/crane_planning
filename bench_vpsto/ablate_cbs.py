@@ -2,15 +2,16 @@
 """
 Where CBS's duration goes: drop one guarantee at a time, same cases as tune_cbs.py.
 
-    ./ablate_cbs.py        # -> results/ablate_cbs.md
+    ./ablate_cbs.py        # -> results/ablate_cbs.{md,csv}
 """
+
+import csv
 
 import common  # noqa: F401
 
 # isort: split
 import numpy as np
 import tune_cbs
-
 from bench_vpsto import RESULTS
 from crane_planning.weights import DEFAULTS
 
@@ -69,6 +70,24 @@ def main():
             + " |"
         )
     (RESULTS / "ablate_cbs.md").write_text("\n".join(lines) + "\n")
+    keys = [
+        "variant",
+        "move",
+        "ok",
+        "duration_s",
+        "residual_sway_deg",
+        "peak_sway_deg",
+        "settled_at_T",
+        "col_cost",
+        "clearance_eq_m",
+        "note",
+    ]
+    with open(RESULTS / "ablate_cbs.csv", "w", newline="") as handle:
+        writer = csv.DictWriter(handle, keys, extrasaction="ignore", restval="")
+        writer.writeheader()
+        writer.writerows(
+            {"variant": n, **r} for n, rows in out.items() for r in rows.values()
+        )
 
 
 if __name__ == "__main__":
