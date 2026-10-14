@@ -124,6 +124,9 @@ def main():
     ap.add_argument("--seeds", type=int, default=5)
     ap.add_argument("--rungs", default="feedforward,full")
     ap.add_argument("--out", required=True)
+    ap.add_argument(
+        "--sway", default=None, help="also EcB25a plans (ea*), weights w_vI,w_qT,w_vT"
+    )
     o = ap.parse_args()
     planner = Planner(description(), PlannerConfig())
     todo = bv.cases(planner, o.only.split(","))
@@ -155,6 +158,23 @@ def main():
                 case.start.q_a, q_goal, sol["via"], T, int(round(T / 0.04))
             )
             trajs[f"vp{k}"] = (np.linspace(0, T, len(q)), q, dq, np.zeros_like(q))
+        if o.sway:
+            q_end = bv.passive_equilibrium(q_goal) + (
+                case.offset(q_goal) if case.offset else 0.0
+            )
+            params = np.concatenate([[case.start.q_tool], case.vector])
+            cm.set_sway(
+                [float(w) for w in o.sway.split(",")], case.start.q_u, q_end, params
+            )
+            for k in range(o.seeds):
+                sol = cm.solve(
+                    case.start.q_a, q_goal, 8, 100, bv.N_SAMPLES, 1
+                )  # EcB25a nEval
+                T = sol["T"]
+                _, q, dq, _ = cm.sample(
+                    case.start.q_a, q_goal, sol["via"], T, int(round(T / 0.04))
+                )
+                trajs[f"ea{k}"] = (np.linspace(0, T, len(q)), q, dq, np.zeros_like(q))
         out[case.name] = {}
         for rung in o.rungs.split(","):
             for name, tr in trajs.items():
