@@ -37,9 +37,6 @@ from .config import (
 TRUCK_ID = "truck"
 PAYLOAD_ID = "payload"
 
-#: Two passive hinges tool hangs on, in `q_sway_max`/`PASSIVE_INDICES` order, 0.223 m apart.
-PASSIVE_PIVOTS = (Frame.TIP, Frame.TILT)
-
 #: Smallest sway cell `_swept` splits to, half-width in rad: its corners then move a
 #: swinging point at most ~0.04 m for a gripped CBS block.
 MIN_SWAY_CELL = 0.0125
@@ -177,8 +174,8 @@ class Geometry:
         self.q_u_offset = np.zeros(2) if q_u_offset is None else np.asarray(q_u_offset)
         #: What the carried body's row was nearest, from the last distance query.
         self.partners: dict[str, str] = {}
-        self.envelope = self._envelope()
         self.levers = self._levers()
+        self.envelope = self._envelope()
         self.required_rigid = float(config.margin_safety) + float(config.margin_interp)
         self.required = self.required_rigid + self.envelope
         self.radii = self._radii()
@@ -216,35 +213,15 @@ class Geometry:
 
     def _envelope(self) -> float:
         """
-        Farthest carried point can swing, in metres.
+        Farthest any swinging point can move over the sway box, in metres.
 
-        Two hinges: `theta6_tip` at `Frame.TIP`, `theta7_tilt` 0.223 m below at
-        `Frame.TILT`, orthogonal (Cardan joint), each bounded by `q_sway_max`,
-        uncoupled -- both at bound at once, perpendicular so hypotenuse. Dropping
-        the upper (longer) hinge understates swing: PZS100 0.153 m one hinge vs
-        0.251 m two. Chord `2 L sin(theta/2)`, not `L sin theta` (~0.5% apart,
-        undershoots by microns) -- estimate not bound.
-
-        Levers at hanging equilibrium: `|TILT -> TCP|` rigid, `|TIP -> TCP|` bends
-        with tilt (0.802 m vs 0.994 m at raw zero); independent of boom/arm/telescope
-        so one config suffices, gripped block lengthens both. Sway box is shared with
-        the controller -- machine may actually reach it, not a conservative allowance.
+        Per-hinge chord `2 L sin(q_sway_max / 2)` on `_levers`, summed: the two
+        displacements need not be orthogonal off the tool axis, and the rails reach past
+        TCP further than a carried block may. Composing on-axis TCP chords instead
+        undershot an empty gripper's rails by 0.28 m (0.25 vs 0.53 m).
         """
-        q = np.zeros(GENERALIZED_DOF)
-        q[TOOL_INDEX] = self.q_tool
-        q[list(PASSIVE_INDICES)] = (
-            passive_equilibrium(q[list(PLANNED_INDICES)]) + self.q_u_offset
-        )
-        tcp = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, Frame.TCP)
-        reach = self._carried_reach()
-        swing = []
-        for pivot, bound in zip(
-            PASSIVE_PIVOTS, np.abs(self.config.q_sway_max), strict=True
-        ):
-            origin = self.model.forward_kinematics(q, Frame.MOUNTING_BASE, pivot)
-            lever = float(np.linalg.norm(tcp.position_m - origin.position_m)) + reach
-            swing.append(lever * 2.0 * float(np.sin(0.5 * bound)))
-        return float(np.hypot(*swing))
+        half = np.abs(np.asarray(self.config.q_sway_max, dtype=float))
+        return float(self.levers @ (2.0 * np.sin(0.5 * half)))
 
     def _radii(self) -> np.ndarray:
         """

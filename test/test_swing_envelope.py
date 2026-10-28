@@ -101,14 +101,12 @@ def measured_swing(model: CraneModel, bounds, reach: float) -> float:
 
 @pytest.mark.parametrize("payload_shape", [None, PAYLOAD_SHAPE])
 def test_envelope_bounds_both_hinges(payload_shape):
-    """One-hinge formula this replaced returned 0.153m vs real 0.250m (fails bound);
-    adding hinges instead of composing returns 0.352m (fails tightness)."""
+    """One-hinge formula returned 0.153m vs real 0.250m at the carried point."""
     scene = geometry(payload_shape)
     swing = measured_swing(
         scene.model, np.abs(scene.config.q_sway_max), scene._carried_reach()
     )
     assert scene.envelope >= swing
-    assert scene.envelope <= 1.05 * swing
 
 
 def test_a_gripped_block_owes_its_own_extent_not_the_k8_drop():
@@ -177,7 +175,9 @@ def test_inside_the_envelope_only_the_swinging_half_owes_it():
     """One wall distance, inside required and outside both margins: accepted near
     base, refused near tool -- envelope is owed only by what hangs on the hinges."""
     scene = geometry(None)
-    target = 0.5 * (scene.required + scene.required_rigid)
+    target = (
+        scene.required_rigid + 0.1
+    )  # inside required; the tool swings 0.19 m sideways
     tcp = _tcp(scene)
 
     # beside base: outriggers reach 2.62m in y, tool 2.9m out in x -- wall over base is base's alone
@@ -320,6 +320,38 @@ def test_swept_bound_never_exceeds_the_swept_distance():
             distances = scene._distances(swung, swinging=True, scene=scene.scene)
             nearest = min(nearest, min(distances.values()))
     assert bound <= nearest
+
+
+@pytest.mark.parametrize("payload_shape", [None, CBS_BLOCK])
+@pytest.mark.parametrize(
+    ("direction", "distance"),
+    [((-0.6, 0.79, -0.06), 2.22), ((0.69, -0.71, -0.12), 2.22)],
+)
+def test_envelope_bounds_how_near_the_sway_box_brings_any_point(
+    payload_shape, direction, distance
+):
+    """`_decide` accepts on `envelope` alone, skipping `_swept`. Composing on-axis TCP
+    chords allowed 0.25 m where an empty gripper's rails swing 0.53 m nearer."""
+    scene = geometry(payload_shape)
+    probe = CollisionPrimitive(
+        id="probe",
+        shape="sphere",
+        pose_in_mounting_base=pin.SE3(
+            np.eye(3), _tcp(scene) + distance * np.asarray(direction)
+        ),
+        dimensions_m=np.array([0.02, 0.02, 0.02]),
+    )
+    q = scene.configuration(np.zeros(PLANNED_DOF))
+    hanging = scene._distances(q, swinging=True, scene=[probe])["probe"]
+    box = np.abs(scene.config.q_sway_max)
+    nearest = hanging
+    for a in np.linspace(-box[0], box[0], 21):
+        for b in np.linspace(-box[1], box[1], 21):
+            swung = q.copy()
+            swung[list(SWAY)] += (a, b)
+            distances = scene._distances(swung, swinging=True, scene=[probe])
+            nearest = min(nearest, distances["probe"])
+    assert hanging - nearest <= scene.envelope
 
 
 def test_a_far_body_does_not_ride_the_near_ones_search(monkeypatch):

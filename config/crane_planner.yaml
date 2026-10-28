@@ -32,9 +32,9 @@ crane_planner:
     #     required = margin_safety + margin_interp + swing envelope
     # and no consecutive pair moves further than `margin_interp`, nothing touches
     # in between. Each part spent once; `margin_safety` is the clearance the answer
-    # carries. Envelope is computed, not configured: the hypotenuse of the two
-    # per-hinge chords `2 L sin(q_sway_max / 2)` -- the hinges are orthogonal and
-    # both reach their bound at once -- owed by the hanging links only (README,
+    # carries. Envelope is computed, not configured: the sum of the two per-hinge
+    # chords `2 L sin(q_sway_max / 2)`, L reaching past TCP to rails or block --
+    # off the tool axis the two need not be orthogonal -- owed by the hanging links only (README,
     # "The collision certificate"). Halving `margin_interp` roughly doubles cost.
     margin_safety: 0.05
     margin_interp: 0.10

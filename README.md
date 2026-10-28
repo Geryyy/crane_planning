@@ -119,12 +119,13 @@ tunnels.
 |---|---|
 | `margin_safety` | clearance the answer actually carries |
 | `margin_interp` | pays for the gap between two checked configurations |
-| `envelope` | `hypot` of the two per-hinge chords `2 L sin(q_sway_max/2)` -- how far the carried body swings inside the admissible box |
+| `envelope` | sum of the two per-hinge chords `2 L sin(q_sway_max/2)` -- how far any swinging point moves inside the admissible box |
 
 The envelope is **computed, not configured** -- each hinge's lever read from the
-description at the hanging pose, plus the carried body's reach past the TCP.
-Both hinges, because they are orthogonal and can be at their bound at once:
-dropping the upper one understates the PZS100's swing by 0.098 m. One distance test at the hanging pose answers the whole box for any
+description (`Geometry._levers`), plus the larger of the carried body's reach and
+`tool_radius` past the TCP. Both hinges, summed: off the tool axis their
+displacements need not be orthogonal. The `hypot` of on-axis TCP chords this
+replaced allowed 0.25 m where an empty gripper's rails swing 0.53 m nearer. One distance test at the hanging pose answers the whole box for any
 configuration clearing more than `required`: no sway state can then reach
 anything.
 
