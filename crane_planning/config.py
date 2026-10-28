@@ -13,6 +13,7 @@ from crane_model import (
     Tool,
     hydraulic_limits,
     parse,
+    sway_limits,
 )
 from crane_model.conventions import (
     CONTROL_SAFE_AXES,
@@ -283,7 +284,10 @@ class PlannerConfig:
     corridor_lateral_step: float = 0.50
     corridor_lateral_samples: int = 2
 
-    q_sway_max: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.2]))
+    #: Admissible sway, shared with crane_mpc through crane_model; not a planner parameter.
+    q_sway_max: np.ndarray = field(
+        default_factory=lambda: np.array(sway_limits()["q_sway_max"])
+    )
 
     #: Quintic segments in fitted path, independent of sample count (certificate dense, curve long).
     path_segments: int = 12
@@ -309,7 +313,9 @@ class PlannerConfig:
     terminal_dq_sway_max: np.ndarray = field(
         default_factory=lambda: np.array([0.04, 0.04])
     )
-    dq_sway_max: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.5]))
+    dq_sway_max: np.ndarray = field(
+        default_factory=lambda: np.array(sway_limits()["dq_sway_max"])
+    )
     ddq_a_max: np.ndarray = field(
         default_factory=lambda: np.array([0.5, 0.7, 0.5, 1.0, 6.0])
     )

@@ -54,10 +54,8 @@ crane_planner:
     corridor_lateral_step: 0.50
     corridor_lateral_samples: 2
 
-    # **The admissible sway bound, and this is where it lives.** Swing envelope is
-    # derived from it; it is also the OCP's state box on the pendulum. Design
-    # value. Tilt-to-TCP pendulum 0.770 m, so 0.2 rad is ~0.15 m of tool travel.
-    q_sway_max: [0.2, 0.2]
+    # The admissible sway (q_sway_max, dq_sway_max) is crane_model's
+    # control_safe_limits.yaml `sway`, shared with crane_mpc; not set here.
 
     # The truck. **Legacy dimensions, preserved and no longer hard-coded**: the
     # scene carries one primitive with reserved id `truck`; bed and six runges ride
@@ -93,8 +91,7 @@ crane_planner:
     # state box at every node.
     terminal_q_sway_max: [0.02, 0.02]
     terminal_dq_sway_max: [0.04, 0.04]
-    # rad/s and rad/s^2. `ddq_a_max` is a comfort limit the description lacks.
-    dq_sway_max: [1.0, 0.5]
+    # rad/s^2. `ddq_a_max` is a comfort limit the description lacks.
     ddq_a_max: [0.5, 0.7, 0.5, 1.0, 6.0]
     # rad/s^3 (m/s^3 on the telescope). **Not a limit** -- the scale the jerk row
     # of the *cost* is measured in, so 1.0 means "as much third derivative as the

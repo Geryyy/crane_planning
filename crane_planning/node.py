@@ -23,10 +23,9 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from timber_crane_planning_interfaces.srv import CalcMovement
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import MarkerArray
-
-from timber_crane_planning_interfaces.srv import CalcMovement
 
 from . import markers as viz
 from . import weights as crane_weights
@@ -131,10 +130,8 @@ INT_PARAMETERS = (
     "visualization_samples",
 )
 ARRAY_PARAMETERS = (
-    "q_sway_max",
     "terminal_q_sway_max",
     "terminal_dq_sway_max",
-    "dq_sway_max",
     "ddq_a_max",
     "dddq_a_max",
     "command_k",
