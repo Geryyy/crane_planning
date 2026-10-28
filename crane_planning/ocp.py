@@ -1104,8 +1104,8 @@ class TrajectoryOcp:
                 solver.constraints_set(node, "ubx", ubx)
         solver.constraints_set(0, "lbx", x0)
         solver.constraints_set(0, "ubx", x0)
-        # Goal: end of curve, arrived stopped. Tool may hang anywhere; `h_e` bounds how still,
-        # softly.
+        # Goal: end of curve, arrived stopped, sway rate pinned to zero; `h_e` bounds the
+        # offset softly (its rate row is then inactive).
         solver.constraints_set(
             N,
             "lbx",

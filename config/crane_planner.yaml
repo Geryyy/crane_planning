@@ -89,7 +89,8 @@ crane_planner:
     path_segments: 12
 
     # --- what "settled" and "admissible" mean --------------------------------
-    # Settled pair is a soft terminal row; sway pair is a state box at every node.
+    # Settled offset is a soft terminal row, the rate is pinned to zero there; sway pair is a
+    # state box at every node.
     terminal_q_sway_max: [0.02, 0.02]
     terminal_dq_sway_max: [0.04, 0.04]
     # rad/s and rad/s^2. `ddq_a_max` is a comfort limit the description lacks.
