@@ -359,7 +359,32 @@ class Planner:
         timing = self.ocp.stretch(
             timing, 1.0 / speed_scale, payload_vector, start.q_tool
         )
+        if speed_scale < 1.0:
+            self._check_stretched(timing)
         return self._resample(geometry, path, timing, start, lifted, candidate_name)
+
+    def _check_stretched(self, timing) -> None:
+        """
+        Refuse a re-timed plan whose flow or command leaves its bound.
+
+        Both are re-read after `stretch`, not powers of it: the command's static (1/k) and
+        inertial (1/k**3) terms can stop cancelling.
+        """
+        cfg = self.config
+        pump_peak = float(np.max(timing.pump_flow))
+        if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
+            raise PlanningError(
+                f"the re-timed plan draws {pump_peak:.3g} of the pump against the "
+                f"{timing.pump_flow_bound:.3g} reserved"
+            )
+        low = cfg.kappa * np.asarray(cfg.command_u_min, dtype=float)
+        high = cfg.kappa * np.asarray(cfg.command_u_max, dtype=float)
+        outside = np.maximum(timing.command - high, low - timing.command)
+        if np.max(outside) > SLACK_SPENT:
+            raise PlanningError(
+                "the re-timed plan commands outside the command domain by "
+                f"{float(np.max(outside)):.3g} rad/s"
+            )
 
     def _validate_start(self, start: Start) -> Start:
         """Refuse a state outside this description; clamp within LIMIT_DEADBAND onto it."""

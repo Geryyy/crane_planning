@@ -6,6 +6,8 @@ both -- what sets that duration is the sway rows, not a kinematic ceiling, so ti
 the ceilings moves the answer somewhere else rather than slowing it down.
 """
 
+from dataclasses import replace
+
 import numpy as np
 import pinocchio as pin
 import pytest
@@ -82,3 +84,14 @@ def test_a_slowed_plan_is_the_fast_one_stretched():
     # `kappa` is the deployment's reservation and a scale above 1 would spend it.
     with pytest.raises(PlanningError, match="speed_scale"):
         plan(1.5)
+
+
+def test_a_stretched_command_outside_the_domain_is_refused():
+    """`u = dq + tau_dot / k` is no power of the stretch, so its bound is re-checked."""
+    planner, plan = plans()
+    slow = plan(1.0 / SLOW_DOWN).timing
+    planner._check_stretched(slow)
+    with pytest.raises(PlanningError, match="command domain"):
+        planner._check_stretched(
+            replace(slow, command=slow.command + 2.0 * planner.config.command_u_max)
+        )
