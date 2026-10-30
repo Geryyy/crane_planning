@@ -62,6 +62,8 @@ COLLISION_SCENE_TOPIC = "/crane/collision_scene"
 ROBOT_DESCRIPTION_TOPIC = "/robot_description"
 #: Last-request OCP result; private diagnostics like crane_mpc's `~/shadow_comparison`, latched.
 SOLVER_STATS_TOPIC = "~/solver_stats"
+#: Same result for CBSRunPanel's planner line: `key=value`, latched, report only.
+PLAN_STATUS_TOPIC = "/cbs/status/plan"
 
 #: Planning frame; assembly planner converts `world` to this, nothing downstream converts.
 PLANNING_FRAME = "K0_mounting_base"
@@ -73,6 +75,25 @@ PLANNING_FRAME = "K0_mounting_base"
 PATH_SAMPLES = 120
 
 SHAPES = {1: "box", 2: "cylinder", 3: "sphere"}
+
+#: `/cbs/status/plan` numbers, in the order the panel reads them off `_report`'s stats.
+PLAN_STATUS_ROWS = (
+    ("duration", "duration_s"),
+    ("iterations", "sqp_iterations"),
+    ("sway_rad", "terminal_sway"),
+    ("sway_rate", "terminal_sway_rate"),
+)
+
+
+def plan_status(level: bytes, message: str, stats: dict) -> str:
+    """`/cbs/status/plan` from the same (level, message, stats) `_report` publishes."""
+    if level == DiagnosticStatus.ERROR:
+        return f"ok=0 msg={message}"
+    numbers = [
+        f"{key}={stats[field]:.4g}" for key, field in PLAN_STATUS_ROWS if field in stats
+    ]
+    # `msg` last: it is the planner's own sentence and carries spaces.
+    return " ".join(["ok=1", *numbers, f"msg={message}"])
 
 
 def latched(depth: int = 1) -> QoSProfile:
@@ -181,6 +202,7 @@ class CranePlanner(Node):
         self.solver_stats = self.create_publisher(
             DiagnosticArray, SOLVER_STATS_TOPIC, latched()
         )
+        self.plan_status = self.create_publisher(String, PLAN_STATUS_TOPIC, latched())
         self.create_service(CalcMovement, A2B_MOVEMENT_SERVICE, self._a2b)
         self.get_logger().info(f"waiting for {ROBOT_DESCRIPTION_TOPIC}")
 
@@ -406,6 +428,7 @@ class CranePlanner(Node):
             refusal = f"no robot description has arrived on {ROBOT_DESCRIPTION_TOPIC}"
             self.get_logger().warn(f"a2b_movement refused: {refusal}")
             self._report(DiagnosticStatus.ERROR, refusal, {})
+            self._status(DiagnosticStatus.ERROR, refusal, {})
             return response
 
         try:
@@ -431,6 +454,7 @@ class CranePlanner(Node):
             self.get_logger().warn(f"a2b_movement refused: {refusal}")
             # Log every refusal, not only the solver's: no numbers reads as "solve was fine".
             self._report(DiagnosticStatus.ERROR, str(refusal), refusal.stats)
+            self._status(DiagnosticStatus.ERROR, str(refusal), refusal.stats)
             return response
 
         # Stamped zero: the JTC reads that as "start at the first point now", whatever latency
@@ -505,6 +529,7 @@ class CranePlanner(Node):
             else DiagnosticStatus.OK
         )
         self._report(level, plan.message, plan.timing.report())
+        self._status(level, plan.message, plan.timing.report())
         return plan, trajectory, path
 
     def _report(self, level: bytes, message: str, stats: dict) -> None:
@@ -523,6 +548,10 @@ class CranePlanner(Node):
             )
         ]
         self.solver_stats.publish(report)
+
+    def _status(self, level: bytes, message: str, stats: dict) -> None:
+        """Beside `_report`, not inside it: `test_solver_stats_report` calls that unbound."""
+        self.plan_status.publish(String(data=plan_status(level, message, stats)))
 
     def _trajectory(self, plan, stamp, indices) -> JointTrajectory:
         """Two widths: actuated six for the reference, canonical eight for a2b_movement."""
