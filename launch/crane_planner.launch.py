@@ -69,6 +69,8 @@ def generate_launch_description() -> LaunchDescription:
                     {"c3_feedforward": ParameterValue(c3_feedforward, value_type=bool)},
                 ],
                 remappings=[("/joint_states", joint_states_topic)],
+                # acados is built with OpenMP; one thread is ~8x faster per SQP iteration under load
+                additional_env={"OMP_NUM_THREADS": "1", "OMP_WAIT_POLICY": "passive"},
             ),
         ]
     )

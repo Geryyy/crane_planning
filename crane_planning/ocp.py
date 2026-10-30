@@ -127,7 +127,7 @@ SOLVER_TUNING = {
     "qp_solver_warm_start": 0,
     "qp_solver_ric_alg": 1,
     "globalization": "MERIT_BACKTRACKING",
-    "globalization_use_SOC": 0,
+    "globalization_use_SOC": 1,  # breaks the duration 2-cycle; `solve` retries without on failure
     "regularize_method": "NO_REGULARIZE",
     # `levenberg_marquardt` alone is 1e-6, i.e. none; this starts at 1e-3 and relaxes, so the first
     # QP is regularised where it needs to be and later ones do not pay for it. Worth a third of the
@@ -911,6 +911,7 @@ class TrajectoryOcp:
         q_tool: float,
         duration_min: float | None = None,
         settled_offset=None,
+        second_order: bool = True,
     ) -> Trajectory:
         """
         Solve one request at full speed, or refuse with what the solver said.
@@ -1123,6 +1124,7 @@ class TrajectoryOcp:
         solver.cost_set(N, "zl", np.full(NH_E, price))
         solver.cost_set(N, "zu", np.full(NH_E, price))
 
+        guess = solver.store_iterate_to_flat_obj()
         started = time.monotonic()
         status = solver.solve()
         elapsed = time.monotonic() - started
@@ -1206,6 +1208,29 @@ class TrajectoryOcp:
             and excess <= cfg.ocp_tolerance
         )
         if status != 0 and not admissible:
+            if second_order and solver_tuning()["globalization_use_SOC"]:
+                print(
+                    f"timing solve with second-order correction failed (acados status {status} "
+                    f"after {int(stats['sqp_iterations'])} iterations); re-solving without it",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                solver.load_iterate_from_flat_obj(guess)
+                solver.options_set("globalization_use_SOC", 0)
+                try:
+                    return self.solve(
+                        coefficients,
+                        q_u_start,
+                        dq_a_start,
+                        dq_u_start,
+                        payload,
+                        q_tool,
+                        duration_min,
+                        settled_offset,
+                        second_order=False,
+                    )
+                finally:
+                    solver.options_set("globalization_use_SOC", 1)
             # Which of the four residuals stalled says dynamics vs goal box vs soft row; no
             # `Trajectory` carries them, so they ride the message. `excess` separates "did not
             # finish" from "finished somewhere it may not be".
