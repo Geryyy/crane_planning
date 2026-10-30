@@ -106,7 +106,7 @@ PHASES = ("prepare_scene", "geometry", "ik", "path", "coefficients", "ocp", "res
 NESTED = ("swept",)
 
 #: What `--carry` plans with. The block as the behaviour tree publishes it
-#: (`sim_captures/2026-10-09-pp-check/run1`: 800 kg, r=0.54, l=0.60, com in K8),
+#: (`sim_captures/2026-10-09-pp-check/run1`: r=0.54, l=0.60; 880 kg block),
 #: the `truck` primitive as `config/crane_planner.yaml` documents the vehicle box,
 #: and five blocks on the ground inside reach -- 13 bodies after `expand_truck`,
 #: the order the live wall-assembly scene carries.
@@ -115,8 +115,8 @@ NESTED = ("swept",)
 #: bed top sits at K0's own height: ground is 1.26 m below K0 (the yaml's bed
 #: height), not 0. Placing it at its world-frame z stands the headboard through the
 #: machine and every pose refuses.
-CARRY_MASS = 800.0
-CARRY_COM = np.array([-0.010, -0.021, 1.032])
+CARRY_MASS = 880.0
+CARRY_COM = np.array([-0.010, -0.021, 1.081])  # captured 1.032 below TCP, + TCP 0.049 below K8
 CARRY_SHAPE = ("cylinder", np.array([1.08, 1.08, 0.60]), CARRY_COM)
 CARRY_SCENE = [
     CollisionPrimitive(

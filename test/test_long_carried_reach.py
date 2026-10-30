@@ -1,13 +1,12 @@
-"""A long carried reach (radius 4.5 -> 8.9 m, 800 kg) plans within the pump, in one short solve."""
+"""A long carried reach (radius 4.5 -> 8.9 m, 880 kg) plans within the pump, in one short solve."""
 
 import numpy as np
 import pinocchio as pin
 from crane_model import CollisionPrimitive, Payload
-from test_jerk_bound import description
-
 from crane_planning import weights as crane_weights
 from crane_planning.config import PlannerConfig
 from crane_planning.planner import Planner, Start
+from test_jerk_bound import description
 
 YAW_PI = (0.0, 0.0, 1.0, 0.0)
 
@@ -32,7 +31,7 @@ def test_block_4_of_the_rotated_wall_plans_within_the_pump_in_one_solve():
     start = Start(q=q, dq_a=np.zeros(5))
     centre = np.array([0.030, 0.018, 1.020])
     payload = Payload(
-        mass_kg=800.0,
+        mass_kg=880.0,
         center_of_mass_k8_m=centre,
         inertia_k8_kg_m2=np.zeros((3, 3)),
         valid=True,

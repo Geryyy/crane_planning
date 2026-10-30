@@ -50,7 +50,7 @@ def poses(limits) -> list:
 
 def payload(centre) -> Payload:
     return Payload(
-        mass_kg=800.0,
+        mass_kg=880.0,
         center_of_mass_k8_m=np.asarray(centre, dtype=float),
         inertia_k8_kg_m2=np.zeros((3, 3)),
         valid=True,
