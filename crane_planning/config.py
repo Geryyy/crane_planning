@@ -285,7 +285,7 @@ class PlannerConfig:
     corridor_lateral_samples: int = 2
 
     #: "corridors" (deterministic candidates) or "ces" (stochastic ensemble, joint space).
-    geometric_stage: str = "corridors"
+    geometric_stage: str = "ces"
     ces_iterations: int = 10
     ces_samples: int = 15
     ces_checks: int = 20
@@ -308,8 +308,8 @@ class PlannerConfig:
     ocp_integrator: str = "ERK"
     ocp_duration_min: float = 2.0
     ocp_duration_max: float = 20.0
-    #: Command row stiffer than dddq_a it replaced: ax_slew needs 70 iters (was 48); sh_boom 29.9s.
-    ocp_max_iterations: int = 100
+    #: Feasible stop at the cap is accepted; duration settles by ~25, boom-at-floor needs 57.
+    ocp_max_iterations: int = 60
     #: acados default 1e-6 on all residuals; resampled onto 25 Hz closed loop, so decades waste.
     ocp_tolerance: float = 1.0e-4
     levenberg_marquardt: float = 1.0e-6

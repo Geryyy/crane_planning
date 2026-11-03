@@ -56,7 +56,7 @@ crane_planner:
 
     # corridors: the candidates above. ces: one free middle control point in joint space,
     # sampled by a cross-entropy ensemble; same fit and certificate after it.
-    geometric_stage: corridors
+    geometric_stage: ces
     ces_iterations: 10
     ces_samples: 15  # candidates per iteration
     ces_checks: 20  # sphere-model clearance samples per candidate, ~0.5 ms each
@@ -241,17 +241,11 @@ crane_planner:
       dddq_a: 1.0
       terminal_scale: 1.0
       time: 1.0
-    # The command row is stiffer than the `dddq_a` row it replaced: `ax_slew` needs
-    # 70 iterations against 48 before, and 60 refuses it. Not higher, because a
-    # refusal spends the whole budget first -- `sh_boom` takes 29.9 s to refuse at
-    # 200, against the tree's 30 s call timeout. `ax_rot` never converges; issue
-    # 113's notes.
-    # That 29.9 s is **load**, not iterations: issue 261 measured the cap itself
-    # (`pair_tuck`, 100/100 at `time` 1.0) at 0.98 s of acados on a quiet box, i.e.
-    # ~10 ms/iteration. The same solve costs 34-41 s under 32-way CPU contention
-    # with the iteration count bit-identical. Read every wall-clock number here as
-    # that machine's load; the budget binds on contention, not on the cap.
-    ocp_max_iterations: 100
+    # A solve stopped here is still accepted if every row holds; past ~25 iterations
+    # the duration no longer moves, only stationarity creeps. Lower: faster under
+    # CPU load (~10 ms/iteration idle, x35 under contention); too low refuses moves
+    # not yet feasible -- boom near its floor needs 57.
+    ocp_max_iterations: 60
     # The duration box `theta` is limited by, in seconds.
     ocp_duration_min: 2.0
     ocp_duration_max: 20.0

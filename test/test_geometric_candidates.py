@@ -80,6 +80,7 @@ def config() -> planning.PlannerConfig:
         corridor_height_samples=2,
         corridor_lateral_step=0.3,
         corridor_lateral_samples=1,
+        geometric_stage="corridors",
     )
 
 

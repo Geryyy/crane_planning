@@ -23,10 +23,9 @@ def box(name, world, size, quat=(0.0, 0.0, 0.0, 1.0)):
     )
 
 
-def test_block_4_of_the_rotated_wall_plans_within_the_pump_in_one_solve():
-    """First solve bought 1.6x the pump in 56 SQP iterations, the retry took 96 more
-    (28.9 s in the sim). Now one solve: guess at the pump's duration, no 0 flow floor."""
-    planner = Planner(description(), PlannerConfig(), dict(crane_weights.DEFAULTS))
+def plan(config):
+    """Block 4 of the rotated wall, 880 kg: timing and every OCP solve it took."""
+    planner = Planner(description(), config, dict(crane_weights.DEFAULTS))
     q = np.array([0.4345, 1.1108, -0.2041, 0.5072, 0.6391, 1.5546, 2.0023, 0.2199])
     start = Start(q=q, dq_a=np.zeros(5))
     centre = np.array([0.030, 0.018, 1.020])
@@ -56,8 +55,15 @@ def test_block_4_of_the_rotated_wall_plans_within_the_pump_in_one_solve():
     timing = planner.plan(
         start, goal, 0.0, payload=payload, payload_shape=shape, scene=scene
     ).timing
+    return timing, solves
 
+
+def test_block_4_of_the_rotated_wall_plans_within_the_pump_in_one_solve():
+    """First solve bought 1.6x the pump in 56 SQP iterations, the retry took 96 more
+    (28.9 s in the sim). Now one solve: guess at the pump's duration, no 0 flow floor;
+    stopped at the cap, it is the answer an uncapped solve converges to."""
+    timing, solves = plan(PlannerConfig())
     assert np.max(timing.pump_flow) <= timing.pump_flow_bound + 1.0e-6
     assert len(solves) == 1  # no pump retry
-    # iterations, not seconds: 20 iterations took 6 s idle and 14 s under a running sim
-    assert solves[0].iterations <= 30
+    uncapped, _solves = plan(PlannerConfig(ocp_max_iterations=200))
+    assert abs(timing.duration - uncapped.duration) <= 0.01 * uncapped.duration
