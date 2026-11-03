@@ -241,9 +241,9 @@ def test_check_path_stops_querying_bodies_its_bounds_vouch_for(monkeypatch):
     queried = []
     real = scene.model.collision_queries
 
-    def counting(q, bodies, swinging=None):
+    def counting(q, bodies, *args):
         queried.append([body.id for body in bodies])
-        return real(q, bodies, swinging)
+        return real(q, bodies, *args)
 
     monkeypatch.setattr(scene.model, "collision_queries", counting)
 
@@ -367,18 +367,15 @@ def test_a_far_body_does_not_ride_the_near_ones_search(monkeypatch):
     queried = []
     real = scene.model.collision_queries
 
-    def counting(q, bodies, swinging=None):
+    def counting(q, bodies, *args):
         queried.extend(body.id for body in bodies)
-        return real(q, bodies, swinging)
+        return real(q, bodies, *args)
 
     monkeypatch.setattr(scene.model, "collision_queries", counting)
     alone = scene._swept(q, scene.scene)
-    scene._swept(q, [])
-    # Each search carries the block-against-machine row; the far body costs that, not
-    # the near body's cells.
-    machine = queried.count("payload") - queried.count("block_1")
+    # block-against-machine is its own search; the far body costs one query, its root cell
     scene._swept(q, scene.scene + [far])
-    assert queried.count("far") == machine
+    assert queried.count("far") == 1
     assert scene._swept(q, scene.scene + [far]) == alone
 
 

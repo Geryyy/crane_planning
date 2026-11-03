@@ -283,7 +283,9 @@ class Geometry:
         q[list(PASSIVE_INDICES)] = passive_equilibrium(q_a) + self.q_u_offset
         return q
 
-    def _distances(self, q: np.ndarray, swinging=None, scene=None) -> dict | None:
+    def _distances(
+        self, q: np.ndarray, swinging=None, scene=None, machine=True
+    ) -> dict | None:
         """
         Distance per scene id at `q`, over `scene` (default all) plus what tool carries.
 
@@ -291,7 +293,7 @@ class Geometry:
         """
         try:
             bodies = self.bodies(q, scene)
-            results = self.model.collision_queries(q, bodies, swinging)
+            results = self.model.collision_queries(q, bodies, swinging, machine)
         except (CraneModelError, PlanningError):
             return None
         # queries(): one row per scene primitive, then a self-pair row if there is one
@@ -367,20 +369,23 @@ class Geometry:
 
         One search per body: the carried row is a minimum over every partner, so a
         shared search splits all bodies' queries down to the nearest one's cells --
-        live, 14 bodies x ~40 cells, 80% of a 11 s carry plan.
+        live, 14 bodies x ~40 cells, 80% of a 11 s carry plan. The carried body
+        against the machine is its own search (key `None`), not part of every body's.
 
         `carried`: per-body bounds still valid at `q` (`check_path` spends them by the
         step), a body still clear on its carried bound is not searched; searched ones
         are written back.
         """
         scene = self.scene if scene is None else list(scene)
+        searches = [(body.id, [body], False) for body in scene]
+        if self.payload_shape is not None or not scene:
+            searches.insert(0, (None, [], True))
         worst, label = np.inf, None
-        for body in scene or [None]:
-            key = None if body is None else body.id
+        for key, bodies, machine in searches:
             if carried is not None and carried.get(key, -np.inf) > self.required_rigid:
                 bound, name = carried[key], key
             else:
-                bound, name = self._swept_one(q, [] if body is None else [body])
+                bound, name = self._swept_one(q, bodies, machine)
                 if carried is not None:
                     carried[key] = bound
             if bound <= self.required_rigid:
@@ -389,7 +394,9 @@ class Geometry:
                 worst, label = bound, name
         return worst, label
 
-    def _swept_one(self, q: np.ndarray, scene: list) -> tuple[float, str | None]:
+    def _swept_one(
+        self, q: np.ndarray, scene: list, machine=True
+    ) -> tuple[float, str | None]:
         """`_swept` against `scene` alone."""
         passive = list(PASSIVE_INDICES)
         hanging = q[passive].copy()
@@ -400,7 +407,7 @@ class Geometry:
             swung = q.copy()
             swung[passive] = hanging + offset
             body, distance = self._nearest(
-                self._distances(swung, swinging=True, scene=scene)
+                self._distances(swung, swinging=True, scene=scene, machine=machine)
             )
             if distance == -np.inf:
                 return -np.inf, None
