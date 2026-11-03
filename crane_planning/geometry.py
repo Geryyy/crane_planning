@@ -1180,6 +1180,14 @@ def plan_fitted_path(
     if config.geometric_stage == "ces":
         if goal_q_a is None:
             raise PlanningError("the ensemble stage needs the goal configuration")
+        # straight joint line first: the ensemble only runs when it is blocked
+        waypoints = lift_joint_line(geometry, config, start_q_a, goal_q_a)
+        path = fit(limits, config, waypoints, dq_start)
+        try:
+            geometry.check_path(path)
+            return path, len(waypoints), "joint line"
+        except PlanningError:
+            pass
         waypoints = ces_path(geometry, limits, config, start_q_a, goal_q_a)
         path = fit(limits, config, waypoints, dq_start)
         geometry.check_path(path)
