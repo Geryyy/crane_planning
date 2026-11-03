@@ -380,3 +380,18 @@ def test_a_far_body_does_not_ride_the_near_ones_search(monkeypatch):
     scene._swept(q, scene.scene + [far])
     assert queried.count("far") == machine
     assert scene._swept(q, scene.scene + [far]) == alone
+
+
+def test_carried_swept_bounds_refuse_what_a_fresh_search_refuses():
+    """Slew onto a neighbour beside the block, refused on the swept bound only (a bound
+    ridden without spending it passes this path)."""
+    scene = _block_near((1.0, 0.0, 0.0), 0.33)
+    start = np.zeros(PLANNED_DOF)
+    start[0] = -0.3
+    line = _Line(start, np.zeros(PLANNED_DOF))
+    with pytest.raises(Exception, match="blocked at s") as carried:
+        scene.check_path(line)
+    scene.swept_step_bound = lambda first, second: np.inf
+    with pytest.raises(Exception, match="blocked at s") as fresh:
+        scene.check_path(line)
+    assert str(carried.value) == str(fresh.value)

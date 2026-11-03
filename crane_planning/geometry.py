@@ -263,6 +263,18 @@ class Geometry:
             np.sum(self.radii * np.abs(np.asarray(second) - np.asarray(first)))
         )
 
+    def swept_step_bound(self, first: np.ndarray, second: np.ndarray) -> float:
+        """
+        `step_bound` for a swept bound, at any sway inside the box.
+
+        A swung point sits up to `envelope` further out than the hanging one on every
+        rotating axis. The carried row's machine partners swing with it (swinging
+        query), so against them only the rotator moves it, already inside this sum.
+        """
+        radii = self.radii + self.envelope
+        radii[TELESCOPE_AXIS] = self.radii[TELESCOPE_AXIS]
+        return float(np.sum(radii * np.abs(np.asarray(second) - np.asarray(first))))
+
     def configuration(self, q_a: np.ndarray) -> np.ndarray:
         """Return canonical eight at `q_a`, tool hanging."""
         q = np.zeros(GENERALIZED_DOF)
@@ -342,7 +354,7 @@ class Geometry:
         )
         return np.array([float(np.linalg.norm(tilt - tip)) + below_tilt, below_tilt])
 
-    def _swept(self, q: np.ndarray, scene) -> tuple[float, str | None]:
+    def _swept(self, q: np.ndarray, scene, carried=None) -> tuple[float, str | None]:
         """
         Swinging half's clearance over the whole sway box, certified lower bound.
 
@@ -356,11 +368,21 @@ class Geometry:
         One search per body: the carried row is a minimum over every partner, so a
         shared search splits all bodies' queries down to the nearest one's cells --
         live, 14 bodies x ~40 cells, 80% of a 11 s carry plan.
+
+        `carried`: per-body bounds still valid at `q` (`check_path` spends them by the
+        step), a body still clear on its carried bound is not searched; searched ones
+        are written back.
         """
         scene = self.scene if scene is None else list(scene)
         worst, label = np.inf, None
         for body in scene or [None]:
-            bound, name = self._swept_one(q, [] if body is None else [body])
+            key = None if body is None else body.id
+            if carried is not None and carried.get(key, -np.inf) > self.required_rigid:
+                bound, name = carried[key], key
+            else:
+                bound, name = self._swept_one(q, [] if body is None else [body])
+                if carried is not None:
+                    carried[key] = bound
             if bound <= self.required_rigid:
                 return bound, name
             if bound < worst:
@@ -408,7 +430,9 @@ class Geometry:
         partner = self.partners.get(PAYLOAD_ID, PAYLOAD_ID)
         return f"{PAYLOAD_ID} against {'the machine' if partner == PAYLOAD_ID else partner}"
 
-    def _decide(self, q: np.ndarray, distances: dict | None, scene) -> tuple:
+    def _decide(
+        self, q: np.ndarray, distances: dict | None, scene, carried=None
+    ) -> tuple:
         """
         `(clearance, required, body)` for one set of measured distances.
 
@@ -424,7 +448,7 @@ class Geometry:
             # inside both margins with something: no split can pass it
             return hanging, self.required_rigid, label
         # rigid half is clear at hanging; the swinging half owes the box it sweeps
-        swept, swept_label = self._swept(q, scene)
+        swept, swept_label = self._swept(q, scene, carried)
         if swept > self.required_rigid:
             return hanging, self.required_rigid, label
         return swept, self.required_rigid, swept_label
@@ -469,7 +493,8 @@ class Geometry:
         previous = path.position(0.0)
         q = self.configuration(previous)
         bounds = self._distances(q)
-        clearance, required, body = self._decide(q, bounds, None)
+        swept: dict = {}
+        clearance, required, body = self._decide(q, bounds, None, swept)
         if not clearance > required:
             raise PlanningError(f"the fitted path is blocked at its start by '{body}'")
         # A body's row is the machine links' distance to it; the carried block hangs ~1 m
@@ -492,13 +517,15 @@ class Geometry:
                 continue
             for body in bounds:
                 bounds[body] -= motion
+            for body in swept:
+                swept[body] -= self.swept_step_bound(previous, candidate)
             near = [body for body in self.scene if bounds[body.id] <= self.required]
             if not near and self.scene:
                 # self row needs query anyway; carry nearest body
                 near = [min(self.scene, key=lambda body: bounds[body.id])]
             q = self.configuration(candidate)
             distances = self._distances(q, scene=near)
-            clearance, required, body = self._decide(q, distances, near)
+            clearance, required, body = self._decide(q, distances, near, swept)
             if not clearance > required:
                 raise PlanningError(
                     f"the fitted path is blocked at s = {s + step:.3f} by '{body}'"
