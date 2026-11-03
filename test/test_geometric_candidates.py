@@ -4,6 +4,7 @@ import numpy as np
 import pinocchio as pin
 import pytest
 from crane_model.collision import CollisionPrimitive
+
 from crane_planning import geometry as geometry_stage
 from crane_planning import planner as planning
 
@@ -30,6 +31,7 @@ class FakeGeometry:
     """Cartesian identity arm facing one low obstacle at origin."""
 
     required = 0.2
+    required_rigid = 0.2
 
     def __init__(self, blocked=True):
         self.blocked = blocked
@@ -153,6 +155,43 @@ def test_blocked_direct_line_uses_overhead_corridor(identity_ik):
     assert name.startswith("lift/traverse/descend")
     sampled = np.array([path.position(s) for s in np.linspace(0.0, 1.0, 201)])
     assert np.max(sampled[:, 2]) >= 0.45
+    assert np.allclose(path.position(1.0)[:3], [1.0, 0.0, 0.0])
+
+
+def test_tall_box_beside_the_move_does_not_raise_the_planes(identity_ik):
+    geometry = FakeGeometry()
+    geometry.scene.append(
+        CollisionPrimitive(
+            id="keepout",
+            shape="box",
+            pose_in_mounting_base=pin.SE3(np.eye(3), np.array([0.0, 5.0, 7.5])),
+            dimensions_m=np.array([1.0, 1.0, 15.0]),
+        )
+    )
+    start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
+    path, name = certify(geometry, start, [1.0, 0.0, 0.0])
+    assert name.startswith("lift/traverse/descend")
+    sampled = np.array([path.position(s) for s in np.linspace(0.0, 1.0, 201)])
+    assert np.max(sampled[:, 2]) < 1.5
+
+
+def test_ensemble_goes_over_a_blocked_joint_line():
+    geometry = FakeGeometry()
+    geometry.clearance = lambda q_a: max(abs(float(q_a[0])) - 0.2, float(q_a[2]) - 0.45)
+    start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
+    settings = config()
+    settings.geometric_stage = "ces"
+    path, _lifted, name = planning.plan_fitted_path(
+        geometry,
+        limits(),
+        settings,
+        start,
+        [1.0, 0.0, 0.0],
+        0.0,
+        np.zeros(5),
+        np.array([1.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+    assert name == "ensemble"
     assert np.allclose(path.position(1.0)[:3], [1.0, 0.0, 0.0])
 
 

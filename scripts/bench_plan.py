@@ -29,6 +29,7 @@ if (PACKAGE / "crane_planning" / "planner.py").is_file():
 
 import pinocchio as pin  # noqa: E402
 from crane_model import CollisionPrimitive, Frame, Payload  # noqa: E402
+
 from crane_planning import Planner, PlannerConfig, PlanningError, Start  # noqa: E402
 from crane_planning import geometry as geometry_module  # noqa: E402
 from crane_planning import planner as planner_module  # noqa: E402
@@ -116,7 +117,9 @@ NESTED = ("swept",)
 #: height), not 0. Placing it at its world-frame z stands the headboard through the
 #: machine and every pose refuses.
 CARRY_MASS = 880.0
-CARRY_COM = np.array([-0.010, -0.021, 1.081])  # captured 1.032 below TCP, + TCP 0.049 below K8
+CARRY_COM = np.array(
+    [-0.010, -0.021, 1.081]
+)  # captured 1.032 below TCP, + TCP 0.049 below K8
 CARRY_SHAPE = ("cylinder", np.array([1.08, 1.08, 0.60]), CARRY_COM)
 CARRY_SCENE = [
     CollisionPrimitive(
@@ -356,6 +359,9 @@ def main() -> int:
         default=None,
         help="write the moves as CalcMovement fields and exit, without planning",
     )
+    parser.add_argument(
+        "--stage", choices=("corridors", "ces"), default=None, help="geometric stage"
+    )
     options = parser.parse_args()
 
     catalogue = {
@@ -372,6 +378,8 @@ def main() -> int:
     config = PlannerConfig()
     if options.kappa is not None:
         config.kappa = options.kappa
+    if options.stage is not None:
+        config.geometric_stage = options.stage
     weights = dict(crane_weights.DEFAULTS)
     for override in options.weight:
         key, _, value = override.partition("=")

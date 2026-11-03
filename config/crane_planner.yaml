@@ -54,6 +54,16 @@ crane_planner:
     corridor_lateral_step: 0.50
     corridor_lateral_samples: 2
 
+    # corridors: the candidates above. ces: one free middle control point in joint space,
+    # sampled by a cross-entropy ensemble; same fit and certificate after it.
+    geometric_stage: corridors
+    ces_iterations: 10
+    ces_samples: 15  # candidates per iteration
+    ces_checks: 20  # clearance queries per candidate, ~4 ms each
+    ces_sigma_init: 0.5  # rad / m, initial spread around the straight joint line
+    ces_clearance_weight: 0.5  # higher: more clearance, longer path
+    ces_collision_weight: 100.0  # per metre inside margin_safety + margin_interp
+
     # The admissible sway (q_sway_max, dq_sway_max) is crane_model's
     # control_safe_limits.yaml `sway`, shared with crane_mpc; not set here.
 

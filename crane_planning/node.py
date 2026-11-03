@@ -23,10 +23,9 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
+from timber_crane_planning_interfaces.srv import CalcMovement
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import MarkerArray
-
-from timber_crane_planning_interfaces.srv import CalcMovement
 
 from . import markers as viz
 from . import weights as crane_weights
@@ -127,6 +126,9 @@ FLOAT_PARAMETERS = (
     "corridor_clearance",
     "corridor_height_step",
     "corridor_lateral_step",
+    "ces_sigma_init",
+    "ces_clearance_weight",
+    "ces_collision_weight",
     "ocp_horizon",
     "ocp_duration_min",
     "ocp_duration_max",
@@ -146,6 +148,9 @@ INT_PARAMETERS = (
     "max_lift_samples",
     "corridor_height_samples",
     "corridor_lateral_samples",
+    "ces_iterations",
+    "ces_samples",
+    "ces_checks",
     "path_segments",
     "ocp_intervals",
     "ocp_max_iterations",
@@ -166,6 +171,7 @@ ARRAY_PARAMETERS = (
 
 OTHER_PARAMETERS = (
     "ocp_integrator",
+    "geometric_stage",
     "max_input_age",
     "max_scene_age",
     "pendulum_state_deadline",
@@ -218,6 +224,7 @@ class CranePlanner(Node):
                 name, [float(value) for value in getattr(defaults, name)]
             )
         self.declare_parameter("ocp_integrator", str(defaults.ocp_integrator))
+        self.declare_parameter("geometric_stage", str(defaults.geometric_stage))
         for name, value in crane_weights.DEFAULTS.items():
             self.declare_parameter(f"weights.{name}", float(value))
         self.declare_parameter("max_input_age", 0.5)

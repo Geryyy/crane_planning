@@ -757,12 +757,23 @@ class JointCandidate:
     goal_q_a: np.ndarray
 
 
+def _primitive_half_extent(primitive) -> np.ndarray:
+    """Half extents of oriented primitive's mounting-base bounding box."""
+    extent = np.asarray(primitive.dimensions_m, dtype=float)
+    return 0.5 * np.abs(primitive.pose_in_mounting_base.rotation) @ extent
+
+
 def _primitive_top(primitive) -> float:
     """Highest mounting-base z of oriented primitive's bounding box."""
     pose = primitive.pose_in_mounting_base
-    extent = np.asarray(primitive.dimensions_m, dtype=float)
-    half_height = 0.5 * float(np.sum(np.abs(pose.rotation[2, :]) * extent))
-    return float(pose.translation[2]) + half_height
+    return float(pose.translation[2]) + float(_primitive_half_extent(primitive)[2])
+
+
+def _under_corridors(primitive, low: np.ndarray, high: np.ndarray) -> bool:
+    """Whether primitive's footprint overlaps the xy box `low..high`."""
+    centre = np.asarray(primitive.pose_in_mounting_base.translation, dtype=float)[:2]
+    half = _primitive_half_extent(primitive)[:2]
+    return bool(np.all(centre + half >= low) and np.all(centre - half <= high))
 
 
 def cartesian_candidates(
@@ -777,10 +788,21 @@ def cartesian_candidates(
     candidates = [CartesianCandidate("direct tool line", (start, goal))]
 
     transfer_z = max(float(start[2]), float(goal[2])) + float(config.corridor_clearance)
-    if geometry.scene:
+    # only bodies under some corridor raise the planes: a keep-out box across the yard
+    # would otherwise lift every plane out of reach
+    reach = (
+        int(config.corridor_lateral_samples) * float(config.corridor_lateral_step)
+        + float(config.corridor_clearance)
+        + float(config.tool_radius)
+        + float(geometry.required)
+    )
+    low = np.minimum(start[:2], goal[:2]) - reach
+    high = np.maximum(start[:2], goal[:2]) + reach
+    under = [body for body in geometry.scene if _under_corridors(body, low, high)]
+    if under:
         transfer_z = max(
             transfer_z,
-            max(_primitive_top(body) for body in geometry.scene)
+            max(_primitive_top(body) for body in under)
             + float(config.corridor_clearance)
             + float(geometry.required),
         )
@@ -918,6 +940,102 @@ def lift_joint_line(
     count = int(np.ceil(geometry.step_bound(start, goal) / config.margin_interp)) + 1
     count = min(max(count, 2), int(config.max_lift_samples))
     return np.linspace(start, goal, count)
+
+
+# ------------------------------------------------------- stochastic ensemble (CES)
+
+#: Sigma scale per iteration: contract while some candidate is clear, else widen.
+CES_CONTRACT = 0.9
+CES_EXPAND = 1.5
+CES_EPSILON = 1.0e-6
+
+
+def _bezier(start: np.ndarray, middle: np.ndarray, goal: np.ndarray, s) -> np.ndarray:
+    """Quadratic Bezier in planned coordinates: three control points, `s` on [0, 1]."""
+    s = np.asarray(s, dtype=float)[:, None]
+    return (1.0 - s) ** 2 * start + 2.0 * s * (1.0 - s) * middle + s**2 * goal
+
+
+def ces_cost(
+    geometry: Geometry, config: PlannerConfig, q_samples: np.ndarray
+) -> tuple[float, bool]:
+    """
+    `(J, clear)`: TCP arclength + collision penalty - mean clearance, ICRA26 section IV.
+
+    Hanging pose only, penalty inside `required_rigid`: the sway search is the certificate's,
+    run once on the winner. Folded or unevaluable counts as zero distance.
+    """
+    positions = np.array([geometry.tcp_pose(q)[0] for q in q_samples])
+    length = float(np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)))
+    distances = np.array([geometry.clearance(q) for q in q_samples])
+    distances = np.where(np.isneginf(distances), 0.0, distances)
+    finite = np.isfinite(distances)  # inf: no body in the scene
+    penalty = np.maximum(0.0, geometry.required_rigid - distances[finite])
+    clearance = float(np.mean(distances[finite])) if np.any(finite) else 0.0
+    cost = (
+        length
+        + float(config.ces_collision_weight) * float(np.sum(penalty))
+        - float(config.ces_clearance_weight) * clearance
+    )
+    return cost, not np.any(penalty > 0.0)
+
+
+def ces_path(
+    geometry: Geometry,
+    limits: Limits,
+    config: PlannerConfig,
+    start_q_a: np.ndarray,
+    goal_q_a: np.ndarray,
+) -> np.ndarray:
+    """
+    Waypoints of the best quadratic Bezier found by a cross-entropy ensemble.
+
+    Only the middle control point is sampled, around the straight joint line; candidate 0 is
+    the best so far, so the answer never gets worse. Seeded, so a request plans the same twice.
+    """
+    start = np.asarray(start_q_a, dtype=float)
+    goal = np.asarray(goal_q_a, dtype=float)
+    # unbounded axis (rotator): within half a turn of the move, never whole extra turns
+    lower = np.where(limits.bounded, limits.lower, np.minimum(start, goal) - np.pi)
+    upper = np.where(limits.bounded, limits.upper, np.maximum(start, goal) + np.pi)
+    checks = np.linspace(0.0, 1.0, max(3, int(config.ces_checks)))
+    samples = max(2, int(config.ces_samples))
+    ranks = np.arange(1, samples + 1)
+    weights = np.log(samples + 0.5) - np.log(ranks)
+    weights /= np.sum(weights)
+
+    rng = np.random.default_rng(0)
+    mean = 0.5 * (start + goal)
+    sigma = float(config.ces_sigma_init) ** 2 * np.eye(PLANNED_DOF)
+    best = mean
+    best_cost, best_clear = ces_cost(
+        geometry, config, _bezier(start, best, goal, checks)
+    )
+    for _iteration in range(int(config.ces_iterations)):
+        middles = np.clip(
+            rng.multivariate_normal(mean, sigma, size=samples - 1), lower, upper
+        )
+        middles = np.vstack([best, middles])
+        scored = [(best_cost, best_clear)] + [
+            ces_cost(geometry, config, _bezier(start, m, goal, checks))
+            for m in middles[1:]
+        ]
+        costs = np.array([cost for cost, _clear in scored])
+        clear = np.array([clear for _cost, clear in scored])
+        order = np.lexsort((costs, ~clear))  # clear first, then by cost
+        best, (best_cost, best_clear) = middles[order[0]], scored[order[0]]
+        ranked = middles[order]
+        mean = weights @ ranked
+        spread = ranked - mean
+        sigma = (spread.T * weights) @ spread + CES_EPSILON * np.eye(PLANNED_DOF)
+        sigma *= CES_CONTRACT if np.any(clear) else CES_EXPAND
+    if not best_clear:
+        raise PlanningError(
+            f"no clear path in {config.ces_iterations} ensemble iterations "
+            f"(best cost {best_cost:.2f})"
+        )
+    # fit target only, the certificate runs on the fitted curve
+    return _bezier(start, best, goal, np.linspace(0.0, 1.0, 129))
 
 
 # ---------------------------------------------------------------------- the fit
@@ -1059,6 +1177,15 @@ def plan_fitted_path(
     unreachable corner refuses every corridor through it before any is lifted -- lifting towards one
     otherwise costs hundreds of IK solves per corridor first.
     """
+    if config.geometric_stage == "ces":
+        if goal_q_a is None:
+            raise PlanningError("the ensemble stage needs the goal configuration")
+        waypoints = ces_path(geometry, limits, config, start_q_a, goal_q_a)
+        path = fit(limits, config, waypoints, dq_start)
+        geometry.check_path(path)
+        return path, len(waypoints), "ensemble"
+    if config.geometric_stage != "corridors":
+        raise PlanningError(f"unknown geometric_stage {config.geometric_stage!r}")
     start_position, start_yaw = geometry.tcp_pose(start_q_a)
     candidates = cartesian_candidates(
         geometry, config, start_position, np.asarray(goal_position_m, dtype=float)

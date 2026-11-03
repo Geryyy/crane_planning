@@ -284,6 +284,15 @@ class PlannerConfig:
     corridor_lateral_step: float = 0.50
     corridor_lateral_samples: int = 2
 
+    #: "corridors" (deterministic candidates) or "ces" (stochastic ensemble, joint space).
+    geometric_stage: str = "corridors"
+    ces_iterations: int = 10
+    ces_samples: int = 15
+    ces_checks: int = 20
+    ces_sigma_init: float = 0.5
+    ces_clearance_weight: float = 0.5
+    ces_collision_weight: float = 100.0
+
     #: Admissible sway, shared with crane_mpc through crane_model; not a planner parameter.
     q_sway_max: np.ndarray = field(
         default_factory=lambda: np.array(sway_limits()["q_sway_max"])
