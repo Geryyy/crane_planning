@@ -309,7 +309,7 @@ class PlannerConfig:
     ocp_duration_min: float = 2.0
     ocp_duration_max: float = 20.0
     #: Feasible stop at the cap is accepted; duration settles by ~25, boom-at-floor needs 57.
-    ocp_max_iterations: int = 60
+    ocp_max_iterations: int = 100
     #: acados default 1e-6 on all residuals; resampled onto 25 Hz closed loop, so decades waste.
     ocp_tolerance: float = 1.0e-4
     levenberg_marquardt: float = 1.0e-6

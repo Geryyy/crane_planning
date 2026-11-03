@@ -245,7 +245,7 @@ crane_planner:
     # the duration no longer moves, only stationarity creeps. Lower: faster under
     # CPU load (~10 ms/iteration idle, x35 under contention); too low refuses moves
     # not yet feasible -- boom near its floor needs 57.
-    ocp_max_iterations: 60
+    ocp_max_iterations: 100
     # The duration box `theta` is limited by, in seconds.
     ocp_duration_min: 2.0
     ocp_duration_max: 20.0
