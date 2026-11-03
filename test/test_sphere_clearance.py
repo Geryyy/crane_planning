@@ -1,4 +1,4 @@
-"""CES's sphere distance must never read clearer than Coal's where the machine is clear."""
+"""CES's sphere distances, to the scene and to itself, never read clearer than Coal's."""
 
 import numpy as np
 from crane_planning import weights as crane_weights
@@ -30,7 +30,16 @@ def test_spheres_are_conservative_where_coal_says_clear():
     lower = np.where(limits.bounded, limits.lower, -np.pi)
     upper = np.where(limits.bounded, limits.upper, np.pi)
     q = np.random.default_rng(1).uniform(lower, upper, size=(100, 5))
-    exact = np.array([geometry.clearance(row) for row in q])
-    clear = np.isfinite(exact) & (exact > 0.0)
-    assert np.count_nonzero(clear) > 30
-    assert np.all(geometry.sphere_clearance(q[clear]) <= exact[clear] + 1.0e-9)
+    rows = [
+        geometry.model.collision_queries(
+            geometry.configuration(row), geometry.bodies(geometry.configuration(row))
+        )
+        for row in q
+    ]
+    exact = np.array([min(r.minimum_distance_m for r in row[:-1]) for row in rows])
+    exact_self = np.array([row[-1].minimum_distance_m for row in rows])
+    spheres, spheres_self = geometry.sphere_clearance(q)
+    clear, clear_self = exact > 0.0, exact_self > 0.0
+    assert np.count_nonzero(clear) > 30 and np.count_nonzero(clear_self) > 30
+    assert np.all(spheres[clear] <= exact[clear] + 1.0e-9)
+    assert np.all(spheres_self[clear_self] <= exact_self[clear_self] + 1.0e-9)

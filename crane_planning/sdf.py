@@ -27,45 +27,141 @@ class MachineSpheres:
         self.model = model
         self.base = model._model.getFrameId(Frame.MOUNTING_BASE.value)
         links = model._link_geometry()
-        self.frames, centres, radii, swinging = [], [], [], []
+        #: per part: owner id, frame, placement in it, exact shape, half extents, spheres
+        self.parts = []
         for index, (link, frame, geometry, placement) in enumerate(links.bodies):
-            if link == Frame.MOUNTING_BASE.value:
-                continue  # constant in q, never queried against static bodies
             if type(geometry).__name__ == "Capsule":
-                half = np.array([geometry.radius, geometry.radius, geometry.halfLength])
+                # spheres on the axis, spacing <= r/2, grown to close the gaps between them
+                r, h = float(geometry.radius), float(geometry.halfLength)
+                count = int(np.ceil(4.0 * h / r)) + 1
+                local = np.zeros((count, 3))
+                local[:, 2] = np.linspace(-h, h, count)
+                step = 2.0 * h / max(count - 1, 1)
+                shape, half = "capsule", np.array([r, r, h])
+                radius = np.full(count, np.hypot(r, 0.5 * step))
             else:
-                half = np.asarray(geometry.halfSide, dtype=float)
-            local, radius = _cover(half)
-            self.frames.append(frame)
-            centres.append(local @ placement.rotation.T + placement.translation)
-            radii.append(radius)
-            swinging.append(np.full(len(local), index in links.swinging))
-        if payload_shape is not None:
-            _shape, dimensions, offset = (
-                payload_shape  # cylinder by its box, corners over-cover
+                shape, half = "box", np.asarray(geometry.halfSide, dtype=float)
+                local, radius = _cover(half)
+            # base is constant in q: crane_model never queries it against static bodies
+            self.parts.append(
+                (
+                    index,
+                    frame,
+                    placement,
+                    shape,
+                    half,
+                    local,
+                    radius,
+                    index in links.swinging,
+                    link != Frame.MOUNTING_BASE.value,
+                )
             )
-            local, radius = _cover(0.5 * np.asarray(dimensions, dtype=float))
-            self.frames.append(model._model.getFrameId(Frame.ROTATOR_LOWER_PART.value))
-            centres.append(local + np.asarray(offset, dtype=float))
-            radii.append(radius)
-            swinging.append(np.ones(len(local), dtype=bool))
-        self.local = centres
-        self.radii = np.concatenate(radii)
+        if payload_shape is not None:
+            kind, dimensions, offset = payload_shape
+            half = 0.5 * np.asarray(dimensions, dtype=float)
+            local, radius = _cover(
+                half
+            )  # cylinder by its box's spheres, corners over-cover
+            placement = pin.SE3(np.eye(3), np.asarray(offset, dtype=float))
+            frame = model._model.getFrameId(Frame.ROTATOR_LOWER_PART.value)
+            self.parts.append(
+                (-1, frame, placement, kind, half, local, radius, True, True)
+            )
+        sizes = [len(part[5]) for part in self.parts]
+        owner = np.repeat([part[0] for part in self.parts], sizes)
+        self.radii = np.concatenate([part[6] for part in self.parts])
         #: below the tool's upper hinge: these owe the sway envelope
-        self.swinging = np.concatenate(swinging)
+        self.swinging = np.repeat([part[7] for part in self.parts], sizes)
+        #: spheres checked against the scene
+        self.scene_mask = np.repeat([part[8] for part in self.parts], sizes)
+        # the pairs crane_model checks: its self pairs, and a carried body (-1) against the arm
+        pairs = list(links.self_pairs)
+        if payload_shape is not None:
+            pairs += [(-1, k) for k in links.detached]
+        slot = {part[0]: n for n, part in enumerate(self.parts)}
+        self.spheres_of = {
+            part[0]: np.flatnonzero(owner == part[0]) for part in self.parts
+        }
+        self.bound = {
+            part[0]: float(np.max(np.linalg.norm(part[5], axis=1) + part[6]))
+            for part in self.parts
+        }
+        # per pair: the part with fewer spheres against the other's exact shape
+        self.pairs = []
+        for i, j in pairs:
+            if i not in slot or j not in slot:
+                continue
+            if len(self.spheres_of[i]) > len(self.spheres_of[j]):
+                i, j = j, i
+            self.pairs.append((slot[i], slot[j], self.spheres_of[i]))
 
-    def centres(self, q: np.ndarray) -> np.ndarray:
-        """Sphere centres in the mounting base at generalised `q`."""
+    def place(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """`(centres, rotations, origins)` in the mounting base at generalised `q`, per part."""
         model, data = self.model._model, self.model._data
         pin.forwardKinematics(model, data, self.model._description.configuration(q))
         pin.updateFramePlacement(model, data, self.base)
         base = data.oMf[self.base]
-        placed = []
-        for frame, local in zip(self.frames, self.local):
+        centres, rotations, origins = [], [], []
+        for _owner, frame, placement, _shape, _half, local, *_rest in self.parts:
             pin.updateFramePlacement(model, data, frame)
-            pose = base.actInv(data.oMf[frame])
-            placed.append(local @ pose.rotation.T + pose.translation)
-        return np.vstack(placed)
+            pose = base.actInv(data.oMf[frame]) * placement
+            centres.append(local @ pose.rotation.T + pose.translation)
+            rotations.append(pose.rotation)
+            origins.append(pose.translation)
+        return np.vstack(centres), np.array(rotations), np.array(origins)
+
+    def self_distance(self, centres, rotations, origins) -> np.ndarray:
+        """
+        Per sample (leading axis): smallest machine-to-itself distance.
+
+        One part's spheres against the other's exact shape. A pair whose bounding spheres
+        stay apart over every sample is not refined: its bound is a positive lower bound,
+        and only a touch is penalised.
+        """
+        nearest = np.full(centres.shape[0], np.inf)
+        for small, big, spheres in self.pairs:
+            apart = (
+                np.linalg.norm(origins[:, small] - origins[:, big], axis=-1)
+                - self.bound[self.parts[small][0]]
+                - self.bound[self.parts[big][0]]
+            )
+            if np.all(apart > 0.0):
+                nearest = np.minimum(nearest, apart)
+                continue
+            _owner, _frame, _placement, shape, half, *_rest = self.parts[big]
+            local = np.einsum(
+                "nkj,nji->nki",
+                centres[:, spheres] - origins[:, big, None],
+                rotations[:, big],
+            )
+            distance = _shape_distance(local, shape, half) - self.radii[spheres]
+            nearest = np.minimum(nearest, np.min(distance, axis=-1))
+        return nearest
+
+
+def _shape_distance(local: np.ndarray, shape: str, half: np.ndarray) -> np.ndarray:
+    """Signed distance of points in a primitive's own frame, negative inside."""
+    if shape == "sphere":
+        return np.linalg.norm(local, axis=-1) - half[0]
+    if shape == "capsule":
+        axis = np.clip(local[..., 2], -half[2], half[2])
+        return (
+            np.linalg.norm(local - np.stack([0 * axis, 0 * axis, axis], -1), axis=-1)
+            - half[0]
+        )
+    if shape == "cylinder":
+        outside = np.stack(
+            [
+                np.linalg.norm(local[..., :2], axis=-1) - half[0],
+                np.abs(local[..., 2]) - half[2],
+            ],
+            axis=-1,
+        )
+    else:
+        outside = np.abs(local) - half
+    return np.linalg.norm(np.maximum(outside, 0.0), axis=-1) + np.minimum(
+        np.max(outside, axis=-1), 0.0
+    )
 
 
 def signed_distance(centres: np.ndarray, radii: np.ndarray, scene) -> np.ndarray:
@@ -75,21 +171,6 @@ def signed_distance(centres: np.ndarray, radii: np.ndarray, scene) -> np.ndarray
         pose = primitive.pose_in_mounting_base
         local = (centres - pose.translation) @ pose.rotation
         half = 0.5 * np.asarray(primitive.dimensions_m, dtype=float)
-        if primitive.shape == "sphere":
-            distance = np.linalg.norm(local, axis=-1) - half[0]
-        else:
-            if primitive.shape == "cylinder":
-                outside = np.stack(
-                    [
-                        np.linalg.norm(local[..., :2], axis=-1) - half[0],
-                        np.abs(local[..., 2]) - half[2],
-                    ],
-                    axis=-1,
-                )
-            else:
-                outside = np.abs(local) - half
-            distance = np.linalg.norm(np.maximum(outside, 0.0), axis=-1) + np.minimum(
-                np.max(outside, axis=-1), 0.0
-            )
+        distance = _shape_distance(local, primitive.shape, half)
         nearest = np.minimum(nearest, np.min(distance - radii, axis=-1))
     return nearest

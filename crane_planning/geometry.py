@@ -316,19 +316,23 @@ class Geometry:
             return -np.inf
         return min(distances.values(), default=np.inf)
 
-    def sphere_clearance(self, q_samples: np.ndarray) -> np.ndarray:
+    def sphere_clearance(self, q_samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
-        Analytic signed scene distance per row of `q_samples`, machine and load as spheres.
+        `(scene, self)` signed distances per row of `q_samples`, machine and load as spheres.
 
-        Swinging spheres grow by the sway envelope, so the rigid margin is what all of them owe.
+        Against the scene swinging spheres grow by the sway envelope, so the rigid margin is
+        what all of them owe; against itself the hanging pose, as the certificate checks it.
         """
         if self._spheres is None:
             self._spheres = sdf.MachineSpheres(self.model, self.payload_shape)
-        centres = np.array(
-            [self._spheres.centres(self.configuration(q)) for q in q_samples]
-        )
+        placed = [self._spheres.place(self.configuration(q)) for q in q_samples]
+        centres, rotations, origins = (np.array(part) for part in zip(*placed))
         radii = self._spheres.radii + self.envelope * self._spheres.swinging
-        return sdf.signed_distance(centres, radii, self.scene)
+        mask = self._spheres.scene_mask
+        return (
+            sdf.signed_distance(centres[:, mask], radii[mask], self.scene),
+            self._spheres.self_distance(centres, rotations, origins),
+        )
 
     def clearance(self, q_a: np.ndarray) -> float:
         """
@@ -978,17 +982,23 @@ def ces_cost(
     """
     `(J, clear)`: TCP arclength + collision penalty - mean clearance, ICRA26 section IV.
 
-    Sphere model, sway as envelope, penalty inside `required_rigid` -- or inside what start
-    and goal themselves clear, if less. Exact distance and self-collision are the
-    certificate's, run once on the winner.
+    Sphere model, sway as envelope. Penalty inside `required_rigid` of the scene and inside
+    zero of itself -- or inside what start and goal themselves clear, if less. Exact
+    distance is the certificate's, run once on the winner.
     """
     positions = np.array([geometry.tcp_pose(q)[0] for q in q_samples])
     length = float(np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)))
-    distances = geometry.sphere_clearance(q_samples)
+    distances, self_distances = geometry.sphere_clearance(q_samples)
     finite = np.isfinite(distances)  # inf: no body in the scene
     # samples 0 and -1 are start and goal, shared by every candidate
     threshold = min(geometry.required_rigid, distances[0], distances[-1])
-    penalty = np.maximum(0.0, threshold - distances[finite])
+    self_threshold = min(0.0, self_distances[0], self_distances[-1])
+    penalty = np.concatenate(
+        [
+            np.maximum(0.0, threshold - distances[finite]),
+            np.maximum(0.0, self_threshold - self_distances),
+        ]
+    )
     clearance = float(np.mean(distances[finite])) if np.any(finite) else 0.0
     cost = (
         length
@@ -1191,7 +1201,9 @@ def plan_fitted_path(
     """
     Lift, fit and certify candidates until one executable curve is found.
 
-    Direct tool line, then joint-space line (if goal config given), then transfer corridors. An
+    `ces`: joint line, then the ensemble, then the corridors below without the joint line.
+    Corridors: direct tool line, then joint-space line (if goal config given), then transfer
+    corridors. An
     unreachable corner refuses every corridor through it before any is lifted -- lifting towards one
     otherwise costs hundreds of IK solves per corridor first.
     """
@@ -1206,19 +1218,25 @@ def plan_fitted_path(
             return path, len(waypoints), "joint line"
         except PlanningError:
             pass
-        waypoints = ces_path(geometry, limits, config, start_q_a, goal_q_a)
-        path = fit(limits, config, waypoints, dq_start)
-        geometry.check_path(path)
-        return path, len(waypoints), "ensemble"
-    if config.geometric_stage != "corridors":
+        try:
+            waypoints = ces_path(geometry, limits, config, start_q_a, goal_q_a)
+            path = fit(limits, config, waypoints, dq_start)
+            geometry.check_path(path)
+            return path, len(waypoints), "ensemble"
+        except PlanningError as failure:
+            ensemble_failure = f"ensemble: {failure}"
+        goal_q_a = None  # joint line already refused; corridors are the fallback
+    elif config.geometric_stage != "corridors":
         raise PlanningError(f"unknown geometric_stage {config.geometric_stage!r}")
+    else:
+        ensemble_failure = None
     start_position, start_yaw = geometry.tcp_pose(start_q_a)
     candidates = cartesian_candidates(
         geometry, config, start_position, np.asarray(goal_position_m, dtype=float)
     )
     if goal_q_a is not None:
         candidates.insert(1, JointCandidate("joint line", np.asarray(goal_q_a)))
-    failures = []
+    failures = [ensemble_failure] if ensemble_failure else []
     unreachable: dict[tuple, str] = {}
 
     def corner_refusal(candidate: CartesianCandidate) -> str | None:
