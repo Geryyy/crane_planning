@@ -17,6 +17,7 @@ from crane_model import (
 from scipy.interpolate import BSpline, make_lsq_spline
 from scipy.optimize import least_squares
 
+from . import sdf
 from .config import (
     ARM_AXIS,
     BOOM_AXIS,
@@ -179,6 +180,7 @@ class Geometry:
         self.required_rigid = float(config.margin_safety) + float(config.margin_interp)
         self.required = self.required_rigid + self.envelope
         self.radii = self._radii()
+        self._spheres = None
 
     def bodies(self, q: np.ndarray, scene=None) -> list:
         """Return scene at `q`, with what tool carries placed on it."""
@@ -313,6 +315,20 @@ class Geometry:
         if distances is None:
             return -np.inf
         return min(distances.values(), default=np.inf)
+
+    def sphere_clearance(self, q_samples: np.ndarray) -> np.ndarray:
+        """
+        Analytic signed scene distance per row of `q_samples`, machine and load as spheres.
+
+        Swinging spheres grow by the sway envelope, so the rigid margin is what all of them owe.
+        """
+        if self._spheres is None:
+            self._spheres = sdf.MachineSpheres(self.model, self.payload_shape)
+        centres = np.array(
+            [self._spheres.centres(self.configuration(q)) for q in q_samples]
+        )
+        radii = self._spheres.radii + self.envelope * self._spheres.swinging
+        return sdf.signed_distance(centres, radii, self.scene)
 
     def clearance(self, q_a: np.ndarray) -> float:
         """
@@ -962,15 +978,17 @@ def ces_cost(
     """
     `(J, clear)`: TCP arclength + collision penalty - mean clearance, ICRA26 section IV.
 
-    Hanging pose only, penalty inside `required_rigid`: the sway search is the certificate's,
-    run once on the winner. Folded or unevaluable counts as zero distance.
+    Sphere model, sway as envelope, penalty inside `required_rigid` -- or inside what start
+    and goal themselves clear, if less. Exact distance and self-collision are the
+    certificate's, run once on the winner.
     """
     positions = np.array([geometry.tcp_pose(q)[0] for q in q_samples])
     length = float(np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)))
-    distances = np.array([geometry.clearance(q) for q in q_samples])
-    distances = np.where(np.isneginf(distances), 0.0, distances)
+    distances = geometry.sphere_clearance(q_samples)
     finite = np.isfinite(distances)  # inf: no body in the scene
-    penalty = np.maximum(0.0, geometry.required_rigid - distances[finite])
+    # samples 0 and -1 are start and goal, shared by every candidate
+    threshold = min(geometry.required_rigid, distances[0], distances[-1])
+    penalty = np.maximum(0.0, threshold - distances[finite])
     clearance = float(np.mean(distances[finite])) if np.any(finite) else 0.0
     cost = (
         length

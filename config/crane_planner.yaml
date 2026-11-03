@@ -59,7 +59,7 @@ crane_planner:
     geometric_stage: corridors
     ces_iterations: 10
     ces_samples: 15  # candidates per iteration
-    ces_checks: 20  # clearance queries per candidate, ~4 ms each
+    ces_checks: 20  # sphere-model clearance samples per candidate, ~0.5 ms each
     ces_sigma_init: 0.5  # rad / m, initial spread around the straight joint line
     ces_clearance_weight: 0.5  # higher: more clearance, longer path
     ces_collision_weight: 100.0  # per metre inside margin_safety + margin_interp

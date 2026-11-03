@@ -177,7 +177,9 @@ def test_tall_box_beside_the_move_does_not_raise_the_planes(identity_ik):
 
 def test_ensemble_goes_over_a_blocked_joint_line():
     geometry = FakeGeometry()
-    geometry.clearance = lambda q_a: max(abs(float(q_a[0])) - 0.2, float(q_a[2]) - 0.45)
+    geometry.sphere_clearance = lambda q: np.maximum(
+        np.abs(q[:, 0]) - 0.2, q[:, 2] - 0.45
+    )
     start = np.array([-1.0, 0.0, 0.0, 0.0, 0.0])
     settings = config()
     settings.geometric_stage = "ces"
