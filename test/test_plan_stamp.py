@@ -32,6 +32,7 @@ PUBLISHERS = (
     "markers",
     "solver_stats",
     "legacy_tcp_path",
+    "plan_status",  # _run publishes it on success, _a2b on the refusals
 )
 
 

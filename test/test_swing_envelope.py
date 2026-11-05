@@ -293,13 +293,23 @@ def _block_near(direction, target: float) -> Geometry:
     raise AssertionError("neighbour never settled at the target clearance")
 
 
+#: Surplus over the rigid margin at which the two directions still disagree: far
+#: enough that a below-swing certifies past `required_rigid`, near enough that a
+#: beside-swing does not. Off the margin, not absolute -- the old literal 0.33 was
+#: sized for margin_interp 0.10 and both directions passed once lab day 2026-11-04
+#: halved it. Verdicts flip at 0.21 (below) and 0.33 (beside), interp 0.05.
+NEAR_SURPLUS = 0.16
+
+
 @pytest.mark.parametrize(
     ("direction", "clear"), [((0.0, 0.0, -1.0), True), ((1.0, 0.0, 0.0), False)]
 )
 def test_sway_is_charged_where_it_swings_not_as_a_ball(direction, clear):
-    """0.33 m from a neighbour: below, a swing only lifts the block (live lift refused
-    against the 0.86 m ball); beside, the box swings it 0.3 m across and must refuse."""
-    scene = _block_near(direction, 0.33)
+    """One clearance, two directions: below, a swing only lifts the block (live lift
+    refused against the 0.86 m ball); beside, the box swings it across and must refuse."""
+    config = shipped_config()
+    target = config.margin_safety + config.margin_interp + NEAR_SURPLUS
+    scene = _block_near(direction, target)
     assert scene.clearance(np.zeros(PLANNED_DOF)) < scene.required
     assert scene.is_valid(np.zeros(PLANNED_DOF)) is clear
     if not clear:

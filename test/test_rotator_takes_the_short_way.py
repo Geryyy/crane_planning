@@ -15,10 +15,14 @@ Q_TOOL = 0.30
 #: `(seed rotator, goal yaw, TCP position)`. Every row is a goal the full-turn
 #: search window used to answer past pi off the seed (-3.55, -3.50, -3.48 rad),
 #: which is the surplus turn issue 213's 4.761 rad goal accumulated.
+#: The last two are the machine's own convention: it reports the rotator
+#: unwrapped, and a lab day started a run at 2pi + 0.25 (issue 293).
 CASES = [
     (1.9, np.radians(115.0), (2.80, 1.05, 1.6)),
     (-1.9, np.radians(-30.0), (2.80, 1.05, 1.6)),
     (0.0, np.radians(-140.0), (2.00, 0.75, 1.6)),
+    (2.0 * np.pi + 0.25, np.radians(115.0), (2.80, 1.05, 1.6)),
+    (-2.0 * np.pi - 0.25, np.radians(115.0), (2.80, 1.05, 1.6)),
 ]
 
 
@@ -73,3 +77,39 @@ def test_the_goal_solve_stays_within_half_a_turn(seed_rotator, goal_yaw, positio
     assert np.linalg.norm(pose.position_m - position_m) <= config.eps_pos
     assert abs(wrap(yaw_of(rotation) - goal_yaw)) <= config.eps_yaw
     assert abs(answer[ROTATOR_AXIS] - seed_rotator) <= np.pi
+
+
+@pytest.mark.parametrize("turns", [1, -1])
+def test_a_whole_turn_on_the_start_moves_the_goal_by_exactly_that_turn(turns):
+    """
+    The machine reports the rotator unwrapped (lab 2026-11-04, issue 293).
+
+    Fold the start to [-pi, pi] instead and the goal is a whole turn off the
+    pose the crane is in, so the move undoes the turn. Gazebo, issue 293: the
+    same move planned +4.4466 from a 2pi + 0.25 start and -1.8366 from a 0.0
+    one -- one angle, one turn apart.
+    """
+    geometry, limits, config = stage()
+    position_m, goal_yaw = np.array([2.80, 1.05, 1.6]), np.radians(115.0)
+    seed = np.array([0.785, 0.5236, 0.5236, 0.25, 0.25])
+
+    def solve(rotator: float) -> np.ndarray:
+        start = seed.copy()
+        start[ROTATOR_AXIS] = rotator
+        return solve_ik(
+            geometry,
+            limits,
+            config,
+            position_m,
+            goal_yaw,
+            start,
+            restarts=config.ik_restarts,
+        )
+
+    here = solve(seed[ROTATOR_AXIS])
+    turned = solve(seed[ROTATOR_AXIS] + turns * 2.0 * np.pi)
+    # The rotator enters the model as cos/sin, so the shift is exact, not within
+    # eps_yaw: measured 9e-16 here, and 1e-9 still catches a turn-dependent bias.
+    assert turned[ROTATOR_AXIS] == pytest.approx(
+        here[ROTATOR_AXIS] + turns * 2.0 * np.pi, abs=1e-9
+    )
