@@ -37,7 +37,7 @@ crane_planner:
     # off the tool axis the two need not be orthogonal -- owed by the hanging links only (README,
     # "The collision certificate"). Halving `margin_interp` roughly doubles cost.
     margin_safety: 0.05
-    margin_interp: 0.10
+    margin_interp: 0.05  # lab day 2026-11-04: was 0.10; finer check steps, start above a block passes
     # Tool collision reach past the TCP. Over-estimate on purpose: too large costs
     # samples, too small is unsound. Carried body's reach added per request.
     tool_radius: 1.0
