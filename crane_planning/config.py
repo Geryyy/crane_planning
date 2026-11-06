@@ -108,6 +108,9 @@ class Limits:
     description_lower: np.ndarray
     description_upper: np.ndarray
     #: The control-safe row itself, margins dropped: how far `relaxed_to` may give way.
+    #: Finite on the rotator where the rows above are not -- the box counts its turns (297)
+    #: -- and `unwound` is the only thing that holds that row: `relaxed_to` and the
+    #: containment scan both skip an unbounded axis.
     control_safe_lower: np.ndarray
     control_safe_upper: np.ndarray
     dq_max: np.ndarray  # velocity, per planned coordinate
@@ -169,9 +172,13 @@ def read_limits(
     Box is narrower on boom/arm and four velocity rows -- not merely read:
     until intersected this planner certified poses/speeds the MPC's
     constraint 1 refuses (boom below 0.02 rad, arm above 1.3039, velocity
-    refs up to 2.7x the MPC bound). Rotator and tool rows stay unintersected
-    (continuous joint; tool row is a retired jaw-gripper angle, not this
-    rail). No cylinder-force constraint (unmeasured relief pressure);
+    refs up to 2.7x the MPC bound). The rotator keeps the description's infinite
+    position rows -- it is periodic and every search window here is a turn either side
+    of the seed -- but its *control-safe* rows now carry the box's +-4pi, a turn count
+    rather than geometry, which is what `unwound` refuses to step past (297: before it
+    only `crane_mpc`'s hard box stopped the count walking, and the PID fallback skips
+    that). The tool row stays unintersected -- a retired jaw-gripper angle, not this
+    rail. No cylinder-force constraint (unmeasured relief pressure);
     `tau_max` is the description's per-joint effort, the scale the
     `dynamic_tau` residual row divides by.
 
@@ -210,10 +217,10 @@ def read_limits(
     for axis, index in enumerate(PLANNED_INDICES):
         name = axis_of[joints[index]]
         dq_max[axis] = min(dq_max[axis], box["dq_a_max"][name])
-        if not bounded[axis]:
-            continue
         control_safe_lower[axis] = max(lower[axis], box["q_a_lower"][name])
         control_safe_upper[axis] = min(upper[axis], box["q_a_upper"][name])
+        if not bounded[axis]:
+            continue
         retreat = PLAN_MARGINS * box["q_a_margin"][name]
         lower[axis] = control_safe_lower[axis] + retreat
         upper[axis] = control_safe_upper[axis] - retreat

@@ -605,20 +605,26 @@ def solve_ik(
     take one restart from predecessor, keeping lift on one IK branch. Reachability
     only -- clearance is the caller's question.
 
-    An unbounded axis is **unwound** before it is handed back: see `unwound`. The
-    search window stays a full turn either side -- narrowing it to half a turn
-    instead turns the long-way-round answers into refusals (36 of 576 goal solves
-    measured), because the yaw row pins the rotator against the wall and the slew
-    then has to take the yaw up, which moves the position off target.
+    An unbounded axis is **unwound** before it is handed back, and refused if no turn of
+    it is inside its own row: see `unwound`. The search window stays a full turn either
+    side -- narrowing it to half a turn instead turns the long-way-round answers into
+    refusals (36 of 576 goal solves measured), because the yaw row pins the rotator
+    against the wall and the slew then has to take the yaw up, which moves the position
+    off target.
     """
     lower = np.where(limits.bounded, limits.lower, seed - 2.0 * np.pi)
     upper = np.where(limits.bounded, limits.upper, seed + 2.0 * np.pi)
     seed = np.asarray(seed, dtype=float)
     turn = ~np.asarray(limits.bounded)
+    # control-safe row, not the retreated one: the retreat holds back two margins where
+    # the MPC's own box gives up one, and answering that 0.254 rad with a whole turn the
+    # other way is worse than the refusal the MPC gives in the outer half (297)
+    turn_lower = limits.control_safe_lower[turn]
+    turn_upper = limits.control_safe_upper[turn]
 
     def unwound(q_a):
         """
-        Fold a continuous axis onto the turn nearest `seed`; same pose, less travel.
+        Fold a continuous axis onto the nearest turn inside its box; same pose, less travel.
 
         The whole kinematics is 2pi-periodic in the rotator (a URDF `continuous`
         joint, carried as cos/sin), so the fold is exact and only drops surplus
@@ -626,10 +632,37 @@ def solve_ik(
         round -- measured 36 of 576 goal solves past pi, worst 3.55 rad -- and the
         surplus is carried into the next move's seed, so the turn count walks.
         Issue 213 saw a goal at 4.761 rad where -1.522 is the same angle.
+
+        The turn nearest the seed can itself be past the control-safe +-4pi, and
+        nothing downstream of here holds that row except `crane_mpc`'s hard box --
+        the PID fallback does not (297). So the turn one back is taken instead; the
+        row is wider than a turn, so that one fits for any seed inside it, and a seed
+        already *past* it unwinds back in. The refusal below therefore needs the seed
+        more than half a turn past the row (|q| > 5pi), where no turn of the goal is
+        inside and `relaxed_to` has not caught it either -- it exempts an unbounded
+        axis. +-4pi is a turn count and not geometry: see `control_safe_limits.yaml`,
+        whose own note says so, and the 297 notes on the +-2pi the deployed timber
+        config carries for the same axis.
         """
         q_a = np.asarray(q_a, dtype=float).copy()
         delta = q_a[turn] - seed[turn]
-        q_a[turn] = seed[turn] + np.arctan2(np.sin(delta), np.cos(delta))
+        folded = seed[turn] + np.arctan2(np.sin(delta), np.cos(delta))
+        folded = folded + 2.0 * np.pi * (
+            np.where(folded < turn_lower, 1.0, 0.0)
+            - np.where(folded > turn_upper, 1.0, 0.0)
+        )
+        outside = (folded < turn_lower) | (folded > turn_upper)
+        if np.any(outside):
+            index = int(np.flatnonzero(outside)[0])
+            axis = int(np.flatnonzero(turn)[index])
+            raise PlanningError(
+                f"planned coordinate {axis} is at {seed[axis]:.6f} and neither turn "
+                f"holding the goal pose is inside [{turn_lower[index]:.6f}, "
+                f"{turn_upper[index]:.6f}]: the rotator is wound more than half a turn "
+                "past its turn count, which no plan from here can give back -- unwind "
+                "it by hand first"
+            )
+        q_a[turn] = folded
         return q_a
 
     def residual(q_a):

@@ -3,6 +3,7 @@ crane_model/config/control_safe_limits.yaml now, this pins them in sync."""
 
 import os
 
+import numpy as np
 import pytest
 from ament_index_python.packages import get_package_share_directory
 from crane_model.conventions import (
@@ -87,6 +88,10 @@ def test_the_intersection_bites_where_the_description_is_wider():
     assert read.dq_max[1] == 0.239067
     # the row itself, margins dropped: how far relaxed_to gives way
     assert (read.control_safe_lower[1], read.control_safe_upper[2]) == (0.0, 1.324864)
+    # 297: the rotator keeps an infinite position row -- it is periodic -- but its
+    # control-safe row carries the box's turn count, which is what `unwound` holds
+    assert (read.lower[4], read.upper[4]) == (-np.inf, np.inf)
+    assert read.control_safe_upper[4] == pytest.approx(4.0 * np.pi)
 
 
 def test_the_tool_keeps_the_descriptions_travel():

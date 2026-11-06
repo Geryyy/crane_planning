@@ -1,4 +1,4 @@
-"""A continuous axis comes back on the turn nearest the seed, not the long way round."""
+"""A continuous axis comes back on the nearest turn inside its box, not the long way round."""
 
 from pathlib import Path
 
@@ -6,7 +6,7 @@ import numpy as np
 import pinocchio as pin
 import pytest
 from crane_model import CraneModel, Frame, Tool
-from crane_planning.config import PlannerConfig, read_limits
+from crane_planning.config import PlannerConfig, PlanningError, read_limits
 from crane_planning.geometry import Geometry, solve_ik, wrap, yaw_of
 
 ROTATOR_AXIS = 4
@@ -113,3 +113,70 @@ def test_a_whole_turn_on_the_start_moves_the_goal_by_exactly_that_turn(turns):
     assert turned[ROTATOR_AXIS] == pytest.approx(
         here[ROTATOR_AXIS] + turns * 2.0 * np.pi, abs=1e-9
     )
+
+
+def tcp(geometry: Geometry, q_a: np.ndarray) -> tuple[np.ndarray, float]:
+    """Where the tool is and which way it points, at a planned five."""
+    pose = geometry.model.forward_kinematics(
+        geometry.configuration(q_a), Frame.MOUNTING_BASE, Frame.TCP
+    )
+    rotation = pin.XYZQUATToSE3(
+        np.concatenate([pose.position_m, pose.orientation_xyzw])
+    ).rotation
+    return pose.position_m, yaw_of(rotation)
+
+
+def test_a_goal_one_turn_past_four_pi_takes_the_other_turn():
+    """
+    297: the nearest turn is not always inside the box. Before this, only
+    `crane_mpc`'s hard box stopped the count, and the PID fallback skips it.
+    """
+    geometry, limits, config = stage()
+    seed = np.array([0.785, 0.5236, 0.5236, 0.25, 4.0 * np.pi - 0.3])
+    # the pose one radian further round than the seed, asked for as a pose: its exact
+    # answer is the rotator at 4pi + 0.7, the turn the fold used to take. Read off the
+    # wound configuration rather than built from `yaw + 1`, which turns the other way
+    wound = seed.copy()
+    wound[ROTATOR_AXIS] = wound[ROTATOR_AXIS] + 1.0
+    position_m, goal_yaw = tcp(geometry, wound)
+
+    answer = solve_ik(
+        geometry,
+        limits,
+        config,
+        position_m,
+        goal_yaw,
+        seed,
+        restarts=config.ik_restarts,
+    )
+
+    reached, reached_yaw = tcp(geometry, answer)
+    assert np.linalg.norm(reached - position_m) <= config.eps_pos
+    assert abs(wrap(reached_yaw - goal_yaw)) <= config.eps_yaw
+    assert answer[ROTATOR_AXIS] <= limits.control_safe_upper[ROTATOR_AXIS]
+    # one turn back, not folded onto the seed: eps_yaw is what the solve converges to
+    assert answer[ROTATOR_AXIS] == pytest.approx(2.0 * np.pi + 0.7, abs=config.eps_yaw)
+
+
+def test_a_rotator_already_wound_past_the_box_is_refused():
+    """
+    Both turns outside: nothing this package can plan, and `relaxed_to` exempts it.
+
+    Needs more than *half a turn* past the row, not merely past it -- the fold is
+    within pi of the seed, so from 4pi..5pi the turn one back still lands inside and
+    the plan unwinds instead of refusing. 6pi + 1 is 2.5 turns out.
+    """
+    geometry, limits, config = stage()
+    seed = np.array([0.785, 0.5236, 0.5236, 0.25, 6.0 * np.pi + 1.0])
+    position_m, yaw_here = tcp(geometry, seed)
+
+    with pytest.raises(PlanningError, match="wound more than half a turn"):
+        solve_ik(
+            geometry,
+            limits,
+            config,
+            position_m,
+            yaw_here,
+            seed,
+            restarts=config.ik_restarts,
+        )
