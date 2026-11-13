@@ -11,7 +11,6 @@ from builtin_interfaces.msg import Time
 from crane_model import (
     ACTUATED_INDICES,
     GENERALIZED_DOF,
-    Payload,
     Tool,
     canonical_joints,
 )
@@ -23,9 +22,10 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
-from timber_crane_planning_interfaces.srv import CalcMovement
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import MarkerArray
+
+from timber_crane_planning_interfaces.srv import CalcMovement
 
 from . import markers as viz
 from . import weights as crane_weights
@@ -403,28 +403,6 @@ class CranePlanner(Node):
                 )
             )
         return primitives
-
-    def _payload(self, declared):
-        mass = float(declared.mass)
-        com = np.array([declared.com.x, declared.com.y, declared.com.z])
-        dimensions = np.array(
-            [declared.dimensions.x, declared.dimensions.y, declared.dimensions.z]
-        )
-        payload = Payload(
-            mass_kg=mass,
-            center_of_mass_k8_m=com,
-            inertia_k8_kg_m2=(
-                Payload.box_inertia(mass, dimensions)
-                if SHAPES.get(declared.shape) == "box"
-                else np.zeros((3, 3))
-            ),
-            valid=mass > 0.0,
-        )
-        shape = None
-        if declared.shape in SHAPES:
-            if np.all(dimensions > 0.0):
-                shape = (SHAPES[declared.shape], dimensions, com)
-        return payload, shape
 
     def _a2b(self, request, response):
         """Answer a2b_movement over `Planner.plan`; `CalcMovement.Response` has no message field."""
