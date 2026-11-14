@@ -308,7 +308,9 @@ class Planner:
         # with the duration floored past the bought one.
         # Flow goes as 1/T, so the floor stretches by the overshoot: a long carried reach drew
         # 2.1x the pump and 1.25x left every retry refused.
-        pump_peak = float(np.max(timing.pump_flow))
+        # Node 0 excluded here and below: it carries the measured start, which the solve leaves
+        # unbound (issue 344) because nothing it chooses can move it.
+        pump_peak = float(np.max(timing.pump_flow[1:]))
         if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
             stretch = max(PUMP_RETRY_STRETCH, pump_peak / timing.pump_flow_bound)
             timing = self.ocp.solve(
@@ -332,7 +334,7 @@ class Planner:
         # Flow row is soft for the same reason and refused for the same reason: a converged
         # solve that bought it draws more than the pump delivers, and the answer reads as valid.
         # Surfaced by the tuning sweep -- baseline refused these paths before reaching here.
-        pump_peak = float(np.max(timing.pump_flow))
+        pump_peak = float(np.max(timing.pump_flow[1:]))
         if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
             raise PlanningError(
                 "the timing solve bought the pump limit instead of meeting it: peak "
@@ -371,7 +373,8 @@ class Planner:
         inertial (1/k**3) terms can stop cancelling.
         """
         cfg = self.config
-        pump_peak = float(np.max(timing.pump_flow))
+        # Node 0 carries the measured start, unbound in the solve; same rule as `plan`.
+        pump_peak = float(np.max(timing.pump_flow[1:]))
         if pump_peak > timing.pump_flow_bound + SLACK_SPENT:
             raise PlanningError(
                 f"the re-timed plan draws {pump_peak:.3g} of the pump against the "
@@ -379,7 +382,7 @@ class Planner:
             )
         low = cfg.kappa * np.asarray(cfg.command_u_min, dtype=float)
         high = cfg.kappa * np.asarray(cfg.command_u_max, dtype=float)
-        outside = np.maximum(timing.command - high, low - timing.command)
+        outside = np.maximum(timing.command - high, low - timing.command)[1:]
         if np.max(outside) > SLACK_SPENT:
             raise PlanningError(
                 "the re-timed plan commands outside the command domain by "

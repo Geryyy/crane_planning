@@ -999,6 +999,16 @@ class TrajectoryOcp:
                 command_hi,
             ]
         )
+        # Node 0 is where the machine is, not something the solve picks: `x0` pins velocity and
+        # passive pair and starts `accel`/`jerk` flat, so every row there follows from the
+        # measurement. Applying them refuses the move instead of planning it -- a replan from a
+        # moving start died on the first QP, `command slew at node 0, +1.3e+02` (issue 344). The
+        # rows from node 1 on are what the plan has to meet; `plan` checks the start's own sway
+        # against `q_sway_max` before it gets here.
+        lh_node = np.tile(lh, (N, 1))
+        uh_node = np.tile(uh, (N, 1))
+        lh_node[0] = -big
+        uh_node[0] = big
         settled = np.concatenate(
             [
                 cfg.terminal_q_sway_max / cfg.q_sway_max,
@@ -1096,8 +1106,8 @@ class TrajectoryOcp:
                 # warm tree would be inert, same failure as weights.
                 solver.constraints_set(node, "lbu", -np.full(NU, SNAP_INPUT_MAX))
                 solver.constraints_set(node, "ubu", np.full(NU, SNAP_INPUT_MAX))
-                solver.constraints_set(node, "lh", lh)
-                solver.constraints_set(node, "uh", uh)
+                solver.constraints_set(node, "lh", lh_node[node])
+                solver.constraints_set(node, "uh", uh_node[node])
                 solver.cost_set(node, "zl", np.full(soft, price))
                 solver.cost_set(node, "zu", np.full(soft, price))
             if 0 < node < N:
@@ -1201,7 +1211,7 @@ class TrajectoryOcp:
         # `res_ineq` is one scalar from bookkeeping and `sway_slack` is a slack variable, neither
         # of which is a statement about what was returned. Raising `ocp_max_iterations` instead
         # buys the same answer later and hides the cycle, so it is not the lever.
-        excess = row_excess(rows[:N], lh, uh, s, speed)
+        excess = row_excess(rows[:N], lh_node, uh_node, s, speed)
         admissible = (
             status == 2
             and float(np.max(residuals[1:])) <= cfg.ocp_tolerance
@@ -1240,7 +1250,7 @@ class TrajectoryOcp:
                 f"{int(stats['sqp_iterations'])} iterations, {elapsed:.2f} s, on "
                 f"residuals stat {stat:.1e} eq {eq:.1e} ineq {ineq:.1e} comp {comp:.1e}, "
                 f"worst row {excess:+.1e} of its bound; worst h row "
-                f"{worst_row(rows[:N], lh, uh)}",
+                f"{worst_row(rows[:N], lh_node, uh_node)}",
                 stats=stats,
             )
         if guard > 0.99:
