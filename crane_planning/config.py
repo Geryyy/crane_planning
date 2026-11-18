@@ -74,6 +74,7 @@ PLAN_MARGINS = 2.0
 #: control-safe row: axes park on their own stops and sim crept 7.9e-5..1.4e-4 rad past
 #: one (`test_start_limit_deadband`), which must not read as a machine out of the box.
 LIMIT_DEADBAND = 1e-3
+TOOL_LIMIT_DEADBAND = 0.01  # m; rails may read past the open stop, tool is not planned
 
 
 @lru_cache(maxsize=1)

@@ -24,6 +24,7 @@ from .config import (
     ARM_AXIS,
     BOOM_AXIS,
     LIMIT_DEADBAND,
+    TOOL_LIMIT_DEADBAND,
     PLANNED_DOF,
     PLANNED_FRAMES,
     PLANNED_INDICES,
@@ -422,14 +423,14 @@ class Planner:
                 "would not match the machine"
             )
         if self.limits.tool_bounded and not (
-            self.limits.tool_lower - LIMIT_DEADBAND
+            self.limits.tool_lower - TOOL_LIMIT_DEADBAND
             <= start.q_tool
-            <= self.limits.tool_upper + LIMIT_DEADBAND
+            <= self.limits.tool_upper + TOOL_LIMIT_DEADBAND
         ):
             raise PlanningError(
                 f"the tool coordinate is measured at {start.q_tool:.6f}, outside "
                 f"[{self.limits.tool_lower:.6f}, {self.limits.tool_upper:.6f}] by "
-                f"more than {LIMIT_DEADBAND:.0e}; fix the simulated state or the "
+                f"more than {TOOL_LIMIT_DEADBAND:.0e}; fix the simulated state or the "
                 "description instead of projecting it"
             )
 
