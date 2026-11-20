@@ -280,7 +280,7 @@ class PlannerConfig:
 
     # margin_safety is the clearance the answer carries; margin_interp pays checked-config gap.
     margin_safety: float = 0.05
-    margin_interp: float = 0.10
+    margin_interp: float = 0.05  # = shipped yaml
     #: Tool collision reach past centre point; over-estimate for the step bound (too small unsound).
     tool_radius: float = 1.0
     #: Cap on lifted samples; reaching it means an IK branch jump, and is a refusal.
